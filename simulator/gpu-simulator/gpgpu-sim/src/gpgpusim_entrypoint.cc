@@ -69,6 +69,7 @@
 #include "option_parser.h"
 #include "cuda-sim/cuda-sim.h"
 #include "cuda-sim/ptx_ir.h"
+#include "cuda-sim/ptx_parser.h"
 
 #define MAX(a,b) (((a)>(b))?(a):(b))
 
@@ -94,6 +95,7 @@ void gpgpu_ptx_sim_init_perf()
 {
    print_splash();
    read_sim_environment_variables();
+   read_parser_environment_variables();
    opp = option_parser_create();
    option_parser_register(opp, "-network_mode", OPT_INT32, &g_network_mode, "Interconnection network mode", "1");
    option_parser_register(opp, "-inter_config_file", OPT_CSTR, &g_network_config_filename, "Interconnection network config file", "mesh");
