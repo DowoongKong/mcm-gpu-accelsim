@@ -62,17 +62,13 @@
  * Vancouver, BC V6T 1Z4
  */
 
+#include "gpgpusim_entrypoint.h"
 #include <stdio.h>
 #include <time.h>
 
 #include "option_parser.h"
-//#include "gpgpu-sim/gpu-sim.h"
 
 #define MAX(a,b) (((a)>(b))?(a):(b))
-
-struct dim3 {
-   unsigned int x, y, z;
-};
 
 struct gpgpu_ptx_sim_arg *grid_params;
 int g_grid_num=0;
