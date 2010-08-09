@@ -68,7 +68,6 @@
 #ifndef MEM_LATENCY_STAT_H
 #define MEM_LATENCY_STAT_H
 
-extern unsigned long long  gpu_sim_cycle;
 extern int gpgpu_dram_scheduler;
 extern unsigned int gpu_mem_n_bk;
 extern bool gpgpu_memlatency_stat;
