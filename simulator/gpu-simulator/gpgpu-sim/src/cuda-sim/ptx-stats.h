@@ -63,7 +63,7 @@
 
 #include "../option_parser.h"
 
-extern int enable_ptx_file_line_stats;
+extern bool enable_ptx_file_line_stats;
 
 // set options
 void ptx_file_line_stats_options(option_parser_t opp);
