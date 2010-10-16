@@ -106,9 +106,9 @@ struct cache_block_t {
 #define RANDOM 'R'
 
 enum cache_write_policy {
-    no_writes, //line replacement when new line arrives
-    write_back, //line replacement when new line arrives
-    write_through //reservation based, use much handle reservation full error.
+    no_writes,    // line replacement when new line arrives
+    write_back,   // line replacement when new line arrives
+    write_through // reservation based, use much handle reservation full error.
 };
 
 class cache_t {
@@ -159,8 +159,6 @@ private:
    
    int m_core_id; // which shader core is using this
    int m_type_id; // what kind of cache is this (normal, texture, constant)
-
-   class linear_histogram_logger *m_logger;
 };
 
 #endif
