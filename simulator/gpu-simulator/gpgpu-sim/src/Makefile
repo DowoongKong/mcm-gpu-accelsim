@@ -31,12 +31,11 @@
 
 DEBUG?=0
 
-CUDART_VERSION:=$(shell $(CUDA_INSTALL_PATH)/bin/nvcc --version | awk '/release/ {print $$5;}' | sed 's/,//' | sed 's/\./ /' | awk '{printf("%02u%02u", 10*int($$1), 10*$$2);}')
+include ../version_detection.mk
 
 CXXFLAGS = -Wall -DDEBUG
 CXXFLAGS += -DCUDART_VERSION=$(CUDART_VERSION)
 
-GNUC_CPP0X := $(shell gcc --version | perl -ne 'if (/gcc\s+\(.*\)\s+([0-9.]+)/){ if($$1 >= 4.3) {$$n=1} else {$$n=0;} } END { print $$n; }')
 ifeq ($(GNUC_CPP0X), 1)
     CXXFLAGS += -std=c++0x
 endif
