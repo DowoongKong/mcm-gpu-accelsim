@@ -48,6 +48,7 @@ __global__ void v4p_example(int *a_int32, int *b_int4, int *c,int *d_int32, int 
 	);
 	asm("CPTX_END");
 	asm("*/");
+
 	asm("/*");
 	asm("CPTX_BEGIN");
 	asm("vp.load.b4.sync.row.m16n16k16.s32 {%0},[%1],%2;" : 
@@ -56,6 +57,7 @@ __global__ void v4p_example(int *a_int32, int *b_int4, int *c,int *d_int32, int 
 	);
 	asm("CPTX_END");
 	asm("*/");
+
 	asm("/*");
 	asm("CPTX_BEGIN");
 	asm("vp.load.c.sync.row.m16n16k16.s32 {%0,%1,%2,%3,%4,%5,%6,%7},[%8],%9;" : 
@@ -81,8 +83,6 @@ __global__ void v4p_example(int *a_int32, int *b_int4, int *c,int *d_int32, int 
 	asm("*/");
 
 	//B8
-	//asm("CPTX_END");
-	//asm("*/");
 	//asm("/*");
 	//asm("CPTX_BEGIN");
 	//asm("vp.mma.sync.row.row.m16n16k16.s32 {%0, %1, %2, %3, %4, %5, %6, %7}, {%8, %9, %10, %11, %12, %13, %14, %15}, {%16, %17}, {%18, %19, %20, %21, %22, %23, %24, %25};" : 
@@ -98,8 +98,6 @@ __global__ void v4p_example(int *a_int32, int *b_int4, int *c,int *d_int32, int 
 	//asm("*/");
 
 	//B16
-	//asm("CPTX_END");
-	//asm("*/");
 	//asm("/*");
 	//asm("CPTX_BEGIN");
 	//asm("vp.mma.sync.row.row.m16n16k16.s32 {%0, %1, %2, %3, %4, %5, %6, %7}, {%8, %9, %10, %11, %12, %13, %14, %15}, {%16, %17, %18, %19}, { %20, %21, %22, %23, %24, %25, %26, %27};" : 
@@ -113,16 +111,18 @@ __global__ void v4p_example(int *a_int32, int *b_int4, int *c,int *d_int32, int 
 	//);
 	//asm("CPTX_END");
 	//asm("*/");
-
-
-	d_int32[0]=registers_d[0];
-	d_int32[1]=registers_d[1];
-	d_int32[2]=registers_d[2];
-	d_int32[3]=registers_d[3];
-	d_int32[4]=registers_d[4];
-	d_int32[5]=registers_d[5];
-	d_int32[6]=registers_d[6];
-	d_int32[7]=registers_d[7];
+	
+	asm("/*");
+	asm("CPTX_BEGIN");
+	asm("vp.store.d.sync.row.m16n16k16.s32 [%0], {%1,%2,%3,%4,%5,%6,%7,%8},%9;" : 
+	:"l"(d_int32)
+	"r"(registers_d[0]), "r"(registers_d[1]),"r"(registers_d[2]),"r"(registers_d[3]),
+	"r"(registers_d[4]),"r"(registers_d[5]),"r"(registers_d[6]),"r"(registers_d[7]),
+	"r"(M)
+	);
+	asm("CPTX_END");
+	asm("*/");
+	//d_int32[0]=registers_d[0];
 }
 
 __global__ void convertFp32ToFp16 (half *out, float *in, int n) {
@@ -268,7 +268,7 @@ int main(int argc, char* argv[]) {
    cudaErrCheck(cudaMemcpy(a_int32,a_host_wmma,  MATRIX_M * MATRIX_K * sizeof(int), cudaMemcpyHostToDevice));
    cudaErrCheck(cudaMemcpy(b_int32,b_host_wmma,  MATRIX_K * MATRIX_N * sizeof(int), cudaMemcpyHostToDevice));
    cudaErrCheck(cudaMemcpy(c_int32,c_host_wmma,  MATRIX_M * MATRIX_N * sizeof(int), cudaMemcpyHostToDevice));
-
+	
    #ifdef TEST16
    	convertInt32ToInt16 <<< (MATRIX_M * MATRIX_K + 255) / 256, 256 >>> (a_int16, a_int32, MATRIX_M * MATRIX_K);
    	convertInt16ToInt32 <<< (MATRIX_M * MATRIX_K + 255) / 256, 256 >>> (d_int32, a_int16, MATRIX_M * MATRIX_K);
@@ -280,8 +280,8 @@ int main(int argc, char* argv[]) {
  	cudaErrCheck(cudaMemcpy(d_host_wmma, d_int32, MATRIX_M * MATRIX_N * sizeof(int), cudaMemcpyDeviceToHost));
    #endif
    #ifdef TEST4
-   	convertInt32ToInt4 <<< (MATRIX_M * MATRIX_K + 255) / 256, 256 >>> (a_int4, a_int32, MATRIX_M * MATRIX_K);
-  	convertInt4ToInt32 <<< (MATRIX_M * MATRIX_K + 255) / 256, 256 >>> (d_int32, a_int4, MATRIX_M * MATRIX_K);
+   	convertInt32ToInt4 <<< (MATRIX_M * MATRIX_K + 255) / 256, 256 >>> (b_int4, b_int32, MATRIX_M * MATRIX_K);
+  	convertInt4ToInt32 <<< (MATRIX_M * MATRIX_K + 255) / 256, 256 >>> (d_int32, b_int4, MATRIX_M * MATRIX_K);
  	cudaErrCheck(cudaMemcpy(d_host_wmma, d_int32, MATRIX_M * MATRIX_N * sizeof(int), cudaMemcpyDeviceToHost));
    #endif
    convertInt32ToInt4 <<< (MATRIX_M * MATRIX_K + 255) / 256, 256 >>> (b_int4, b_int32, MATRIX_M * MATRIX_K);
@@ -297,49 +297,48 @@ int main(int argc, char* argv[]) {
    cudaErrCheck(cudaEventRecord(stopWMMA));
    cudaErrCheck(cudaEventSynchronize(stopWMMA));
 
-//AAMIR
-//AAMIR   // Error checking
-//AAMIR   printf("\nChecking results...\n");
-//AAMIR   cudaErrCheck(cudaMemcpy(d_host_wmma, d_fp32, MATRIX_M * MATRIX_N * sizeof(float), cudaMemcpyDeviceToHost));
-//AAMIR   
-//AAMIR   printf("Results verified: cublas and WMMA agree.\n\n");
-//AAMIR   float wmmaTime;
-//AAMIR   cudaErrCheck(cudaEventElapsedTime(&wmmaTime, startWMMA, stopWMMA));
-//AAMIR   printf("wmma took %fms\n", wmmaTime);
-//AAMIR   
-//AAMIR   cudaErrCheck(cudaEventDestroy(startWMMA));
-//AAMIR   cudaErrCheck(cudaEventDestroy(stopWMMA));
-//AAMIR
-//AAMIR   int t=200000;
-//AAMIR   while(t-->0);
-//AAMIR   printf("D_CALCULATED\n");
-//AAMIR
-//AAMIR   for(int m=0;m<MATRIX_M;m++){
-//AAMIR	for(int n=0;n<MATRIX_N;n++){
-//AAMIR		printf("%.2f,",d_cal_host_wmma[m*MATRIX_N+n]);
-//AAMIR	}
-//AAMIR	printf("\n");
-//AAMIR   }
+
+   // Error checking
+   printf("\nChecking results...\n");
+   cudaErrCheck(cudaMemcpy(d_host_wmma, d_int32, MATRIX_M * MATRIX_N * sizeof(float), cudaMemcpyDeviceToHost));
+   
+   float wmmaTime;
+   cudaErrCheck(cudaEventElapsedTime(&wmmaTime, startWMMA, stopWMMA));
+   printf("wmma took %fms\n", wmmaTime);
+   
+   cudaErrCheck(cudaEventDestroy(startWMMA));
+   cudaErrCheck(cudaEventDestroy(stopWMMA));
+
+   int t=200000;
+   while(t-->0);
+   printf("D_CALCULATED\n");
+
+   for(int m=0;m<MATRIX_M;m++){
+	for(int n=0;n<MATRIX_N;n++){
+		printf("%d,",d_cal_host_wmma[m*MATRIX_N+n]);
+	}
+	printf("\n");
+   }
    printf("D_WMMA\n");
    for(int m=0;m<MATRIX_M;m++){
 	for(int n=0;n<MATRIX_N;n++){
-		printf("%x,",d_host_wmma[m*MATRIX_N+n]);
+		printf("%d,",d_host_wmma[m*MATRIX_N+n]);
 	}
 	printf("\n");
     }
-//AAMIR   int suc=1;
-//AAMIR   for(int m=0;m<MATRIX_M;m++){
-//AAMIR	for(int n=0;n<MATRIX_N;n++){
-//AAMIR 		if(abs(d_cal_host_wmma[m*MATRIX_N+n]-d_host_wmma[m*MATRIX_N+n])>1) 
-//AAMIR		{	
-//AAMIR			printf("ERROR:\n");
-//AAMIR			suc=0;
-//AAMIR		}
-//AAMIR	}
-//AAMIR   }
-//AAMIR   if(suc==1)
-//AAMIR	printf("COMPLETED_SUCCESSFULLY\n");
-//AAMIR   
+   int suc=1;
+   for(int m=0;m<MATRIX_M;m++){
+	for(int n=0;n<MATRIX_N;n++){
+ 		if(abs(d_cal_host_wmma[m*MATRIX_N+n]-d_host_wmma[m*MATRIX_N+n])) 
+		{	
+			printf("ERROR:\n");
+			suc=0;
+		}
+	}
+   }
+   if(suc==1)
+	printf("COMPLETED_SUCCESSFULLY\n");
+   
    
    cudaErrCheck(cudaFree(a_int32));
    cudaErrCheck(cudaFree(b_int32));
