@@ -40,9 +40,9 @@ void cudaErrCheck_(cudaError_t stat, const char *file, int line) {
 using namespace nvcuda;
 
 // Must be multiples of 16 for wmma code to work
-#define MATRIX_M (16)
-#define MATRIX_N (16)
-#define MATRIX_K (16)
+#define MATRIX_M (32)
+#define MATRIX_N (32)
+#define MATRIX_K (32)
 
 
 
@@ -152,27 +152,27 @@ int main(int argc, char* argv[]) {
    b_host_wmma      = (float*)malloc(MATRIX_K * MATRIX_N * sizeof(float));
 
 
-   printf("a\n"); 
+   printf("INITIAL_MATRIX_A\n"); 
    for(int m=0;m<MATRIX_M;m++){
 	for(int n=0;n<MATRIX_K;n++){
 		a_host_wmma[m*MATRIX_K+n]= (rand()%3);///3.0; 
-		printf("%f ",a_host_wmma[m*MATRIX_K+n]);
+		printf("%.2f ",a_host_wmma[m*MATRIX_K+n]);
 	}
 	printf("\n");
    }
-   printf("b\n"); 
+   printf("INITIAL_MATRIX_B\n"); 
    for(int m=0;m<MATRIX_K;m++){
 	for(int n=0;n<MATRIX_N;n++){
 		b_host_wmma[m*MATRIX_N+n]=(rand()%3);///3.0;
-		printf("%f ",b_host_wmma[m*MATRIX_K+n]);
+		printf("%.2f ",b_host_wmma[m*MATRIX_K+n]);
 	}
 	printf("\n");
    }
-   printf("c\n"); 
+   printf("INITIAL_MATRIX_C\n"); 
    for(int m=0;m<MATRIX_M;m++){
 	for(int n=0;n<MATRIX_N;n++){
 		c_host_wmma[m*MATRIX_N+n]= (rand()%3);///3.0;
-		printf("%f ",c_host_wmma[m*MATRIX_K+n]);
+		printf("%.2f ",c_host_wmma[m*MATRIX_K+n]);
 	}
 	printf("\n");
    }
@@ -215,34 +215,8 @@ int main(int argc, char* argv[]) {
    printf("\nChecking results...\n");
    cudaErrCheck(cudaMemcpy(d_host_wmma, c_wmma, MATRIX_M * MATRIX_N * sizeof(float), cudaMemcpyDeviceToHost));
    
-   printf("wmma:d\n"); 
-   for(int m=0;m<MATRIX_M;m++){
-	for(int n=0;n<MATRIX_N;n++){
-		printf("%f ",d_host_wmma[m*MATRIX_K+n]);
-	}
-	printf("\n");
-   }
-   printf("wmma:d\n"); 
-   for(int m=0;m<MATRIX_M;m++){
-	for(int n=0;n<MATRIX_N;n++){
-		printf("%f ",d_host_wmma[m*MATRIX_K+n]);
-	}
-	printf("\n");
-   }
-   printf("wmma:d\n"); 
-   for(int m=0;m<MATRIX_M;m++){
-	for(int n=0;n<MATRIX_N;n++){
-		printf("%f ",d_host_wmma[m*MATRIX_K+n]);
-	}
-	printf("\n");
-   }
-   printf("wmma:d\n"); 
-   for(int m=0;m<MATRIX_M;m++){
-	for(int n=0;n<MATRIX_N;n++){
-		printf("%f ",d_host_wmma[m*MATRIX_K+n]);
-	}
-	printf("\n");
-   }
+   int t=200000000;
+   while(t-->0);
    for(int m=0;m<MATRIX_M;m++){
 	for(int n=0;n<MATRIX_N;n++){
 		d_cal_host_wmma[n*MATRIX_N+m]=0;
