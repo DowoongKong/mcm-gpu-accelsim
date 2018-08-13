@@ -20,9 +20,9 @@ void curandErrCheck_(curandStatus_t stat, const char *file, int line) {
 using namespace nvcuda;
 
 // Must be multiples of 16 for wmma code to work
-#define MATRIX_M (32)
-#define MATRIX_N (32)
-#define MATRIX_K (32)
+#define MATRIX_M (1024)
+#define MATRIX_N (1024)
+#define MATRIX_K (1024)
 
 
 // The only dimensions currently supported by WMMA
