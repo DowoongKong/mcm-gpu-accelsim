@@ -73,4 +73,5 @@ See ${BUILD_URL} for full build detials.
 <pre>            10.1:
 <pre>               https://engineering.purdue.edu/tgrogers/gpgpu-sim-plots/jenkins/${JOB_NAME}/${BUILD_NUMBER}/titanv-cycles.cuda-10.1.html
 <pre>               https://engineering.purdue.edu/tgrogers/gpgpu-sim-plots/jenkins/${JOB_NAME}/${BUILD_NUMBER}/titanv-cycles.cuda-10.1.apps.txt
+<pre>       Correlation also posted to: https://engineering.purdue.edu/tgrogers/group/correlator.html
 </BODY>
