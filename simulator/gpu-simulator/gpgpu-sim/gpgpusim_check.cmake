@@ -116,7 +116,7 @@ execute_process(
 # Get debug or release
 # Set with -DCMAKE_BUILD_TYPE=Debug|Release to change build type
 message(CHECK_START "Checking for CMAKE_BUILD_TYPE")
-if(NOT CMAKE_BUILD_TYPE)
+if(NOT ${CMAKE_BUILD_TYPE})
     set(CMAKE_BUILD_TYPE Release)
     set(GPGPUSIM_BUILD_MODE "release" CACHE STRING "" FORCE)
 else()
