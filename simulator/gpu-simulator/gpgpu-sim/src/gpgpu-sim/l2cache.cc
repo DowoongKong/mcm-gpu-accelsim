@@ -559,7 +559,7 @@ void memory_sub_partition::cache_cycle(unsigned cycle) {
             if (mf->get_access_type() == L1_WRBK_ACC) {
               m_request_tracker.erase(mf);
               delete mf;
-            } else {
+            } else if (m_config->m_L2_config.get_write_policy() == WRITE_BACK) {
               mf->set_reply();
               mf->set_status(IN_PARTITION_L2_TO_ICNT_QUEUE,
                              m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
