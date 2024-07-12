@@ -4138,10 +4138,7 @@ void opndcoll_rfu_t::init(unsigned num_banks, shader_core_ctx *shader) {
   // for( unsigned n=0; n<m_num_ports;n++ )
   //    m_dispatch_units[m_output[n]].init( m_num_collector_units[n] );
   m_num_banks = num_banks;
-  m_bank_warp_shift = 0;
   m_warp_size = shader->get_config()->warp_size;
-  m_bank_warp_shift = (unsigned)(int)(log(m_warp_size + 0.5) / log(2.0));
-  assert((m_bank_warp_shift == 5) || (m_warp_size != 32));
 
   sub_core_model = shader->get_config()->sub_core_model;
   m_num_warp_scheds = shader->get_config()->gpgpu_num_sched_per_core;
@@ -4159,7 +4156,7 @@ void opndcoll_rfu_t::init(unsigned num_banks, shader_core_ctx *shader) {
       unsigned cusPerSched = m_cu.size() / m_num_warp_scheds;
       reg_id = j / cusPerSched;
     }
-    m_cu[j]->init(j, num_banks, m_bank_warp_shift, shader->get_config(), this,
+    m_cu[j]->init(j, num_banks, shader->get_config(), this,
                   sub_core_model, reg_id, m_num_banks_per_sched);
   }
   for (unsigned j = 0; j < m_dispatch_units.size(); j++) {
@@ -4168,11 +4165,11 @@ void opndcoll_rfu_t::init(unsigned num_banks, shader_core_ctx *shader) {
   m_initialized = true;
 }
 
-int register_bank(int regnum, int wid, unsigned num_banks,
-                  unsigned bank_warp_shift, bool sub_core_model,
+unsigned register_bank(int regnum, int wid, unsigned num_banks,
+                  bool sub_core_model,
                   unsigned banks_per_sched, unsigned sched_id) {
   int bank = regnum;
-  if (bank_warp_shift) bank += wid;
+  bank += wid;
   if (sub_core_model) {
     unsigned bank_num = (bank % banks_per_sched) + (sched_id * banks_per_sched);
     assert(bank_num < num_banks);
@@ -4190,12 +4187,12 @@ bool opndcoll_rfu_t::writeback(warp_inst_t &inst) {
                                           // in function_info::ptx_decode_inst
     if (reg_num >= 0) {                   // valid register
       unsigned bank = register_bank(reg_num, inst.warp_id(), m_num_banks,
-                                    m_bank_warp_shift, sub_core_model,
+                                    sub_core_model,
                                     m_num_banks_per_sched, inst.get_schd_id());
       if (m_arbiter.bank_idle(bank)) {
         m_arbiter.allocate_bank_for_write(
             bank,
-            op_t(&inst, reg_num, m_num_banks, m_bank_warp_shift, sub_core_model,
+            op_t(&inst, reg_num, m_num_banks, sub_core_model,
                  m_num_banks_per_sched, inst.get_schd_id()));
         inst.arch_reg.dst[op] = -1;
       } else {
@@ -4305,7 +4302,7 @@ void opndcoll_rfu_t::allocate_reads() {
     unsigned reg = rr.get_reg();
     unsigned wid = rr.get_wid();
     unsigned bank =
-        register_bank(reg, wid, m_num_banks, m_bank_warp_shift, sub_core_model,
+        register_bank(reg, wid, m_num_banks, sub_core_model,
                       m_num_banks_per_sched, rr.get_sid());
     m_arbiter.allocate_for_read(bank, rr);
     read_ops[bank] = rr;
@@ -4357,7 +4354,7 @@ void opndcoll_rfu_t::collector_unit_t::dump(
 }
 
 void opndcoll_rfu_t::collector_unit_t::init(
-    unsigned n, unsigned num_banks, unsigned log2_warp_size,
+    unsigned n, unsigned num_banks,
     const core_config *config, opndcoll_rfu_t *rfu, bool sub_core_model,
     unsigned reg_id, unsigned banks_per_sched) {
   m_rfu = rfu;
@@ -4365,7 +4362,6 @@ void opndcoll_rfu_t::collector_unit_t::init(
   m_num_banks = num_banks;
   assert(m_warp == NULL);
   m_warp = new warp_inst_t(config);
-  m_bank_warp_shift = log2_warp_size;
   m_sub_core_model = sub_core_model;
   m_reg_id = reg_id;
   m_num_banks_per_sched = banks_per_sched;
@@ -4393,7 +4389,7 @@ bool opndcoll_rfu_t::collector_unit_t::allocate(register_set *pipeline_reg_set,
       }
       if (reg_num >= 0 && new_reg) {          // valid register
         prev_regs.push_back(reg_num);
-        m_src_op[op] = op_t(this, op, reg_num, m_num_banks, m_bank_warp_shift,
+        m_src_op[op] = op_t(this, op, reg_num, m_num_banks,
                             m_sub_core_model, m_num_banks_per_sched,
                             (*pipeline_reg)->get_schd_id());
         m_not_ready.set(op);
