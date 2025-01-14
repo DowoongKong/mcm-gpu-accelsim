@@ -56,6 +56,7 @@ class stream_manager *g_stream_manager() {
 
 // SST callback
 extern void SST_callback_cudaThreadSynchronize_done();
+__attribute__((weak)) void SST_callback_cudaThreadSynchronize_done() {}
 
 void *gpgpu_sim_thread_sequential(void *ctx_ptr) {
   gpgpu_context *ctx = (gpgpu_context *)ctx_ptr;

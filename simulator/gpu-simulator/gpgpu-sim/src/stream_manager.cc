@@ -39,6 +39,10 @@ extern void SST_callback_memcpy_H2D_done();
 extern void SST_callback_memcpy_D2H_done();
 extern void SST_callback_memcpy_to_symbol_done();
 extern void SST_callback_memcpy_from_symbol_done();
+__attribute__((weak)) void SST_callback_memcpy_H2D_done() {}
+__attribute__((weak)) void SST_callback_memcpy_D2H_done() {}
+__attribute__((weak)) void SST_callback_memcpy_to_symbol_done() {}
+__attribute__((weak)) void SST_callback_memcpy_from_symbol_done() {}
 
 CUstream_st::CUstream_st() {
   m_pending = false;
