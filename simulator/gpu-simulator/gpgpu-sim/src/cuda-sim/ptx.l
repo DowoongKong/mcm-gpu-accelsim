@@ -1,6 +1,7 @@
 /*
-Copyright (c) 2009-2021, Tor M. Aamodt, Vijay Kandiah, Nikos Hardavellas
-The University of British Columbia, Northwestern University
+Copyright (c) 2009-2021, Tor M. Aamodt, Vijay Kandiah, Nikos Hardavellas, 
+Mahmoud Khairy, Junrui Pan, Timothy G. Rogers
+The University of British Columbia, Northwestern University, Purdue University
 All rights reserved.
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
@@ -133,6 +134,7 @@ selp	TC; yylval->int_value = SELP_OP; return OPCODE;
 setp    TC; yylval->int_value = SETP_OP; return OPCODE;
 set	TC; yylval->int_value = SET_OP; return OPCODE;
 shfl	TC; yylval->int_value = SHFL_OP; return OPCODE;
+shf	TC; yylval->int_value = SHF_OP; return OPCODE;
 shl     TC; yylval->int_value = SHL_OP; return OPCODE;
 shr     TC; yylval->int_value = SHR_OP; return OPCODE;
 sin	TC; yylval->int_value = SIN_OP; return OPCODE;
@@ -316,6 +318,9 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 
 \.sat	TC; return SAT_OPTION;
 
+\.l		TC; return LEFT_OPTION;
+\.r		TC; return RIGHT_OPTION;
+
 \.eq    TC; return EQ_OPTION;
 \.ne    TC; return NE_OPTION;
 \.lt    TC; return LT_OPTION;
@@ -353,6 +358,8 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.arrive TC; return ARRIVE_OPTION;
 \.red TC; return RED_OPTION;
 
+\.clamp	TC; return CLAMP_OPTION;
+\.wrap	TC; return WRAP_OPTION;
 
 \.approx TC; return APPROX_OPTION;
 \.full  TC; return FULL_OPTION;
