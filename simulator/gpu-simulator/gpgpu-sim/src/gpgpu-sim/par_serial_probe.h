@@ -33,11 +33,11 @@
 //   across all of them and is listed first because 3 of the 4 top same-phase
 //   TSan sites are on the icnt push path.
 enum par_probe_subsys {
-  PAR_PROBE_ICNT = 0,   // icnt_push / icnt_has_buffer / icnt_pop entry points
-  PAR_PROBE_FETCH,      // shader_core_ctx::decode() + fetch(): L1I cycle
-  PAR_PROBE_ISSUE,      // shader_core_ctx::issue(): issue_warp inst copy
-  PAR_PROBE_EXEC,       // shader_core_ctx::execute_c() + read_operands()
-  PAR_PROBE_N
+  PAR_PROBE_ICNT = 0,   // env token "icnt":  icnt_push / has_buffer / pop entry points
+  PAR_PROBE_FETCH,      // env token "fetch": shader_core_ctx::decode() + fetch(): L1I cycle
+  PAR_PROBE_ISSUE,      // env token "issue": shader_core_ctx::issue(): issue_warp inst copy
+  PAR_PROBE_EXEC,       // env token "mf" (historical): execute_c() + read_operands()
+  PAR_PROBE_N           // token strings live in g_probe_names (par_serial_probe.cc)
 };
 
 // Must be called once, from the serial region, before any parallel region is

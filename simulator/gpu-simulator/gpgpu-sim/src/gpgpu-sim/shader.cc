@@ -1623,6 +1623,10 @@ void scheduler_unit::cycle() {
   }
 
   // issue stall statistics:
+  // RACE (findings.ko.md BUG-7): shader_cycle_distro[] is shared by every SM
+  // and these increments (plus the two other sites in this file) run inside
+  // the parallel CORE phase without an atomic -- the one W5-class counter
+  // group the atomic sweep missed. Stats-only impact; fix pending approval.
   if (!valid_inst)
     m_stats->shader_cycle_distro[0]++;  // idle or control hazard
   else if (!ready_inst)
@@ -2438,9 +2442,10 @@ bool ldst_unit::constant_cycle(warp_inst_t &inst, mem_stage_stall_type &rc_fail,
     rc_fail = fail;  // keep other fails if this didn't fail.
     fail_type = C_MEM;
     if (rc_fail == BK_CONF or rc_fail == COAL_STALL) {
-      m_stats->gpgpu_n_cmem_portconflict++;  // coal stalls aren't really a bank
-                                             // conflict, but this maintains
-                                             // previous behavior.
+      // RACE (findings.ko.md BUG-8): shared scalar stat incremented from every
+      // SM in the parallel phase; missed by the W5 atomic sweep. Coal stalls
+      // aren't really a bank conflict, but this maintains previous behavior.
+      m_stats->gpgpu_n_cmem_portconflict++;
     }
   }
   return inst.accessq_empty();  // done if empty.

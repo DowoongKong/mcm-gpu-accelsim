@@ -1808,8 +1808,10 @@ class shader_core_config : public core_config {
   unsigned gpgpu_l1_tlb_2m_mshr_entries;
   unsigned gpgpu_l1_tlb_2m_mshr_max_merge;
   unsigned gpgpu_l1_tlb_2m_lookup_latency;
-  // page size policy: 0 = all 4KB (baseline), 1 = size-based (>=2MB alloc uses
-  // a 2MB page), 2 = all 2MB
+  // Page size policy (authoritative decode: gpgpu_sim::decide_page_shift()).
+  // Fixed: 0 = all 4KB (baseline), 1 = all 64KB, 2 = all 2MB.
+  // Automatic (largest page with alloc size >= page size): 3 = 4K/64K/2M,
+  // 4 = 4K/2M, 5 = 4K/64K.
   unsigned gpgpu_page_size_policy;
   // How many L1->L2 TLB requests one SM may hand over per cycle. Models the
   // width of the SM-to-L2-TLB request interface.
