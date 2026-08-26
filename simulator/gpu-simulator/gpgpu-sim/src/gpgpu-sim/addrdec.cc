@@ -47,11 +47,11 @@ linear_to_raw_address_translation::linear_to_raw_address_translation() {
   ADDR_CHIP_S = 10;
   memset(addrdec_mklow, 0, N_ADDRDEC);
   memset(addrdec_mkhigh, 64, N_ADDRDEC);
-  addrdec_mask[0] = 0x0000000000001C00;
-  addrdec_mask[1] = 0x0000000000000300;
-  addrdec_mask[2] = 0x000000000FFF0000;
-  addrdec_mask[3] = 0x000000000000E0FF;
-  addrdec_mask[4] = 0x000000000000000F;
+  addrdec_mask[0] = 0x0000000000001C00;  // bits 10-12 for chip select (3 bits for 8 channels)
+  addrdec_mask[1] = 0x0000000000000300;  // bits 8-9 for bank select (2 bits for 4 banks)
+  addrdec_mask[2] = 0x000000000FFF0000;  // bits 16-27 for row select (12 bits for 4096 rows)
+  addrdec_mask[3] = 0x000000000000E0FF;  // bits 9-12 and 13-15 for column select (8 bits for 256 columns)
+  addrdec_mask[4] = 0x000000000000000F;  // bits 4-7 for burst select (4 bits for 16 beats)
 }
 
 void linear_to_raw_address_translation::addrdec_setoption(option_parser_t opp) {

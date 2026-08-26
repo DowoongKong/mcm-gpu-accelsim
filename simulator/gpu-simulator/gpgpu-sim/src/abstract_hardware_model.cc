@@ -45,6 +45,11 @@
 
 void mem_access_t::init(gpgpu_context *ctx) {
   gpgpu_ctx = ctx;
+  // G6: same class of race as G5 (mem_fetch uid). mem_access_t objects are
+  // built during the parallel CORE phase (generate_mem_accesses at issue), so
+  // a plain read-modify-write on the shared counter is a data race. The uid is
+  // never compared by the model, so only uniqueness matters.
+#pragma omp atomic capture
   m_uid = ++(gpgpu_ctx->sm_next_access_uid);
   m_addr = 0;
   m_req_size = 0;
@@ -55,6 +60,19 @@ void warp_inst_t::issue(const active_mask_t &mask, unsigned warp_id,
                         int sch_id, unsigned long long streamID) {
   m_warp_active_mask = mask;
   m_warp_issued_mask = mask;
+  // G6: this counter is bumped by every SM's issue stage inside the parallel
+  // CORE phase, and the uid it hands out IS model-visible: register_set::
+  // get_ready() / get_ready_reg_id() pick the OLDEST (minimum-uid) instruction
+  // among a core's pipeline registers (EX_WB writeback order among others).
+  // With a plain non-atomic ++ a stale delayed store can roll the counter
+  // BACKWARDS, so a later instruction of the SAME core can receive a smaller
+  // uid than one still in flight -- get_ready() then picks a different
+  // "oldest" and the trajectory forks (observed as one random SM falling a few
+  // cycles behind at 8/16 threads). Atomic capture makes the counter globally
+  // monotone, which restores the only property the model consumes: uids of one
+  // core's instructions strictly increase in issue order. Absolute values may
+  // differ from a 1-thread run; they are never compared across cores.
+#pragma omp atomic capture
   m_uid = ++(m_config->gpgpu_ctx->warp_inst_sm_next_uid);
   m_streamID = streamID;
   m_warp_id = warp_id;
@@ -187,6 +205,7 @@ gpgpu_t::gpgpu_t(const gpgpu_functional_sim_config &config, gpgpu_context *ctx)
   m_surf_mem = new memory_space_impl<8192>("surf", 64 * 1024);
 
   m_dev_malloc = GLOBAL_HEAP_START;
+  // m_dev_malloc = GPU_VA_HEAP_START;  // new
   checkpoint_option = m_function_model_config.get_checkpoint_option();
   checkpoint_kernel = m_function_model_config.get_checkpoint_kernel();
   checkpoint_CTA = m_function_model_config.get_checkpoint_CTA();
@@ -782,6 +801,10 @@ kernel_info_t::kernel_info_t(dim3 gridDim, dim3 blockDim,
       num_blocks() * entry->gpgpu_ctx->device_runtime->g_TB_launch_latency;
 
   cache_config_set = false;
+  
+  // Initialize LASP configuration with default values
+  m_lasp_config.policy = lasp::KERNEL_WIDE;
+  m_lasp_config.chunk_size = 1;
 }
 
 /*A snapshot of the texture mappings needs to be stored in the kernel's info as
@@ -815,6 +838,10 @@ kernel_info_t::kernel_info_t(
   cache_config_set = false;
   m_NameToCudaArray = nameToCudaArray;
   m_NameToTextureInfo = nameToTextureInfo;
+  
+  // Initialize LASP configuration with default values
+  m_lasp_config.policy = lasp::KERNEL_WIDE;
+  m_lasp_config.chunk_size = 1;
 }
 
 kernel_info_t::~kernel_info_t() {

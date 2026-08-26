@@ -31,6 +31,7 @@
 #include "../intersim2/globals.hpp"
 #include "../intersim2/interconnect_interface.hpp"
 #include "local_interconnect.h"
+#include "par_serial_probe.h"
 
 icnt_create_p icnt_create;
 icnt_init_p icnt_init;
@@ -101,16 +102,22 @@ static void LocalInterconnect_create(unsigned int n_shader,
 
 static void LocalInterconnect_init() { g_localicnt_interface->Init(); }
 
+// The par_probe_guard on these three is the ACCELSIM_SERIAL_SUBSYS=icnt probe:
+// 3 of the 4 most frequent same-phase TSan sites sit on this path, reached from
+// every SM's L1I during phase C. Inert unless the probe is selected.
 static bool LocalInterconnect_has_buffer(unsigned input, unsigned int size) {
+  par_probe_guard g(PAR_PROBE_ICNT);
   return g_localicnt_interface->HasBuffer(input, size);
 }
 
 static void LocalInterconnect_push(unsigned input, unsigned output, void* data,
                                    unsigned int size) {
+  par_probe_guard g(PAR_PROBE_ICNT);
   g_localicnt_interface->Push(input, output, data, size);
 }
 
 static void* LocalInterconnect_pop(unsigned output) {
+  par_probe_guard g(PAR_PROBE_ICNT);
   return g_localicnt_interface->Pop(output);
 }
 
@@ -158,6 +165,25 @@ void icnt_reg_options(class OptionParser* opp) {
                          &g_inct_config.verbose, "inct_verbose", "0");
   option_parser_register(opp, "-icnt_grant_cycles", OPT_UINT32,
                          &g_inct_config.grant_cycles, "grant_cycles", "1");
+  
+  option_parser_register(opp, "-icnt_use_ring", OPT_UINT32,
+                         &g_inct_config.use_ring,
+                         "1 = inter-chiplet ring, 0 = direct handoff", "0");
+  option_parser_register(opp, "-icnt_ring_buf", OPT_UINT32,
+                         &g_inct_config.ring_buf,
+                         "ring per-link/eject buffer depth (packets)", "64");
+  option_parser_register(opp, "-icnt_ring_hop_latency", OPT_UINT32,
+                         &g_inct_config.ring_hop_latency,
+                         "ring per-hop latency in cycles (paper: 32)", "32");
+  option_parser_register(opp, "-icnt_ring_link_width", OPT_UINT32,
+                         &g_inct_config.ring_link_width,
+                         "ring flits drained per cycle per link (BW = width*flit*freq)", "1");
+  // Default 5: per-port BW = 5 * 40B * 1.395GHz = 279 GB/s >= HBM2 stack (256 GB/s),
+  // so a single intra-chiplet xbar port can sink a chiplet's HBM2 bandwidth.
+  option_parser_register(opp, "-icnt_xbar_port_width", OPT_UINT32,
+                         &g_inct_config.xbar_port_width,
+                         "intra-chiplet xbar flits drained per cycle per OUTPUT port "
+                         "(per-port BW = width*flit*freq)", "5");
 }
 
 void icnt_wrapper_init() {
@@ -195,4 +221,17 @@ void icnt_wrapper_init() {
       assert(0);
       break;
   }
+}
+
+void icnt_configure_chiplets(unsigned n_chiplets,
+                             const std::vector<unsigned>& cluster_to_chiplet,
+                             const std::vector<unsigned>& mem_sub_to_chiplet) {
+  // Only the LocalInterconnect backend is split per chiplet (Phase 1).
+  if (g_network_mode == LOCAL_XBAR && g_localicnt_interface)
+    g_localicnt_interface->configure_chiplets(n_chiplets, cluster_to_chiplet,
+                                              mem_sub_to_chiplet);
+}
+
+bool icnt_ring_enabled() {
+  return g_network_mode == LOCAL_XBAR && g_inct_config.use_ring != 0;
 }

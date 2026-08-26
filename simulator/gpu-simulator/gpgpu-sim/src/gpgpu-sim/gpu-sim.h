@@ -67,6 +67,7 @@
 #define DUMPLOG 333
 
 class gpgpu_context;
+class gpu_module; //jb
 
 extern tr1_hash_map<new_addr_type, unsigned> address_random_interleaving;
 
@@ -388,6 +389,7 @@ class memory_config {
   linear_to_raw_address_translation m_address_mapping;
 
   unsigned icnt_flit_size;
+  unsigned icnt_inter_flit_size;
 
   unsigned dram_bnk_indexing_policy;
   unsigned dram_bnkgrp_indexing_policy;
@@ -405,6 +407,104 @@ class memory_config {
 };
 
 extern bool g_interactive_debugger_enabled;
+
+// ============================================================
+// CTA Scheduling Policy
+// ============================================================
+// Mirrors the warp-scheduler pattern (scheduler_unit in shader.h):
+// abstract base class + policy subclasses declared here,
+// implemented in gpu-sim.cc near issue_block2core().
+
+// Selects which CTA-to-cluster assignment policy is used.
+// Controlled by config option -gpgpu_cta_scheduling_policy.
+enum cta_scheduling_policy_t {
+  CTA_SCHED_SEQUENTIAL          = 0,  // original: clusters visited 0..N-1
+  CTA_SCHED_ROUND_ROBIN_CHIPLET = 1,  // chiplet-interleaved ordering
+  // Each CTA has a fixed home chiplet, chiplet = cta_id % n_chiplets, enforced
+  // strictly (a CTA waits for its chiplet rather than spilling elsewhere). The
+  // mapping is a pure function of the CTA id, so it cannot drift with timing --
+  // required for the local-PTW A/B: under policy 1 the chiplet a CTA lands on
+  // depends on which cluster happens to be free, so a pure timing knob like
+  // -gmmu_local_ptw would shift the CTA->chiplet map and confound the result.
+  CTA_SCHED_STATIC_BINDING      = 2,
+};
+
+// Abstract base: subclasses return the cluster visit order for one
+// scheduling round.  issue_block2core() iterates the returned order
+// and issues at most one CTA per cluster per call.
+class cta_scheduler_t {
+ public:
+  virtual ~cta_scheduler_t() {}
+
+  // Returns the ordered list of cluster indices to visit this round.
+  // n_clusters  : total SM clusters in the simulation.
+  // n_chiplets  : number of chiplets; must divide n_clusters evenly.
+  // last_issued : cluster that last successfully issued a CTA
+  //               (used by SEQUENTIAL to maintain round-robin offset;
+  //                ignored by ROUND_ROBIN_CHIPLET).
+  virtual std::vector<unsigned> cluster_order(unsigned n_clusters,
+                                              unsigned n_chiplets,
+                                              unsigned last_issued) = 0;
+
+  virtual const char* policy_name() const = 0;
+
+  // Factory: allocates and returns the scheduler for the given policy.
+  static cta_scheduler_t* create(cta_scheduling_policy_t policy);
+};
+
+// Reproduces the original issue_block2core() visit order.
+// Clusters are visited starting one past last_issued, wrapping around.
+class SequentialScheduler : public cta_scheduler_t {
+ public:
+  std::vector<unsigned> cluster_order(unsigned n_clusters,
+                                      unsigned n_chiplets,
+                                      unsigned last_issued) override;
+  const char* policy_name() const override { return "SEQUENTIAL"; }
+};
+
+// Chiplet-level round-robin: for each intra-chiplet slot, all chiplets are
+// visited before moving to the next slot.  Consecutive CTAs therefore land
+// on successive chiplets, maximising first-touch locality across chiplets.
+// The starting chiplet rotates each round to avoid systematic bias.
+//
+// Example (4 chiplets, 8 clusters/chiplet, m_start_chiplet=0):
+//   slot 0: cluster  0, 8, 16, 24
+//   slot 1: cluster  1, 9, 17, 25
+//   ...
+//   slot 7: cluster  7, 15, 23, 31
+// Static binding: a CTA's home chiplet is chiplet = cta_id % n_chiplets, a pure
+// function of the CTA id. The cluster visit order is the chiplet-interleaved one
+// but WITHOUT the per-call rotation, so nothing here depends on the cycle count.
+// The affinity itself is enforced in simt_core_cluster::issue_block2core().
+class StaticBindingScheduler : public cta_scheduler_t {
+ public:
+  std::vector<unsigned> cluster_order(unsigned n_clusters, unsigned n_chiplets,
+                                      unsigned /*last_issued*/) override {
+    assert(n_chiplets > 0 && n_clusters % n_chiplets == 0);
+    unsigned clusters_per_chiplet = n_clusters / n_chiplets;
+    std::vector<unsigned> order;
+    order.reserve(n_clusters);
+    for (unsigned slot = 0; slot < clusters_per_chiplet; slot++)
+      for (unsigned chip = 0; chip < n_chiplets; chip++)
+        order.push_back(chip * clusters_per_chiplet + slot);
+    return order;
+  }
+  const char* policy_name() const override { return "STATIC_BINDING"; }
+};
+
+class RoundRobinChipletScheduler : public cta_scheduler_t {
+ public:
+  RoundRobinChipletScheduler() : m_start_chiplet(0) {}
+  std::vector<unsigned> cluster_order(unsigned n_clusters,
+                                      unsigned n_chiplets,
+                                      unsigned last_issued) override;
+  const char* policy_name() const override { return "ROUND_ROBIN_CHIPLET"; }
+
+ private:
+  unsigned m_start_chiplet;  // chiplet to lead the current round
+};
+// ============================================================
+
 
 class gpgpu_sim_config : public power_config,
                          public gpgpu_functional_sim_config {
@@ -447,6 +547,10 @@ class gpgpu_sim_config : public power_config,
   unsigned num_shader() const { return m_shader_config.num_shader(); }
   unsigned num_cluster() const { return m_shader_config.n_simt_clusters; }
   unsigned get_max_concurrent_kernel() const { return max_concurrent_kernel; }
+  // jb
+  unsigned get_num_chiplets() const { return m_n_chiplets; }
+  unsigned get_icnt_inter_hop_latency_ns() const { return icnt_inter_hop_latency_ns; }
+
 
   /**
    * @brief Check if we are in SST mode
@@ -466,6 +570,30 @@ class gpgpu_sim_config : public power_config,
   }
 
   bool flush_l1() const { return gpgpu_flush_l1_cache; }
+  unsigned get_gpu_mem_size_mb() const { return gpu_mem_size_mb; }
+  unsigned get_gmmu_n_ptw()      const { return gmmu_n_ptw; }      // P3
+  unsigned get_gmmu_pwq_depth()  const { return gmmu_pwq_depth; }  // P3
+  unsigned get_gmmu_pwc_entries() const { return gmmu_pwc_entries; }  // P3
+  const char* get_gmmu_placement_dump() const { return gmmu_placement_dump; }
+  const char* get_gmmu_placement_load() const { return gmmu_placement_load; }
+  bool get_gmmu_local_ptw() const { return gmmu_local_ptw; }
+  unsigned get_l2_tlb_ports() const { return m_shader_config.gpgpu_l2_tlb_ports; }
+  unsigned get_l2_tlb_sets()         const { return m_l2_tlb_sets; }  // P5
+  unsigned get_l2_tlb_assoc()        const { return m_l2_tlb_assoc; }  // P5
+  unsigned get_l2_tlb_mshr_entries() const { return m_l2_tlb_mshr_entries; }  // P5
+  unsigned get_l2_tlb_mshr_max_merge() const { return m_l2_tlb_mshr_max_merge; }
+  unsigned get_l2_tlb_lookup_latency() const { return m_l2_tlb_lookup_latency; }
+  // L2 TLB (64KB / 2MB): mirror the getters above. The unsuffixed ones stay 4KB-only.
+  unsigned get_l2_tlb_64k_sets()           const { return m_l2_tlb_64k_sets; }
+  unsigned get_l2_tlb_64k_assoc()          const { return m_l2_tlb_64k_assoc; }
+  unsigned get_l2_tlb_64k_mshr_entries()   const { return m_l2_tlb_64k_mshr_entries; }
+  unsigned get_l2_tlb_64k_mshr_max_merge() const { return m_l2_tlb_64k_mshr_max_merge; }
+  unsigned get_l2_tlb_64k_lookup_latency() const { return m_l2_tlb_64k_lookup_latency; }
+  unsigned get_l2_tlb_2m_sets()           const { return m_l2_tlb_2m_sets; }
+  unsigned get_l2_tlb_2m_assoc()          const { return m_l2_tlb_2m_assoc; }
+  unsigned get_l2_tlb_2m_mshr_entries()   const { return m_l2_tlb_2m_mshr_entries; }
+  unsigned get_l2_tlb_2m_mshr_max_merge() const { return m_l2_tlb_2m_mshr_max_merge; }
+  unsigned get_l2_tlb_2m_lookup_latency() const { return m_l2_tlb_2m_lookup_latency; }
 
  private:
   void init_clock_domains(void);
@@ -484,6 +612,8 @@ class gpgpu_sim_config : public power_config,
   double icnt_period;
   double dram_period;
   double l2_period;
+  unsigned icnt_inter_hop_latency_ns;  // inter-chiplet one-way latency (ns), 0 = off
+
 
   // GPGPU-Sim timing model options
   unsigned long long gpu_max_cycle_opt;
@@ -518,6 +648,56 @@ class gpgpu_sim_config : public power_config,
   unsigned int gpgpu_compute_capability_major;
   unsigned int gpgpu_compute_capability_minor;
   unsigned long long liveness_message_freq;
+
+  // jb
+  unsigned m_n_chiplets;
+  unsigned m_cta_sched_policy;  // set by -gpgpu_cta_scheduling_policy (P3-5)
+  // LASP CTA scheduling (LADM, MICRO'20), selected per run via config (S40).
+  // 0=off keeps the pre-LASP issue path; the locality type is supplied
+  // manually (oracle locality table stand-in for the paper's compiler pass).
+  unsigned m_lasp_policy;      // -gpgpu_lasp_policy: 0=off 1=row 2=col 3=chunk
+  unsigned m_lasp_chunk_size;  // -gpgpu_lasp_chunk_size for policy=3
+ public:
+  unsigned get_cta_sched_policy() const { return m_cta_sched_policy; }
+  unsigned get_lasp_policy() const { return m_lasp_policy; }
+  unsigned get_lasp_chunk_size() const { return m_lasp_chunk_size; }
+ private:
+  unsigned gpu_mem_size_mb;  // new: total device memory size in MB
+
+  // P3
+  unsigned gmmu_n_ptw;
+  unsigned gmmu_pwq_depth;
+  unsigned gmmu_pwc_entries;
+  
+  // Placement snapshot for the local-PTW experiment (see
+  // docs/localptw_port_design.ko.md). Both default to "" (disabled), in which
+  // case first-touch placement behaves exactly as before.
+  char* gmmu_placement_dump;  // write VA->owner map at exit
+  char* gmmu_placement_load;  // pre-map every page from this map before kernel 1
+
+  // local PTW-only: give every chiplet its own physical copy of the page table
+  // (own root = CR3, own node pages), so a page walk never leaves the chiplet.
+  // Data pages are NOT replicated: the leaf PTE still points at the data page's
+  // home chiplet, so remote *data* accesses cost exactly what they did before.
+  // 0 = baseline (one distributed page table).
+  bool gmmu_local_ptw;
+
+  // P5
+  unsigned m_l2_tlb_sets;          // set by -gpgpu_l2_tlb_sets
+  unsigned m_l2_tlb_assoc;         // set by -gpgpu_l2_tlb_assoc
+  unsigned m_l2_tlb_mshr_entries;  // set by -gpgpu_l2_tlb_mshr_entries
+  unsigned m_l2_tlb_mshr_max_merge;  // set by -gpgpu_l2_tlb_mshr_max_merge
+  unsigned m_l2_tlb_lookup_latency;  // set by -gpgpu_l2_tlb_lookup_latency
+  unsigned m_l2_tlb_64k_sets;            // set by -gpgpu_l2_tlb_64k_sets
+  unsigned m_l2_tlb_64k_assoc;
+  unsigned m_l2_tlb_64k_mshr_entries;
+  unsigned m_l2_tlb_64k_mshr_max_merge;
+  unsigned m_l2_tlb_64k_lookup_latency;
+  unsigned m_l2_tlb_2m_sets;            // set by -gpgpu_l2_tlb_2m_sets
+  unsigned m_l2_tlb_2m_assoc;           // set by -gpgpu_l2_tlb_2m_assoc
+  unsigned m_l2_tlb_2m_mshr_entries;    // set by -gpgpu_l2_tlb_2m_mshr_entries
+  unsigned m_l2_tlb_2m_mshr_max_merge;  // set by -gpgpu_l2_tlb_2m_mshr_max_merge
+  unsigned m_l2_tlb_2m_lookup_latency;  // set by -gpgpu_l2_tlb_2m_lookup_latency
 
   friend class gpgpu_sim;
   friend class sst_gpgpu_sim;
@@ -601,7 +781,12 @@ class gpgpu_sim : public gpgpu_t {
   void print_stats(unsigned long long streamID);
   void update_stats();
   void deadlock_check();
-  void inc_completed_cta() { gpu_completed_cta++; }
+  // G3: incremented from register_cta_thread_exit() inside the CORE phase.
+  // Counter increment is commutative -> atomic is bit-exact.
+  void inc_completed_cta() {
+#pragma omp atomic
+    gpu_completed_cta++;
+  }
   void get_pdom_stack_top_info(unsigned sid, unsigned tid, unsigned *pc,
                                unsigned *rpc);
 
@@ -629,6 +814,11 @@ class gpgpu_sim : public gpgpu_t {
   const gpgpu_sim_config &get_config() const { return m_config; }
   void gpu_print_stat(unsigned long long streamID);
   void dump_pipeline(int mask, int s, int m) const;
+
+  // Relay cudaMalloc VA range to gpu_module for GMMU fault validation.
+  virtual void on_gpu_malloc(uint64_t va, size_t aligned_size,
+                             unsigned page_shift) override;
+  virtual unsigned decide_page_shift(size_t size) const override;
 
   void perf_memcpy_to_gpu(size_t dst_start_addr, size_t count);
 
@@ -682,6 +872,9 @@ class gpgpu_sim : public gpgpu_t {
   void shader_print_scheduler_stat(FILE *fout, bool print_dynamic_info) const;
   void visualizer_printstat();
   void print_shader_cycle_distro(FILE *fout) const;
+  
+  // NEW: Phase 1 - bind global arrays into chiplet ranges (no remote timing yet)
+  void init_gpu_module_phase1(); //jb
 
   void gpgpu_debug();
 
@@ -690,6 +883,10 @@ class gpgpu_sim : public gpgpu_t {
   class simt_core_cluster **m_cluster;
   class memory_partition_unit **m_memory_partition_unit;
   class memory_sub_partition **m_memory_sub_partition;
+
+  // NEW: Phase 1 MCM wrapper (does not change baseline behavior when num_chiplets == 1)
+  gpu_module *m_gpu_module; //jb
+  unsigned m_n_chiplets; //jb
 
   std::vector<kernel_info_t *> m_running_kernels;
   unsigned m_last_issued_kernel;
@@ -701,7 +898,43 @@ class gpgpu_sim : public gpgpu_t {
   unsigned long long gpu_tot_issued_cta;
   unsigned gpu_completed_cta;
 
+  // T2-PROBE removed in P6c. Its job is done: proposition T2 was proved from the
+  // code (set_kernel_done only ever nulls a kernel that already reports no CTAs
+  // left, so get_more_cta_left() cannot change value during the CORE phase), and
+  // the probe measured exactly zero over the whole 2dconv run and six BFS
+  // kernels. It cost a get_n_active_sms() call per cluster per cycle.
+
+  // P4: cluster ids grouped by owning chiplet, built once. The CORE phase walks
+  // chiplets in the outer loop so each chiplet's work can later be handed to one
+  // thread. Order *within* a chiplet is preserved exactly, which is what the L2
+  // TLB / GMMU state depends on; only the interleaving across chiplets changes,
+  // and those objects are chiplet-private (proposition T5).
+  std::vector<std::vector<unsigned> > m_chiplet_cluster_order;
+
+  // P10: per-cluster run/skip decision, latched in CORE pass A and reused by
+  // passes B and C so all three agree. char rather than bool: std::vector<bool>
+  // packs bits, and neighbouring clusters written by different threads would
+  // then share a word.
+  std::vector<char> m_cluster_ran;
+
   unsigned m_last_cluster_issue;
+  // 39: issue-scan gating. Scan verdict is a pure function of (core occupancy,
+  // kernel set, next_cta, TB_latency); these change only at enumerated events,
+  // each of which bumps the epoch. Written from parallel regions (CTA exit) ->
+  // atomic; read/cleared only in the sequential tail (issue_block2core).
+  unsigned long long m_issue_event_epoch = 1;
+  unsigned long long m_issue_seen_epoch = 0;
+
+ public:
+  void note_issue_event() {
+  #ifdef _OPENMP
+  #pragma omp atomic
+  #endif
+    m_issue_event_epoch++;
+  }
+
+ protected:  // 39: restore the enclosing section's access (region begins at :874)
+  cta_scheduler_t* m_cta_scheduler;  // owns the active scheduling policy object (P3-5)
   float *average_pipeline_duty_cycle;
   float *active_sms;
   // time of next rising edge
@@ -751,6 +984,10 @@ class gpgpu_sim : public gpgpu_t {
   unsigned gpu_sim_insn_last_update_sid;
   occupancy_stats gpu_occupancy;
   occupancy_stats gpu_tot_occupancy;
+
+  // MCM-GPU: Accessor for gpu_module
+  gpu_module* get_gpu_module() const { return m_gpu_module; }
+  unsigned get_num_chiplets() const { return m_n_chiplets; }
 
   typedef struct {
     unsigned long long start_cycle;
@@ -810,6 +1047,7 @@ class exec_gpgpu_sim : public gpgpu_sim {
   exec_gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
       : gpgpu_sim(config, ctx) {
     createSIMTCluster();
+    m_gpu_module->bind_global_arrays(m_cluster, m_memory_partition_unit); // 
   }
 
   virtual void createSIMTCluster();
@@ -824,6 +1062,7 @@ class sst_gpgpu_sim : public gpgpu_sim {
   sst_gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
       : gpgpu_sim(config, ctx) {
     createSIMTCluster();
+    m_gpu_module->bind_global_arrays(m_cluster, m_memory_partition_unit);
   }
 
   // SST memory handling

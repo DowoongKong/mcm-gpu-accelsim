@@ -403,8 +403,8 @@ ptx_reg_t ptx_thread_info::get_operand_value(const operand_info &op,
     // global memory - g[4], g[$r0]
     mem = thread->get_global_memory();
     type_info_key::type_decode(opType, size, t);
-    mem->read(result.u32, size / 8, &finalResult.u128);
-    thread->m_last_effective_address = result.u32;
+    mem->read(result.u64, size / 8, &finalResult.u128);
+    thread->m_last_effective_address = result.u64;
     thread->m_last_memory_space = global_space;
 
     if (opType == S16_TYPE || opType == S32_TYPE)
@@ -413,8 +413,8 @@ ptx_reg_t ptx_thread_info::get_operand_value(const operand_info &op,
     // shared memory - s[4], s[$r0]
     mem = thread->m_shared_mem;
     type_info_key::type_decode(opType, size, t);
-    mem->read(result.u32, size / 8, &finalResult.u128);
-    thread->m_last_effective_address = result.u32;
+    mem->read(result.u64, size / 8, &finalResult.u128);
+    thread->m_last_effective_address = result.u64;
     thread->m_last_memory_space = shared_space;
 
     if (opType == S16_TYPE || opType == S32_TYPE)
@@ -423,9 +423,9 @@ ptx_reg_t ptx_thread_info::get_operand_value(const operand_info &op,
     // const memory - ce0c1[4], ce0c1[$r0]
     mem = thread->get_global_memory();
     type_info_key::type_decode(opType, size, t);
-    mem->read((result.u32 + op.get_const_mem_offset()), size / 8,
+    mem->read((result.u64 + op.get_const_mem_offset()), size / 8,
               &finalResult.u128);
-    thread->m_last_effective_address = result.u32;
+    thread->m_last_effective_address = result.u64;
     thread->m_last_memory_space = const_space;
     if (opType == S16_TYPE || opType == S32_TYPE)
       sign_extend(finalResult, size, dstInfo);
@@ -433,8 +433,8 @@ ptx_reg_t ptx_thread_info::get_operand_value(const operand_info &op,
     // local memory - l0[4], l0[$r0]
     mem = thread->m_local_mem;
     type_info_key::type_decode(opType, size, t);
-    mem->read(result.u32, size / 8, &finalResult.u128);
-    thread->m_last_effective_address = result.u32;
+    mem->read(result.u64, size / 8, &finalResult.u128);
+    thread->m_last_effective_address = result.u64;
     thread->m_last_memory_space = local_space;
     if (opType == S16_TYPE || opType == S32_TYPE)
       sign_extend(finalResult, size, dstInfo);
@@ -753,8 +753,8 @@ void ptx_thread_info::set_operand_value(const operand_info &dst,
     mem = thread->get_global_memory();
     type_info_key::type_decode(type, size, t);
 
-    mem->write(dstData.u32, size / 8, &data.u128, thread, pI);
-    thread->m_last_effective_address = dstData.u32;
+    mem->write(dstData.u64, size / 8, &data.u128, thread, pI);
+    thread->m_last_effective_address = dstData.u64;
     thread->m_last_memory_space = global_space;
   }
 
@@ -764,8 +764,8 @@ void ptx_thread_info::set_operand_value(const operand_info &dst,
     mem = thread->m_shared_mem;
     type_info_key::type_decode(type, size, t);
 
-    mem->write(dstData.u32, size / 8, &data.u128, thread, pI);
-    thread->m_last_effective_address = dstData.u32;
+    mem->write(dstData.u64, size / 8, &data.u128, thread, pI);
+    thread->m_last_effective_address = dstData.u64;
     thread->m_last_memory_space = shared_space;
   }
 
@@ -775,8 +775,8 @@ void ptx_thread_info::set_operand_value(const operand_info &dst,
     mem = thread->m_local_mem;
     type_info_key::type_decode(type, size, t);
 
-    mem->write(dstData.u32, size / 8, &data.u128, thread, pI);
-    thread->m_last_effective_address = dstData.u32;
+    mem->write(dstData.u64, size / 8, &data.u128, thread, pI);
+    thread->m_last_effective_address = dstData.u64;
     thread->m_last_memory_space = local_space;
   }
 
@@ -3382,7 +3382,7 @@ void ld_exec(const ptx_instruction *pI, ptx_thread_info *thread) {
   unsigned vector_spec = pI->get_vector();
 
   memory_space *mem = NULL;
-  addr_t addr = src1_data.u32;
+  addr_t addr = src1_data.u64;
 
   decode_space(space, thread, src1, mem, addr);
 
@@ -3455,7 +3455,7 @@ void mma_st_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
     memory_space_t space = pI->get_space();
 
     memory_space *mem = NULL;
-    addr_t addr = addr_reg.u32;
+    addr_t addr = addr_reg.u64;
 
     new_addr_type mem_txn_addr[MAX_ACCESSES_PER_INSN_PER_THREAD];
     int num_mem_txn = 0;
@@ -3469,8 +3469,8 @@ void mma_st_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
 
     type_info_key::type_decode(type, size, t);
     if (core->get_gpu()->gpgpu_ctx->debug_tensorcore)
-      printf("mma_st: thrd=%d, addr=%x, fp(size=%zu), stride=%d\n", thrd,
-             addr_reg.u32, size, src2_data.u32);
+      printf("mma_st: thrd=%d, addr=%llx, fp(size=%zu), stride=%d\n", thrd,
+             addr_reg.u64, size, src2_data.u32);
     addr_t new_addr =
         addr + thread_group_offset(thrd, wmma_type, wmma_layout, type, stride) *
                    size / 8;
@@ -3575,7 +3575,7 @@ void mma_ld_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
     memory_space_t space = pI->get_space();
 
     memory_space *mem = NULL;
-    addr_t addr = src1_data.u32;
+    addr_t addr = src1_data.u64;
     smid = thread->get_hw_sid();
     if (whichspace(addr) == shared_space) {
       addr = generic_to_shared(smid, addr);
@@ -5751,7 +5751,7 @@ void sst_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     // squeeze the zeros out of the array and store data back into original
     // array
     mem = NULL;
-    addr = src1_data.u32;
+    addr = src1_data.u64;
     space.set_type(global_space);
     decode_space(space, thread, src1, mem, addr);
     // store nonzero entries and indices
@@ -5798,7 +5798,7 @@ void st_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   unsigned vector_spec = pI->get_vector();
 
   memory_space *mem = NULL;
-  addr_t addr = addr_reg.u32;
+  addr_t addr = addr_reg.u64;
 
   decode_space(space, thread, dst, mem, addr);
 
@@ -6545,13 +6545,13 @@ ptx_reg_t srcOperandModifiers(ptx_reg_t opData, operand_info opInfo,
   if (opInfo.get_addr_space() == global_space) {
     mem = thread->get_global_memory();
     type_info_key::type_decode(type, size, t);
-    mem->read(opData.u32, size / 8, &result.u64);
+    mem->read(opData.u64, size / 8, &result.u64);
     if (type == S16_TYPE || type == S32_TYPE)
       sign_extend(result, size, dstInfo);
   } else if (opInfo.get_addr_space() == shared_space) {
     mem = thread->m_shared_mem;
     type_info_key::type_decode(type, size, t);
-    mem->read(opData.u32, size / 8, &result.u64);
+    mem->read(opData.u64, size / 8, &result.u64);
 
     if (type == S16_TYPE || type == S32_TYPE)
       sign_extend(result, size, dstInfo);
@@ -6560,7 +6560,7 @@ ptx_reg_t srcOperandModifiers(ptx_reg_t opData, operand_info opInfo,
     mem = thread->get_global_memory();
     type_info_key::type_decode(type, size, t);
 
-    mem->read((opData.u32 + opInfo.get_const_mem_offset()), size / 8,
+    mem->read((opData.u64 + opInfo.get_const_mem_offset()), size / 8,
               &result.u64);
 
     if (type == S16_TYPE || type == S32_TYPE)

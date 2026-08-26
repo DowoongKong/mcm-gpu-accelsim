@@ -42,6 +42,12 @@ mem_fetch::mem_fetch(const mem_access_t &access, const warp_inst_t *inst,
     : m_access(access)
 
 {
+  // G5: shared static counter bumped from every mem_fetch construction, and
+  // mem_fetch objects are built inside the CORE phase (shader.cc, gpu-cache.cc,
+  // gmmu.cc). A plain read-modify-write here is a data race. The uid itself is
+  // only consumed by mem_fetch::print(), so ordering does not matter -- only
+  // uniqueness does. "atomic capture" gives that at no measurable cost.
+#pragma omp atomic capture
   m_request_uid = sm_next_mf_request_uid++;
   m_access = access;
   if (inst) {
@@ -76,9 +82,21 @@ mem_fetch::mem_fetch(const mem_access_t &access, const warp_inst_t *inst,
     m_raw_addr.chip = m_original_mf->get_tlx_addr().chip;
     m_raw_addr.sub_partition = m_original_mf->get_tlx_addr().sub_partition;
   }
+  m_local_access = false;
+  m_va = access.get_addr();  // preserve VA; equals PA until TLB is connected
+  m_translated = false;
+  m_tlb_depth = -1;       // -1 = not a page table walk fetch (P3-1)
+  m_parent_mf = nullptr;  // no parent for regular SM requests (P3-1)
 }
 
 mem_fetch::~mem_fetch() { m_status = MEM_FETCH_DELETED; }
+
+void mem_fetch::set_pa(new_addr_type pa) {
+  m_access.set_addr(pa);  // Replace the routing address with PA so interconnect routes to the correct memory partition
+  m_mem_config->m_address_mapping.addrdec_tlx(pa, &m_raw_addr);  // Decode PA into DRAM components (chip/row/bank/col/sub_partition) for correct chiplet routing
+  m_partition_addr = m_mem_config->m_address_mapping.partition_address(pa);  // Compute the relative address within the DRAM partition (used by L2 cache lookup)
+  m_translated = true;  // Mark translation complete so callers know this request carries a valid PA
+}
 
 #define MF_TUP_BEGIN(X) static const char *Status_str[] = {
 #define MF_TUP(X) #X
@@ -145,4 +163,21 @@ unsigned mem_fetch::get_num_flits(bool simt_to_mem) {
     sz = get_ctrl_size();
 
   return (sz / icnt_flit_size) + ((sz % icnt_flit_size) ? 1 : 0);
+}
+
+unsigned mem_fetch::get_num_flits(bool simt_to_mem, bool is_local_access) {
+  unsigned sz = 0;
+  // If atomic, write going to memory, or read coming back from memory, size =
+  // ctrl + data. Else, only ctrl
+  if (isatomic() || (simt_to_mem && get_is_write()) ||
+      !(simt_to_mem || get_is_write()))
+    sz = size();
+  else
+    sz = get_ctrl_size();
+
+  unsigned icnt_flit_size2 =
+      is_local_access ? m_mem_config->icnt_flit_size
+                      : m_mem_config->icnt_inter_flit_size;
+
+  return (sz / icnt_flit_size2) + ((sz % icnt_flit_size2) ? 1 : 0);
 }

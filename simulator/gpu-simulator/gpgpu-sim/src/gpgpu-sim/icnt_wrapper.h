@@ -30,6 +30,7 @@
 #define ICNT_WRAPPER_H
 
 #include <stdio.h>
+#include <vector>
 
 // functional interface to the interconnect
 
@@ -65,5 +66,14 @@ enum network_mode { INTERSIM = 1, LOCAL_XBAR = 2, N_NETWORK_MODE };
 
 void icnt_wrapper_init();
 void icnt_reg_options(class OptionParser* opp);
+
+// Phase 1 (inter-chiplet split): inject the device->chiplet owner maps into the
+// LocalInterconnect before icnt_create(), so the crossbar is split per chiplet.
+// No-op unless g_network_mode == LOCAL_XBAR. Encapsulates g_localicnt_interface
+// (defined in icnt_wrapper.cc) so callers need no access to that global.
+void icnt_configure_chiplets(unsigned n_chiplets,
+                             const std::vector<unsigned>& cluster_to_chiplet,
+                             const std::vector<unsigned>& mem_sub_to_chiplet);
+bool icnt_ring_enabled();
 
 #endif

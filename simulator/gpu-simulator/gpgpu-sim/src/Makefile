@@ -54,6 +54,9 @@ endif
 CXXFLAGS += -I$(CUDA_INSTALL_PATH)/include
 
 OPTFLAGS += -g3 -fPIC
+# P5: keep the whole library consistent -- gpu-sim.h carries an "omp atomic"
+# inside inc_completed_cta(), and any TU including it must honour the pragma.
+OPTFLAGS += -fopenmp
 
 CPP = g++ $(SNOW)
 OEXT = o

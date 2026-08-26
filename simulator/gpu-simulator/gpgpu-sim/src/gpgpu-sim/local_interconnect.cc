@@ -27,6 +27,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
@@ -37,23 +38,59 @@
 #include "local_interconnect.h"
 #include "mem_fetch.h"
 
+// FUNNEL_ (temp): current gpu cycle, set by gpgpu_sim::cycle() before icnt_transfer().
+// Used to stamp a TLB reply's arrival at its destination cluster out_buffer so the
+// reply-icnt latency (B) can be split into transit vs last-hop pop-wait.
+unsigned long long g_icnt_now = 0;
+
+// §25 pre-measurement: split ICNT's wall-clock into "local xbar Advance()"
+// (candidate for chiplet-width parallel) vs "handoff/handoff_ring" (must stay
+// sequential). Defined in gpu-sim.cc (PHASE_TIMING, §24) as free-standing
+// globals (not struct members) precisely so they can be extern'd here without
+// needing phase_timers_t's full definition in this translation unit.
+extern const bool g_phase_timing_on;
+extern unsigned long long g_icnt_local_ns, g_icnt_handoff_ns;
+extern unsigned long long g_icnt_local_calls, g_icnt_handoff_calls;
+static inline unsigned long long icnt_split_now_ns() {
+  using namespace std::chrono;
+  return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+// FUNNEL_ (temp): normal (non-PTW) reply xbar latency by SOURCE mem chiplet, to
+// compare against PTW reply transit (same measurement points). Indexed [src chiplet].
+unsigned long long g_normrep_transit_sum[8] = {0};
+unsigned long long g_normrep_lasthop_sum[8] = {0};
+unsigned long long g_normrep_cnt[8]         = {0};
+// FUNNEL_ (temp): normal-reply transit as a [source mem chiplet][dest cluster chiplet]
+// matrix, to localize which src->dst pairs are slow (ring path vs dest ingress).
+unsigned long long g_normrep_mtx_transit[8][8] = {{0}};
+unsigned long long g_normrep_mtx_cnt[8][8]     = {{0}};
+
 xbar_router::xbar_router(unsigned router_id, enum Interconnect_type m_type,
                          unsigned n_shader, unsigned n_mem,
-                         const struct inct_config& m_localinct_config) {
+                         const struct inct_config& m_localinct_config,
+                         unsigned n_icp, bool inter_via_ring) {
   m_id = router_id;
   router_type = m_type;
   _n_mem = n_mem;
   _n_shader = n_shader;
-  total_nodes = n_shader + n_mem;
+  _n_icp = n_icp; // ADD 
+  m_inter_via_ring = inter_via_ring;  // ADD(P3)
+  // total_nodes = n_shader + n_mem;
+  total_nodes = n_shader + n_mem + n_icp; // ADD
   verbose = m_localinct_config.verbose;
   grant_cycles = m_localinct_config.grant_cycles;
   grant_cycles_count = m_localinct_config.grant_cycles;
   in_buffers.resize(total_nodes);
   out_buffers.resize(total_nodes);
+  m_icp_voq.resize(total_nodes);          // Fix B: per-output ICP ingress VOQ
+  m_icp_voq_flits = 0;
+  m_icp_voq_rr.assign(total_nodes, 0);
   next_node.resize(total_nodes, 0);
   in_buffer_limit = m_localinct_config.in_buffer_limit;
   out_buffer_limit = m_localinct_config.out_buffer_limit;
   arbit_type = m_localinct_config.arbiter_algo;
+  m_port_width = m_localinct_config.xbar_port_width ? m_localinct_config.xbar_port_width : 1;
   next_node_id = 0;
   if (m_type == REQ_NET) {
     active_in_buffers = n_shader;
@@ -80,7 +117,23 @@ xbar_router::~xbar_router() {}
 void xbar_router::Push(unsigned input_deviceID, unsigned output_deviceID,
                        void* data, unsigned int size) {
   assert(input_deviceID < total_nodes);
-  in_buffers[input_deviceID].push(Packet(data, output_deviceID));
+
+  mem_fetch* mf = static_cast<mem_fetch*>(data);
+  unsigned flits;
+  
+  // P3: when inter traffic is carried by the ring, the local xbar uses LOCAL flit
+  // size for everything (no remote inflation). Ring owns inter bandwidth.
+  bool is_local = m_inter_via_ring ? true : mf->is_local_access();
+  if (mf->get_type() == READ_REQUEST || mf->get_type() == WRITE_REQUEST
+      || mf->get_type() == TLB_FILL_ACC)
+    flits = mf->get_num_flits(true, is_local);
+  else if (mf->get_type() == READ_REPLY || mf->get_type() == WRITE_ACK
+      || mf->get_type() == TLB_FILL_REPLY)
+    flits = mf->get_num_flits(false, is_local);
+
+  in_buffers[input_deviceID].push(Packet(data, output_deviceID, flits));
+  // Shared statistic bumped from every source node during the CORE phase.
+#pragma omp atomic
   packets_num++;
 }
 
@@ -96,19 +149,64 @@ void* xbar_router::Pop(unsigned ouput_deviceID) {
   return data;
 }
 
-bool xbar_router::Has_Buffer_In(unsigned input_deviceID, unsigned size,
+unsigned xbar_router::queue_flits(const flit_queue& q) const {
+  // 44-1: running total maintained by flit_queue; was a full queue copy + walk.
+#ifdef XBAR_FLITS_CHECK
+  assert(q.flits == q.recount() && "flit_queue invariant broken");
+#endif
+  return q.flits;
+}
+
+bool xbar_router::Has_Buffer_In(unsigned input_deviceID, unsigned flits, 
                                 bool update_counter) {
   assert(input_deviceID < total_nodes);
 
-  bool has_buffer =
-      (in_buffers[input_deviceID].size() + size <= in_buffer_limit);
-  if (update_counter && !has_buffer) in_buffer_full++;
+  unsigned occ = queue_flits(in_buffers[input_deviceID]);
+
+  bool has_buffer = (occ + flits <= in_buffer_limit);
+
+  if (update_counter && !has_buffer) {
+    // TSan found this one first, and it is the only xbar counter reachable from
+    // the parallel CORE phase: icnt_has_buffer() -> Has_Buffer_In(.., true) is
+    // called by every SM's L1 cache in pass C (gpu-cache.cc:1218). The other
+    // xbar counters live in Advance(), which runs in the sequential ICNT phase.
+    // The return value itself is computed from in_buffers[input_deviceID] alone,
+    // so the MODEL is unaffected -- only this statistic was racing.
+#pragma omp atomic
+    in_buffer_full++;
+  }
 
   return has_buffer;
 }
 
-bool xbar_router::Has_Buffer_Out(unsigned output_deviceID, unsigned size) {
-  return (out_buffers[output_deviceID].size() + size <= out_buffer_limit);
+bool xbar_router::Has_Buffer_Out(unsigned output_deviceID, unsigned flits) {
+  assert(output_deviceID < total_nodes);
+
+  unsigned occ = queue_flits(out_buffers[output_deviceID]);
+
+  return (occ + flits <= out_buffer_limit);
+}
+
+void* xbar_router::TopOut(unsigned out) const {
+  assert(out < total_nodes);
+  return out_buffers[out].empty() ? nullptr : out_buffers[out].front().data;
+} // ADD
+
+bool xbar_router::HasOut(unsigned out) const {
+  assert(out < total_nodes);
+  return !out_buffers[out].empty();
+} // ADD
+
+unsigned xbar_router::flits_of(void* data) const {
+  mem_fetch* mf = static_cast<mem_fetch*>(data);
+  bool is_local = m_inter_via_ring ? true : mf->is_local_access();
+  if (mf->get_type()==READ_REQUEST || mf->get_type()==WRITE_REQUEST
+      || mf->get_type()==TLB_FILL_ACC)
+    return mf->get_num_flits(true,  is_local);
+  else if (mf->get_type()==READ_REPLY || mf->get_type()==WRITE_ACK
+      || mf->get_type() == TLB_FILL_REPLY)
+    return mf->get_num_flits(false, is_local);
+  return 1;
 }
 
 void xbar_router::Advance() {
@@ -122,7 +220,9 @@ void xbar_router::Advance() {
 
 void xbar_router::RR_Advance() {
   bool active = false;
-  vector<bool> issued(total_nodes, false);
+  // issued[out] = grants given to output port `out` this cycle; up to m_port_width
+  // (per-port BW = m_port_width * flit_size * icnt_freq).
+  vector<unsigned> issued(total_nodes, 0);
   unsigned conflict_sub = 0;
   unsigned reqs = 0;
 
@@ -134,15 +234,21 @@ void xbar_router::RR_Advance() {
       Packet _packet = in_buffers[node_id].front();
       // ensure that the outbuffer has space and not issued before in this cycle
       if (Has_Buffer_Out(_packet.output_deviceID, 1)) {
-        if (!issued[_packet.output_deviceID]) {
+        if (issued[_packet.output_deviceID] < m_port_width) {
+          // FUNNEL_ (temp): see iSLIP_Advance — stamp any packet's out_buffer arrival.
+          mem_fetch* _rmf = static_cast<mem_fetch*>(_packet.data);
+          if (_rmf) _rmf->set_icnt_receive_time((unsigned)g_icnt_now);
           out_buffers[_packet.output_deviceID].push(_packet);
           in_buffers[node_id].pop();
-          issued[_packet.output_deviceID] = true;
+          issued[_packet.output_deviceID]++;
           reqs++;
         } else
           conflict_sub++;
       } else {
-        out_buffer_full++;
+        {  // TSan: shared xbar counter, bumped from every SM
+        #pragma omp atomic
+          out_buffer_full++;
+        }
 
         if (issued[_packet.output_deviceID]) conflict_sub++;
       }
@@ -151,11 +257,23 @@ void xbar_router::RR_Advance() {
   next_node_id = next_node_id + 1;
   next_node_id = (next_node_id % total_nodes);
 
-  conflicts += conflict_sub;
+  {  // TSan: shared xbar counter, bumped from every SM
+  #pragma omp atomic
+    conflicts += conflict_sub;
+  }
   if (active) {
-    conflicts_util += conflict_sub;
-    cycles_util++;
-    reqs_util += reqs;
+    {  // TSan: shared xbar counter, bumped from every SM
+    #pragma omp atomic
+      conflicts_util += conflict_sub;
+    }
+    {  // TSan: shared xbar counter, bumped from every SM
+    #pragma omp atomic
+      cycles_util++;
+    }
+    {  // TSan: shared xbar counter, bumped from every SM
+    #pragma omp atomic
+      reqs_util += reqs;
+    }
   }
 
   if (verbose) {
@@ -165,11 +283,20 @@ void xbar_router::RR_Advance() {
 
   // collect some stats about buffer util
   for (unsigned i = 0; i < total_nodes; ++i) {
-    in_buffer_util += in_buffers[i].size();
-    out_buffer_util += out_buffers[i].size();
+    {  // TSan: shared xbar counter, bumped from every SM
+    #pragma omp atomic
+      in_buffer_util += in_buffers[i].size();
+    }
+    {  // TSan: shared xbar counter, bumped from every SM
+    #pragma omp atomic
+      out_buffer_util += out_buffers[i].size();
+    }
   }
 
-  cycles++;
+  {  // TSan: shared xbar counter, bumped from every SM
+  #pragma omp atomic
+    cycles++;
+  }
 }
 
 // iSLIP algorithm
@@ -200,51 +327,102 @@ void xbar_router::iSLIP_Advance() {
     }
   }
 
-  conflicts += conflict_sub;
-  if (active) {
-    conflicts_util += conflict_sub;
-    cycles_util++;
+  {  // TSan: shared xbar counter, bumped from every SM
+  #pragma omp atomic
+    conflicts += conflict_sub;
   }
-  // do iSLIP
+  if (active) {
+    {  // TSan: shared xbar counter, bumped from every SM
+    #pragma omp atomic
+      conflicts_util += conflict_sub;
+    }
+    {  // TSan: shared xbar counter, bumped from every SM
+    #pragma omp atomic
+      cycles_util++;
+    }
+  }
+  // 37: when no input flit exists anywhere and the ICP VOQ is empty, the
+  // grant loop below cannot grant, and every piece of iSLIP state it owns
+  // (next_node[i], m_icp_voq_rr[i], grant_cycles_count) moves ONLY on a grant.
+  // Its single observable effect in this state is the out_buffer_full sample
+  // for outputs whose out-buffer is full -- replicate that and skip the
+  // O(outputs x port_width x inputs) scan. Tail stats below run unchanged.
+  if (!active && m_icp_voq_flits == 0) {
+    unsigned obf = 0;
+    for (unsigned i = 0; i < total_nodes; ++i)
+      if (!Has_Buffer_Out(i, 1)) obf++;
+    if (obf) {
+      #pragma omp atomic
+      out_buffer_full += obf;
+    }
+  } else {
+  // do iSLIP. Each OUTPUT port may grant up to m_port_width flits per cycle (spanning
+  // packets/inputs) -> per-port BW = m_port_width * flit_size * icnt_freq.
   for (unsigned i = 0; i < total_nodes; ++i) {
+   for (unsigned w = 0; w < m_port_width; ++w) {
+    bool _did_grant = false;
     if (Has_Buffer_Out(i, 1)) {
-      for (unsigned j = 0; j < total_nodes; ++j) {
-        unsigned node_id = (j + next_node[i]) % total_nodes;
-
-        if (!in_buffers[node_id].empty()) {
-          Packet _packet = in_buffers[node_id].front();
-          if (_packet.output_deviceID == i) {
-            out_buffers[_packet.output_deviceID].push(_packet);
-            in_buffers[node_id].pop();
-            if (verbose)
-              printf("%d : cycle %llu : send req from %d to %d\n", m_id, cycles,
-                     node_id, i - _n_shader);
-            if (grant_cycles_count == 1)
-              next_node[i] = (++node_id % total_nodes);
-            if (verbose) {
-              for (unsigned k = j + 1; k < total_nodes; ++k) {
-                unsigned node_id2 = (k + next_node[i]) % total_nodes;
-                if (!in_buffers[node_id2].empty()) {
-                  Packet _packet2 = in_buffers[node_id2].front();
-
-                  if (_packet2.output_deviceID == i)
-                    printf("%d : cycle %llu : cannot send req from %d to %d\n",
-                           m_id, cycles, node_id2, i - _n_shader);
+      // Fix B: RR-alternate ICP VOQ[i] vs local inputs (starvation-free). pass 0 =
+      // preferred source (toggled per grant), pass 1 = fallback to the other.
+      bool _voq_first = (m_icp_voq_rr[i] & 1u);
+      for (int _pass = 0; _pass < 2 && !_did_grant; ++_pass) {
+        bool _use_voq = (_pass == 0) ? _voq_first : !_voq_first;
+        if (_use_voq) {
+          // (A) serve one flit of ICP VOQ[i] front (per-flit -> data BW preserved)
+          if (!m_icp_voq[i].empty()) {
+            Packet &_vp = m_icp_voq[i].front();
+            _vp.remaining_flits--;
+            m_icp_voq_flits--;                          // shared budget
+            if (_vp.remaining_flits == 0) {
+              mem_fetch* _rmf = static_cast<mem_fetch*>(_vp.data);
+              if (_rmf) _rmf->set_icnt_receive_time((unsigned)g_icnt_now);
+              out_buffers[i].push(_vp);
+              m_icp_voq[i].pop();
+            }
+            reqs++;
+            _did_grant = true;
+          }
+        } else {
+          // (B) serve a local input (unchanged iSLIP scan over in_buffers)
+          for (unsigned j = 0; j < total_nodes; ++j) {
+            unsigned node_id = (j + next_node[i]) % total_nodes;
+            if (!in_buffers[node_id].empty()) {
+              const Packet &_packet = in_buffers[node_id].front();
+              if (_packet.output_deviceID == i) {
+                in_buffers[node_id].dec_front_flits();   // 44-1: keeps the running total
+                if (_packet.remaining_flits == 0) {
+                  mem_fetch* _rmf = static_cast<mem_fetch*>(_packet.data);
+                  if (_rmf) _rmf->set_icnt_receive_time((unsigned)g_icnt_now);
+                  out_buffers[_packet.output_deviceID].push(_packet);
+                  in_buffers[node_id].pop();
                 }
+                if (grant_cycles_count == 1)
+                  next_node[i] = (++node_id % total_nodes);
+                reqs++;
+                _did_grant = true;
+                break;
               }
             }
-
-            reqs++;
-            break;
           }
         }
       }
+      if (_did_grant) m_icp_voq_rr[i]++;   // advance RR turn on a grant
     } else
-      out_buffer_full++;
+      {  // TSan: shared xbar counter, bumped from every SM
+      #pragma omp atomic
+        out_buffer_full++;
+      }
+    if (!_did_grant) break;   // out buffer full or no packet for this output -> stop
+   }
   }
 
+  }  // 37: end of skip-else
+
   if (active) {
-    reqs_util += reqs;
+    {  // TSan: shared xbar counter, bumped from every SM
+    #pragma omp atomic
+      reqs_util += reqs;
+    }
   }
 
   if (verbose)
@@ -262,11 +440,20 @@ void xbar_router::iSLIP_Advance() {
 
   // collect some stats about buffer util
   for (unsigned i = 0; i < total_nodes; ++i) {
-    in_buffer_util += in_buffers[i].size();
-    out_buffer_util += out_buffers[i].size();
+    {  // TSan: shared xbar counter, bumped from every SM
+    #pragma omp atomic
+      in_buffer_util += in_buffers[i].size();
+    }
+    {  // TSan: shared xbar counter, bumped from every SM
+    #pragma omp atomic
+      out_buffer_util += out_buffers[i].size();
+    }
   }
 
-  cycles++;
+  {  // TSan: shared xbar counter, bumped from every SM
+  #pragma omp atomic
+    cycles++;
+  }
 }
 
 bool xbar_router::Busy() const {
@@ -274,6 +461,8 @@ bool xbar_router::Busy() const {
     if (!in_buffers[i].empty()) return true;
 
     if (!out_buffers[i].empty()) return true;
+
+    if (!m_icp_voq[i].empty()) return true;   // Fix B: pending ICP ingress VOQ packets
   }
   return false;
 }
@@ -299,21 +488,59 @@ LocalInterconnect::LocalInterconnect(
   n_subnets = m_localinct_config.subnets;
 }
 
+// LocalInterconnect::~LocalInterconnect() {
+//   for (unsigned i = 0; i < m_inct_config.subnets; ++i) {
+//     delete net[i];
+//   }
+// }
+
 LocalInterconnect::~LocalInterconnect() {
-  for (unsigned i = 0; i < m_inct_config.subnets; ++i) {
-    delete net[i];
-  }
+  for (unsigned s = 0; s < net.size(); ++s)
+    for (unsigned ch = 0; ch < net[s].size(); ++ch)
+      delete net[s][ch];
+  for (unsigned s = 0; s < m_ring.size(); ++s) delete m_ring[s];
 }
 
-void LocalInterconnect::CreateInterconnect(unsigned m_n_shader,
-                                           unsigned m_n_mem) {
-  n_shader = m_n_shader;
-  n_mem = m_n_mem;
+// void LocalInterconnect::CreateInterconnect(unsigned m_n_shader,
+//                                            unsigned m_n_mem) {
+//   n_shader = m_n_shader;
+//   n_mem = m_n_mem;
 
+//   net.resize(n_subnets);
+//   for (unsigned i = 0; i < n_subnets; ++i) {
+//     net[i] = new xbar_router(i, static_cast<Interconnect_type>(i), m_n_shader,
+//                              m_n_mem, m_inct_config);
+//   }
+// }
+
+void LocalInterconnect::CreateInterconnect(unsigned m_n_shader, unsigned m_n_mem) {
+  n_shader = m_n_shader;  n_mem = m_n_mem;
+  // n_shader/n_mem are set now -> validate the injected maps here (NOT in
+  // configure_chiplets, where they are still 0).
+  assert(m_chiplets_configured && "configure_chiplets must run before CreateInterconnect");
+  assert(m_dev_chiplet.size() == n_shader + n_mem && "chiplet map size mismatch");
+
+  m_use_ring = (m_inct_config.use_ring != 0) && (m_n_chiplets > 1);  // MOVED UP (needed below)
+  const unsigned n_icp = (m_n_chiplets > 1) ? 1u : 0u;
   net.resize(n_subnets);
-  for (unsigned i = 0; i < n_subnets; ++i) {
-    net[i] = new xbar_router(i, static_cast<Interconnect_type>(i), m_n_shader,
-                             m_n_mem, m_inct_config);
+  for (unsigned s = 0; s < n_subnets; ++s) {
+    net[s].resize(m_n_chiplets, nullptr);
+    for (unsigned ch = 0; ch < m_n_chiplets; ++ch) {
+      net[s][ch] = new xbar_router(ch, static_cast<Interconnect_type>(s),
+                                   m_n_local_cluster[ch], m_n_local_mem[ch],
+                                   m_inct_config, n_icp, m_use_ring);  // P3: inter_via_ring
+    }
+  }
+  if (m_use_ring) {
+    m_ring.assign(n_subnets, nullptr);
+    for (unsigned s = 0; s < n_subnets; ++s)
+      m_ring[s] = new ring_net(m_n_chiplets, m_inct_config.ring_buf,
+                               m_inct_config.ring_hop_latency,
+                               m_inct_config.ring_link_width);   // P4: BW
+    // RINGINJ_ (temp): [subnet][chiplet] source-side egress accounting.
+    m_rinj_egress_busy.assign(n_subnets, std::vector<unsigned long long>(m_n_chiplets, 0));
+    m_rinj_stall.assign(n_subnets, std::vector<unsigned long long>(m_n_chiplets, 0));
+    m_rinj_ok.assign(n_subnets, std::vector<unsigned long long>(m_n_chiplets, 0));
   }
 }
 
@@ -322,106 +549,355 @@ void LocalInterconnect::Init() {
   // there is nothing to do
 }
 
-void LocalInterconnect::Push(unsigned input_deviceID, unsigned output_deviceID,
-                             void* data, unsigned int size) {
-  unsigned subnet;
-  if (n_subnets == 1) {
-    subnet = 0;
-  } else {
-    if (input_deviceID < n_shader) {
-      subnet = 0;
-    } else {
-      subnet = 1;
-    }
+// void LocalInterconnect::Push(unsigned input_deviceID, unsigned output_deviceID,
+//                              void* data, unsigned int size) {
+//   unsigned subnet;
+//   if (n_subnets == 1) {
+//     subnet = 0;
+//   } else {
+//     if (input_deviceID < n_shader) {
+//       subnet = 0;
+//     } else {
+//       subnet = 1;
+//     }
+//   }
+
+//   // it should have free buffer
+//   // assume all the packets have size of one
+//   // no flits are implemented
+//   assert(net[subnet]->Has_Buffer_In(input_deviceID, size));
+
+//   net[subnet]->Push(input_deviceID, output_deviceID, data, size);
+// }
+
+void LocalInterconnect::Push(unsigned in, unsigned out, void* data, unsigned int size) {
+  unsigned subnet = (n_subnets == 1) ? 0
+                  : (in < n_shader ? REQ_NET : REPLY_NET);
+  unsigned src_ch = m_dev_chiplet[in];
+  unsigned dst_ch = m_dev_chiplet[out];
+
+  if (src_ch == dst_ch) {                                      // LOCAL
+    assert(net[subnet][src_ch]->Has_Buffer_In(m_local_idx[in], size));
+    net[subnet][src_ch]->Push(m_local_idx[in], m_local_idx[out], data, size);
+  } else {                                                     // REMOTE
+    assert(net[subnet][src_ch]->Has_Buffer_In(m_local_idx[in], size));
+    net[subnet][src_ch]->Push(m_local_idx[in], net[subnet][src_ch]->icp_index(), data, size);
   }
-
-  // it should have free buffer
-  // assume all the packets have size of one
-  // no flits are implemented
-  assert(net[subnet]->Has_Buffer_In(input_deviceID, 1));
-
-  net[subnet]->Push(input_deviceID, output_deviceID, data, size);
 }
 
-void* LocalInterconnect::Pop(unsigned ouput_deviceID) {
-  // 0-_n_shader-1 indicates reply(network 1), otherwise request(network 0)
-  int subnet = 0;
-  if (ouput_deviceID < n_shader) subnet = 1;
+// void* LocalInterconnect::Pop(unsigned ouput_deviceID) {
+//   // 0-_n_shader-1 indicates reply(network 1), otherwise request(network 0)
+//   int subnet = 0;
+//   if (ouput_deviceID < n_shader) subnet = 1;
 
-  return net[subnet]->Pop(ouput_deviceID);
+//   return net[subnet]->Pop(ouput_deviceID);
+// }
+
+void* LocalInterconnect::Pop(unsigned out) {
+  unsigned subnet = (out < n_shader) ? REPLY_NET : REQ_NET;    // 소비자 기준(기존과 동일)
+  if (n_subnets == 1) subnet = 0;
+  unsigned ch = m_dev_chiplet[out];
+  return net[subnet][ch]->Pop(m_local_idx[out]);
 }
+
+// void LocalInterconnect::Advance() {
+//   for (unsigned i = 0; i < n_subnets; ++i) {
+//     net[i]->Advance();
+//   }
+// }
 
 void LocalInterconnect::Advance() {
-  for (unsigned i = 0; i < n_subnets; ++i) {
-    net[i]->Advance();
+  // §25 pre-measurement (diagnostic only, gated off by default -- see
+  // gpu-sim.cc PHASE_TIMING/§24): split into "local" (each net[s][ch] is a
+  // chiplet-private xbar_router -- the §25 chiplet-width parallel candidate)
+  // and "handoff" (ring advance + handoff/handoff_ring -- genuine
+  // chiplet-to-chiplet exchange, must stay sequential either way).
+  // P25: chiplet-width parallel, same T5 independence argument already used for
+  // CORE Phase B and the L2/GMMU loop -- net[s][ch] is a chiplet-private
+  // xbar_router (own in_buffers/out_buffers/counters, §25-0). Advance() runs in
+  // the sequential ICNT clock domain (local_interconnect.cc:154's own comment:
+  // "the other xbar counters live in Advance(), which runs in the sequential
+  // ICNT phase"), so this loop never overlaps Phase A/B/C's parallel SM work --
+  // only with itself, across chiplets, which is exactly what T5 covers.
+  // §25-3 E5 (2026-08-15, applied after the chiplet-only version passed E1-E4):
+  // collapse subnet(REQ_NET/REPLY_NET) together with chiplet. net[REQ_NET][ch]
+  // and net[REPLY_NET][ch] are separate xbar_router instances with no shared
+  // state between them (same disjointness argument as the chiplet axis), so
+  // up to n_subnets*m_n_chiplets=8 iterations can run at once instead of being
+  // capped at m_n_chiplets=4 per subnet, processed in two sequential batches.
+  const unsigned long long __icnt_t0 = g_phase_timing_on ? icnt_split_now_ns() : 0;
+#pragma omp parallel for schedule(runtime) collapse(2)
+  for (unsigned s = 0; s < n_subnets; ++s)
+    for (unsigned ch = 0; ch < m_n_chiplets; ++ch)
+      net[s][ch]->Advance();
+  if (g_phase_timing_on) {
+    g_icnt_local_ns += icnt_split_now_ns() - __icnt_t0;
+    g_icnt_local_calls++;
+  }
+
+  const unsigned long long __icnt_t1 = g_phase_timing_on ? icnt_split_now_ns() : 0;
+  if (m_n_chiplets > 1) {
+    if (m_use_ring) {
+      for (unsigned s = 0; s < n_subnets; ++s) m_ring[s]->advance();
+      handoff_ring();
+    } else {
+      handoff();              // Phase 1 zero-latency direct path
+    }
+  }
+  if (g_phase_timing_on) {
+    g_icnt_handoff_ns += icnt_split_now_ns() - __icnt_t1;
+    g_icnt_handoff_calls++;
   }
 }
 
-bool LocalInterconnect::Busy() const {
-  for (unsigned i = 0; i < n_subnets; ++i) {
-    if (net[i]->Busy()) return true;
+void LocalInterconnect::handoff() {
+  for (unsigned s = 0; s < n_subnets; ++s) {
+    for (unsigned ch = 0; ch < m_n_chiplets; ++ch) {
+      xbar_router* src = net[s][ch];
+      unsigned egress = src->icp_index();
+      // ICP egress에 쌓인 패킷을 dest로 전달(여러 개 가능하나 1/Advance로 제한해도 됨)
+      while (src->HasOut(egress)) {
+        void* data = src->TopOut(egress);
+        mem_fetch* mf = static_cast<mem_fetch*>(data);
+        // 최종 dest 글로벌 deviceID 복원 (subnet 기준)
+        unsigned final_dev = (s == REQ_NET)
+            ? (n_shader + mf->get_sub_partition_id())   // mem2device
+            : (mf->get_tpc());                          // cluster deviceID
+        unsigned dch = m_dev_chiplet[final_dev];
+        xbar_router* dst = net[s][dch];
+        unsigned ingress = dst->icp_index();
+        unsigned f = dst->flits_of(data);
+        if (!dst->Has_Buffer_In(ingress, f)) break;     // back-pressure -> 다음 Advance에 재시도
+        (void) src->Pop(egress);                        // 실제 제거
+        dst->Push(ingress, m_local_idx[final_dev], data, 0);  // size 무시(flits는 mf로 계산)
+      }
+    }
   }
+}
+
+void LocalInterconnect::handoff_ring() {
+  m_rinj_advances++;   // RINGINJ_ (temp)
+  for (unsigned s = 0; s < n_subnets; ++s) {
+    ring_net* ring = m_ring[s];
+
+    // (1) inject: each chiplet's ICP egress -> ring
+    for (unsigned ch = 0; ch < m_n_chiplets; ++ch) {
+      xbar_router* src = net[s][ch];
+      unsigned egress = src->icp_index();
+      bool had_pending = src->HasOut(egress);   // RINGINJ_ (temp)
+      bool stalled = false;                     // RINGINJ_ (temp)
+      while (src->HasOut(egress)) {
+        void* data = src->TopOut(egress);
+        mem_fetch* mf = static_cast<mem_fetch*>(data);
+        unsigned final_dev = (s == REQ_NET)
+            ? (n_shader + mf->get_sub_partition_id())   // mem2device
+            : (mf->get_tpc());                          // cluster deviceID
+        unsigned dch   = m_dev_chiplet[final_dev];
+        // Ring link width = inter flit size (NOT the local xbar's local size).
+        unsigned flits = mf->get_num_flits(s == REQ_NET, /*is_local=*/false);
+        if (!ring->inject(ch, dch, final_dev, data, flits)) { stalled = true; break; }  // link full
+        (void) src->Pop(egress);
+        m_rinj_ok[s][ch]++;                     // RINGINJ_ (temp)
+      }
+      // RINGINJ_ (temp): egress had work this cycle; stalled = blocked by ring-link-full.
+      if (had_pending) {
+        m_rinj_egress_busy[s][ch]++;
+        if (stalled) m_rinj_stall[s][ch]++;
+      }
+    }
+
+    // (2) eject: ring -> dst chiplet's ICP ingress VOQ (Fix B: per-destination queue,
+    // removes head-of-line blocking; packets still traverse iSLIP per-flit downstream).
+    for (unsigned ch = 0; ch < m_n_chiplets; ++ch) {
+      while (ring->has_eject(ch)) {
+        void* data        = ring->top_eject(ch);
+        unsigned final_dev = ring->eject_final_dev(ch);   // chiplet(final_dev) == ch
+        xbar_router* dst  = net[s][ch];
+        unsigned out      = m_local_idx[final_dev];       // destination output port
+        unsigned f        = dst->flits_of(data);
+        if (!dst->has_icp_voq_room(f)) break;             // shared VOQ budget full -> retry
+        ring->pop_eject(ch);
+        dst->push_icp_voq(out, data, f);                  // enqueue to that output's VOQ
+      }
+    }
+  }
+}
+
+// bool LocalInterconnect::Busy() const {
+//   for (unsigned i = 0; i < n_subnets; ++i) {
+//     if (net[i]->Busy()) return true;
+//   }
+//   return false;
+// }
+
+bool LocalInterconnect::Busy() const {
+  for (unsigned s = 0; s < n_subnets; ++s)
+    for (unsigned ch = 0; ch < m_n_chiplets; ++ch)
+      if (net[s][ch]->Busy()) return true;   // ICP in/out buffer도 xbar Busy에 포함됨
+  for (unsigned s = 0; s < m_ring.size(); ++s)
+    if (m_ring[s] && m_ring[s]->busy()) return true;     // ADD
   return false;
 }
 
+// bool LocalInterconnect::HasBuffer(unsigned deviceID, unsigned int size) const {
+//   bool has_buffer = false;
+
+//   if ((n_subnets > 1) && deviceID >= n_shader)  // deviceID is memory node
+//     has_buffer = net[REPLY_NET]->Has_Buffer_In(deviceID, size, true);
+//   else
+//     has_buffer = net[REQ_NET]->Has_Buffer_In(deviceID, size, true);
+
+//   return has_buffer;
+// }
+
 bool LocalInterconnect::HasBuffer(unsigned deviceID, unsigned int size) const {
-  bool has_buffer = false;
-
-  if ((n_subnets > 1) && deviceID >= n_shader)  // deviceID is memory node
-    has_buffer = net[REPLY_NET]->Has_Buffer_In(deviceID, 1, true);
-  else
-    has_buffer = net[REQ_NET]->Has_Buffer_In(deviceID, 1, true);
-
-  return has_buffer;
+  unsigned subnet = (n_subnets > 1 && deviceID >= n_shader) ? REPLY_NET : REQ_NET;
+  unsigned ch     = m_dev_chiplet[deviceID];
+  return net[subnet][ch]->Has_Buffer_In(m_local_idx[deviceID], size, true);
 }
+
+// void LocalInterconnect::DisplayStats() const {
+//   printf("Req_Network_injected_packets_num = %lld\n",
+//          net[REQ_NET]->packets_num);
+//   printf("Req_Network_cycles = %lld\n", net[REQ_NET]->cycles);
+//   printf("Req_Network_injected_packets_per_cycle = %12.4f \n",
+//          (float)(net[REQ_NET]->packets_num) / (net[REQ_NET]->cycles));
+//   printf("Req_Network_conflicts_per_cycle = %12.4f\n",
+//          (float)(net[REQ_NET]->conflicts) / (net[REQ_NET]->cycles));
+//   printf("Req_Network_conflicts_per_cycle_util = %12.4f\n",
+//          (float)(net[REQ_NET]->conflicts_util) / (net[REQ_NET]->cycles_util));
+//   printf("Req_Bank_Level_Parallism = %12.4f\n",
+//          (float)(net[REQ_NET]->reqs_util) / (net[REQ_NET]->cycles_util));
+//   printf("Req_Network_in_buffer_full_per_cycle = %12.4f\n",
+//          (float)(net[REQ_NET]->in_buffer_full) / (net[REQ_NET]->cycles));
+//   printf("Req_Network_in_buffer_avg_util = %12.4f\n",
+//          ((float)(net[REQ_NET]->in_buffer_util) / (net[REQ_NET]->cycles) /
+//           net[REQ_NET]->active_in_buffers));
+//   printf("Req_Network_out_buffer_full_per_cycle = %12.4f\n",
+//          (float)(net[REQ_NET]->out_buffer_full) / (net[REQ_NET]->cycles));
+//   printf("Req_Network_out_buffer_avg_util = %12.4f\n",
+//          ((float)(net[REQ_NET]->out_buffer_util) / (net[REQ_NET]->cycles) /
+//           net[REQ_NET]->active_out_buffers));
+
+//   printf("\n");
+//   printf("Reply_Network_injected_packets_num = %lld\n",
+//          net[REPLY_NET]->packets_num);
+//   printf("Reply_Network_cycles = %lld\n", net[REPLY_NET]->cycles);
+//   printf("Reply_Network_injected_packets_per_cycle =  %12.4f\n",
+//          (float)(net[REPLY_NET]->packets_num) / (net[REPLY_NET]->cycles));
+//   printf("Reply_Network_conflicts_per_cycle =  %12.4f\n",
+//          (float)(net[REPLY_NET]->conflicts) / (net[REPLY_NET]->cycles));
+//   printf(
+//       "Reply_Network_conflicts_per_cycle_util = %12.4f\n",
+//       (float)(net[REPLY_NET]->conflicts_util) / (net[REPLY_NET]->cycles_util));
+//   printf("Reply_Bank_Level_Parallism = %12.4f\n",
+//          (float)(net[REPLY_NET]->reqs_util) / (net[REPLY_NET]->cycles_util));
+//   printf("Reply_Network_in_buffer_full_per_cycle = %12.4f\n",
+//          (float)(net[REPLY_NET]->in_buffer_full) / (net[REPLY_NET]->cycles));
+//   printf("Reply_Network_in_buffer_avg_util = %12.4f\n",
+//          ((float)(net[REPLY_NET]->in_buffer_util) / (net[REPLY_NET]->cycles) /
+//           net[REPLY_NET]->active_in_buffers));
+//   printf("Reply_Network_out_buffer_full_per_cycle = %12.4f\n",
+//          (float)(net[REPLY_NET]->out_buffer_full) / (net[REPLY_NET]->cycles));
+//   printf("Reply_Network_out_buffer_avg_util = %12.4f\n",
+//          ((float)(net[REPLY_NET]->out_buffer_util) / (net[REPLY_NET]->cycles) /
+//           net[REPLY_NET]->active_out_buffers));
+// }
 
 void LocalInterconnect::DisplayStats() const {
-  printf("Req_Network_injected_packets_num = %lld\n",
-         net[REQ_NET]->packets_num);
-  printf("Req_Network_cycles = %lld\n", net[REQ_NET]->cycles);
-  printf("Req_Network_injected_packets_per_cycle = %12.4f \n",
-         (float)(net[REQ_NET]->packets_num) / (net[REQ_NET]->cycles));
-  printf("Req_Network_conflicts_per_cycle = %12.4f\n",
-         (float)(net[REQ_NET]->conflicts) / (net[REQ_NET]->cycles));
-  printf("Req_Network_conflicts_per_cycle_util = %12.4f\n",
-         (float)(net[REQ_NET]->conflicts_util) / (net[REQ_NET]->cycles_util));
-  printf("Req_Bank_Level_Parallism = %12.4f\n",
-         (float)(net[REQ_NET]->reqs_util) / (net[REQ_NET]->cycles_util));
-  printf("Req_Network_in_buffer_full_per_cycle = %12.4f\n",
-         (float)(net[REQ_NET]->in_buffer_full) / (net[REQ_NET]->cycles));
-  printf("Req_Network_in_buffer_avg_util = %12.4f\n",
-         ((float)(net[REQ_NET]->in_buffer_util) / (net[REQ_NET]->cycles) /
-          net[REQ_NET]->active_in_buffers));
-  printf("Req_Network_out_buffer_full_per_cycle = %12.4f\n",
-         (float)(net[REQ_NET]->out_buffer_full) / (net[REQ_NET]->cycles));
-  printf("Req_Network_out_buffer_avg_util = %12.4f\n",
-         ((float)(net[REQ_NET]->out_buffer_util) / (net[REQ_NET]->cycles) /
-          net[REQ_NET]->active_out_buffers));
-
-  printf("\n");
-  printf("Reply_Network_injected_packets_num = %lld\n",
-         net[REPLY_NET]->packets_num);
-  printf("Reply_Network_cycles = %lld\n", net[REPLY_NET]->cycles);
-  printf("Reply_Network_injected_packets_per_cycle =  %12.4f\n",
-         (float)(net[REPLY_NET]->packets_num) / (net[REPLY_NET]->cycles));
-  printf("Reply_Network_conflicts_per_cycle =  %12.4f\n",
-         (float)(net[REPLY_NET]->conflicts) / (net[REPLY_NET]->cycles));
-  printf(
-      "Reply_Network_conflicts_per_cycle_util = %12.4f\n",
-      (float)(net[REPLY_NET]->conflicts_util) / (net[REPLY_NET]->cycles_util));
-  printf("Reply_Bank_Level_Parallism = %12.4f\n",
-         (float)(net[REPLY_NET]->reqs_util) / (net[REPLY_NET]->cycles_util));
-  printf("Reply_Network_in_buffer_full_per_cycle = %12.4f\n",
-         (float)(net[REPLY_NET]->in_buffer_full) / (net[REPLY_NET]->cycles));
-  printf("Reply_Network_in_buffer_avg_util = %12.4f\n",
-         ((float)(net[REPLY_NET]->in_buffer_util) / (net[REPLY_NET]->cycles) /
-          net[REPLY_NET]->active_in_buffers));
-  printf("Reply_Network_out_buffer_full_per_cycle = %12.4f\n",
-         (float)(net[REPLY_NET]->out_buffer_full) / (net[REPLY_NET]->cycles));
-  printf("Reply_Network_out_buffer_avg_util = %12.4f\n",
-         ((float)(net[REPLY_NET]->out_buffer_util) / (net[REPLY_NET]->cycles) /
-          net[REPLY_NET]->active_out_buffers));
+  // Every router Advance()s each cycle, so 'cycles' is identical across
+  // chiplets -> use chiplet 0 as representative for *_per_cycle ratios.
+  for (unsigned s = 0; s < n_subnets; ++s) {
+    const char* tag = (s == REQ_NET) ? "Req" : "Reply";
+    unsigned long long packets=0, conflicts=0, conflicts_util=0, reqs_util=0;
+    unsigned long long in_buffer_full=0, in_buffer_util=0;
+    unsigned long long out_buffer_full=0, out_buffer_util=0;
+    unsigned long long active_in=0, active_out=0, cyc_util_sum=0;
+    for (unsigned ch = 0; ch < net[s].size(); ++ch) {
+      xbar_router* r = net[s][ch];
+      packets+=r->packets_num; conflicts+=r->conflicts;
+      conflicts_util+=r->conflicts_util; reqs_util+=r->reqs_util;
+      in_buffer_full+=r->in_buffer_full; in_buffer_util+=r->in_buffer_util;
+      out_buffer_full+=r->out_buffer_full; out_buffer_util+=r->out_buffer_util;
+      active_in+=r->active_in_buffers; active_out+=r->active_out_buffers;
+      cyc_util_sum+=r->cycles_util;
+    }
+    unsigned long long cyc = net[s][0]->cycles;
+    printf("%s_Network_injected_packets_num = %lld\n", tag, packets);
+    printf("%s_Network_cycles = %lld\n", tag, cyc);
+    printf("%s_Network_injected_packets_per_cycle = %12.4f \n", tag, (float)packets/cyc);
+    printf("%s_Network_conflicts_per_cycle = %12.4f\n", tag, (float)conflicts/cyc);
+    printf("%s_Network_conflicts_per_cycle_util = %12.4f\n", tag, (float)conflicts_util/cyc_util_sum);
+    printf("%s_Bank_Level_Parallism = %12.4f\n", tag, (float)reqs_util/cyc_util_sum);
+    printf("%s_Network_in_buffer_full_per_cycle = %12.4f\n", tag, (float)in_buffer_full/cyc);
+    printf("%s_Network_in_buffer_avg_util = %12.4f\n", tag, (float)in_buffer_util/cyc/active_in);
+    printf("%s_Network_out_buffer_full_per_cycle = %12.4f\n", tag, (float)out_buffer_full/cyc);
+    printf("%s_Network_out_buffer_avg_util = %12.4f\n", tag, (float)out_buffer_util/cyc/active_out);
+    printf("\n");
+  }
+  // RINGLAT_ (temp): per-subnet ring traversal time (inject->eject), inter-chiplet.
+  if (m_use_ring) {
+    for (unsigned s = 0; s < m_ring.size(); ++s) {
+      if (!m_ring[s]) continue;
+      const char* tag = (s == REQ_NET) ? "Req" : "Reply";
+      unsigned long long cnt = m_ring[s]->ringlat_cnt;
+      printf("[RINGLAT] %s_ring pkts=%llu avg_ring_cycles=%.2f max_ring_cycles=%llu\n",
+             tag, cnt, cnt ? (double)m_ring[s]->ringlat_sum / cnt : 0.0,
+             m_ring[s]->ringlat_max);
+    }
+    // RINGINJ_ (temp): source-side ring egress accounting per (subnet, src chiplet).
+    // egress_busy%% high + stall%% high  -> ring-link BW saturated at that source.
+    // egress_busy%% high + stall%% low   -> xbar arbitration can't fill egress fast enough.
+    // RINGSRC_ (temp): per-source-chiplet ring residency (inject->eject). If a source's
+    // avg is high while links are near-empty, the wait is at the hub eject (order unfairness).
+    for (unsigned s = 0; s < m_ring.size(); ++s) {
+      const char* tag = (s == REQ_NET) ? "Req" : "Reply";
+      unsigned N = m_ring[s]->ring_N();
+      for (unsigned c = 0; c < N; ++c) {
+        unsigned long long n = m_ring[s]->ringlat_src_cnt[c];
+        double tot = n ? (double)m_ring[s]->ringlat_src_sum[c] / n : 0.0;
+        double bw  = n ? (double)m_ring[s]->bkt_bw_sum[c] / n : 0.0;
+        double ej  = n ? (double)m_ring[s]->bkt_ej_sum[c] / n : 0.0;
+        double wire = tot - bw - ej;   // legit hop latency = total - bw - ejwait
+        printf("[RINGSRC] %-5s src_chiplet=%u ring_avg=%.1f  (bw=%.1f wire=%.1f "
+               "ejwait=%.1f) [n=%llu]\n", tag, c, tot, bw, wire, ej, n);
+      }
+    }
+    printf("[RINGINJ] handoff_advances=%llu\n", m_rinj_advances);
+    for (unsigned s = 0; s < m_ring.size(); ++s) {
+      const char* tag = (s == REQ_NET) ? "Req" : "Reply";
+      for (unsigned ch = 0; ch < m_n_chiplets; ++ch) {
+        unsigned long long busy = m_rinj_egress_busy[s][ch];
+        unsigned long long stall = m_rinj_stall[s][ch];
+        unsigned long long ok = m_rinj_ok[s][ch];
+        double adv = m_rinj_advances ? (double)m_rinj_advances : 1.0;
+        printf("[RINGINJ] %-5s src_chiplet=%u egress_busy=%llu(%.1f%%) "
+               "ring_full_stall=%llu(%.1f%%) injected=%llu stall/busy=%.1f%%\n",
+               tag, ch, busy, 100.0 * busy / adv,
+               stall, 100.0 * stall / adv, ok,
+               busy ? 100.0 * stall / busy : 0.0);
+      }
+    }
+    // RINGLINK_ (temp): per-(node,dir) link load. Reveals tie-break CW/CCW imbalance:
+    // the CW link out of the hub carries both 1-hop and 2-hop(equidistant, tie->cw) traffic.
+    // link (node c, dir d) = the wire from c to neighbor(c,d): d0=cw (c->c+1), d1=ccw (c->c-1).
+    for (unsigned s = 0; s < m_ring.size(); ++s) {
+      const char* tag = (s == REQ_NET) ? "Req" : "Reply";
+      unsigned long long smp = m_ring[s]->link_occ_samples ? m_ring[s]->link_occ_samples : 1;
+      unsigned N = m_ring[s]->ring_N();
+      for (unsigned c = 0; c < N; ++c) {
+        unsigned cw_dst = (c + 1) % N, ccw_dst = (c + N - 1) % N;
+        printf("[RINGLINK] %-5s node%u  cw(->%u): flits=%llu occ_avg=%.2f | "
+               "ccw(->%u): flits=%llu occ_avg=%.2f\n",
+               tag, c, cw_dst, m_ring[s]->link_flits[c][0],
+               (double)m_ring[s]->link_occ_sum[c][0] / smp,
+               ccw_dst, m_ring[s]->link_flits[c][1],
+               (double)m_ring[s]->link_occ_sum[c][1] / smp);
+      }
+    }
+  }
 }
+
 
 void LocalInterconnect::DisplayOverallStats() const {}
 
@@ -429,4 +905,36 @@ unsigned LocalInterconnect::GetFlitSize() const { return LOCAL_INCT_FLIT_SIZE; }
 
 void LocalInterconnect::DisplayState(FILE* fp) const {
   fprintf(fp, "GPGPU-Sim uArch: ICNT:Display State: Under implementation\n");
+}
+
+void LocalInterconnect::configure_chiplets(
+    unsigned n_chiplets,
+    const std::vector<unsigned>& cluster_to_chiplet,
+    const std::vector<unsigned>& mem_sub_to_chiplet) {
+  // Runs BEFORE CreateInterconnect, so n_shader/n_mem are not set yet.
+  // The map sizes are the authoritative device counts.
+  const unsigned ns = (unsigned)cluster_to_chiplet.size();  // == n_simt_clusters
+  const unsigned nm = (unsigned)mem_sub_to_chiplet.size();   // == n_mem_sub_partition
+  m_n_chiplets = n_chiplets;
+
+  const unsigned ndev = ns + nm;
+  m_dev_chiplet.assign(ndev, 0);
+  m_local_idx.assign(ndev, 0);
+  m_n_local_cluster.assign(n_chiplets, 0);
+  m_n_local_mem.assign(n_chiplets, 0);
+
+  // 1) clusters: local idx 0,1,2,... per chiplet, in global order.
+  for (unsigned d = 0; d < ns; ++d) {
+    unsigned ch = cluster_to_chiplet[d];
+    m_dev_chiplet[d] = ch;
+    m_local_idx[d]   = m_n_local_cluster[ch]++;
+  }
+  // 2) mems: local idx = (that chiplet's cluster count) + 0,1,2,... (2-pass).
+  for (unsigned s = 0; s < nm; ++s) {
+    unsigned dev = ns + s;
+    unsigned ch  = mem_sub_to_chiplet[s];
+    m_dev_chiplet[dev] = ch;
+    m_local_idx[dev]   = m_n_local_cluster[ch] + (m_n_local_mem[ch]++);
+  }
+  m_chiplets_configured = true;
 }

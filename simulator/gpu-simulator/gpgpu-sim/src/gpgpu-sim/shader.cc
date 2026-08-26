@@ -43,13 +43,25 @@
 #include "dram.h"
 #include "gpu-misc.h"
 #include "gpu-sim.h"
+#include "gpu-module.h"  // for gpu_module::cluster_to_chiplet(), get_gmmu()
+#include "gmmu.h"        // for gmmu::translate()
 #include "icnt_wrapper.h"
 #include "mem_fetch.h"
 #include "mem_latency_stat.h"
+#include "par_serial_probe.h"
 #include "shader_trace.h"
 #include "stat-tool.h"
 #include "traffic_breakdown.h"
 #include "visualizer.h"
+#include <cstdlib>   // getenv (verification log gate)
+
+// Verification logging: CTA placement lines, OFF unless ACCELSIM_LOG_CTA is
+// set. [CTA_ISSUE] pairs with [CTA_DONE] on (sm, hw_cta) in FIFO order, since
+// a hardware CTA slot is reused only after it has been released.
+static bool accelsim_log_cta() {
+  static const bool on = (getenv("ACCELSIM_LOG_CTA") != NULL);
+  return on;
+}
 
 #define PRIORITIZE_MSHR_OVER_WB 1
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
@@ -505,6 +517,7 @@ shader_core_ctx::shader_core_ctx(class gpgpu_sim *gpu,
 
 void shader_core_ctx::reinit(unsigned start_thread, unsigned end_thread,
                              bool reset_not_completed) {
+  m_p4_issue_epoch++;  // 44-8 (E8): warp/SIMT state (re)initialized
   if (reset_not_completed) {
     m_not_completed = 0;
     m_active_threads.reset();
@@ -532,6 +545,7 @@ void shader_core_ctx::reinit(unsigned start_thread, unsigned end_thread,
 void shader_core_ctx::init_warps(unsigned cta_id, unsigned start_thread,
                                  unsigned end_thread, unsigned ctaid,
                                  int cta_size, kernel_info_t &kernel) {
+  m_p4_issue_epoch++;  // 44-8 (E8): warp/SIMT state (re)initialized
   address_type start_pc = next_pc(start_thread);
   unsigned kernel_id = kernel.get_uid();
   if (m_config->model == POST_DOMINATOR) {
@@ -891,9 +905,10 @@ void shader_core_ctx::decode() {
     // decode 1 or 2 instructions and place them into ibuffer
     address_type pc = m_inst_fetch_buffer.m_pc;
     const warp_inst_t *pI1 = get_next_inst(m_inst_fetch_buffer.m_warp_id, pc);
-    m_warp[m_inst_fetch_buffer.m_warp_id]->ibuffer_fill(0, pI1);
-    m_warp[m_inst_fetch_buffer.m_warp_id]->inc_inst_in_pipeline();
     if (pI1) {
+      m_warp[m_inst_fetch_buffer.m_warp_id]->ibuffer_fill(0, pI1);
+      m_p4_issue_epoch++;  // 44-8 (E2)
+      m_warp[m_inst_fetch_buffer.m_warp_id]->inc_inst_in_pipeline();
       m_stats->m_num_decoded_insn[m_sid]++;
       if ((pI1->oprnd_type == INT_OP) ||
           (pI1->oprnd_type == UN_OP)) {  // these counters get added up in mcPat
@@ -906,6 +921,7 @@ void shader_core_ctx::decode() {
           get_next_inst(m_inst_fetch_buffer.m_warp_id, pc + pI1->isize);
       if (pI2) {
         m_warp[m_inst_fetch_buffer.m_warp_id]->ibuffer_fill(1, pI2);
+        m_p4_issue_epoch++;  // 44-8 (E2)
         m_warp[m_inst_fetch_buffer.m_warp_id]->inc_inst_in_pipeline();
         m_stats->m_num_decoded_insn[m_sid]++;
         if ((pI1->oprnd_type == INT_OP) ||
@@ -1073,6 +1089,7 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
     m_warp[warp_id]->store_info_of_last_inst_at_barrier(*pipe_reg);
     m_barriers.warp_reaches_barrier(m_warp[warp_id]->get_cta_id(), warp_id,
                                     const_cast<warp_inst_t *>(next_inst));
+    m_p4_issue_epoch++;  // 44-8 (E3): may have released the whole CTA's warps
 
   } else if (next_inst->op == MEMORY_BARRIER_OP) {
     m_warp[warp_id]->set_membar();
@@ -1115,6 +1132,7 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
     if (done_flag) {
       if (m_warp[warp_id]->m_waiting_ldgsts) {
         m_warp[warp_id]->m_waiting_ldgsts = false;
+        m_p4_issue_epoch++;  // 44-8 (E6)
       }
     }
   }
@@ -1258,6 +1276,22 @@ void scheduler_unit::order_by_priority(
 
 void scheduler_unit::cycle() {
   SCHED_DPRINTF("scheduler_unit::cycle()\n");
+  // 44-8 (P4-1): a scheduler whose previous scan issued nothing and was
+  // blocked only by epoch-covered conditions (ibuffer/waiting/scoreboard/
+  // ldst-park) reproduces the exact same outcome until the per-SM issue-event
+  // epoch moves. Skip the scan and charge the same distro bucket.
+  const uint64_t p4_epoch_now =
+      m_shader->p4_issue_epoch() + m_scoreboard->release_epoch();
+#ifdef P4_CHECK
+  const bool p4_predicted = (m_memo_armed && m_memo_epoch == p4_epoch_now);
+  const unsigned char p4_pred_bucket = m_memo_bucket;
+#else
+  if (m_memo_armed && m_memo_epoch == p4_epoch_now) {
+    m_stats->shader_cycle_distro[m_memo_bucket]++;
+    return;
+  }
+#endif
+  bool p4_arm_ok = skip_memo_supported();
   bool valid_inst =
       false;  // there was one warp with a valid instruction to issue (didn't
               // require flush due to control hazard)
@@ -1306,11 +1340,13 @@ void scheduler_unit::cycle() {
       if (pI && pI->m_is_cdp && warp(warp_id).m_cdp_latency > 0) {
         assert(warp(warp_id).m_cdp_dummy);
         warp(warp_id).m_cdp_latency--;
+        p4_arm_ok = false;  // 44-8: the countdown is a per-scan side effect
         break;
       }
 
       bool valid = warp(warp_id).ibuffer_next_valid();
       bool warp_inst_issued = false;
+      bool p4_this_ready = false;  // 44-8: THIS inst passed the scoreboard
       unsigned pc, rpc;
       m_shader->get_pdom_stack_top_info(warp_id, pI, &pc, &rpc);
       SCHED_DPRINTF(
@@ -1335,6 +1371,7 @@ void scheduler_unit::cycle() {
                 "Warp (warp_id %u, dynamic_warp_id %u) passes scoreboard\n",
                 (*iter)->get_warp_id(), (*iter)->get_dynamic_warp_id());
             ready_inst = true;
+            p4_this_ready = true;  // 44-8
 
             const active_mask_t &active_mask =
                 m_shader->get_active_mask(warp_id, pI);
@@ -1348,9 +1385,27 @@ void scheduler_unit::cycle() {
               if (m_mem_out->has_free(m_shader->m_config->sub_core_model,
                                       m_id) &&
                   (!diff_exec_units ||
-                   previous_issued_inst_exec_type != exec_unit_type_t::MEM)) {
+                   previous_issued_inst_exec_type != exec_unit_type_t::MEM) &&
+                  // FIX-A: do not issue a 2nd memory op for this warp while it
+                  // already has one occupying the ldst (dispatch/decoupled-TLB
+                  // park). The ldst holds a single park slot per warp; a 2nd
+                  // parked op would overwrite/lose the 1st -> its dest register
+                  // never releases -> scoreboard deadlock. Enforces the
+                  // decoupled-TLB design's "<=1 outstanding mem inst per warp".
+                  !warp(warp_id).get_ldst_park()) {
+                // FIX-A: only LOAD/STORE occupy the decoupled-TLB park slot and
+                // reach the ldst completion (which clears the flag). Do NOT mark
+                // for MEMORY_BARRIER / TENSOR ops, or the flag could stick.
+                // Read the opcode BEFORE issuing: the trace-driven override
+                // trace_shader_core_ctx::issue_warp() deletes pI once the
+                // instruction has been issued (trace_driven.cc:668), so touching
+                // pI afterwards reads freed memory.
+                const bool ldst_park_op =
+                    (pI->op == LOAD_OP || pI->op == STORE_OP);
                 m_shader->issue_warp(*m_mem_out, pI, active_mask, warp_id,
                                      m_id);
+                if (ldst_park_op)
+                  warp(warp_id).set_ldst_park();  // FIX-A: mark ldst occupied
                 issued++;
                 issued_inst = true;
                 warp_inst_issued = true;
@@ -1521,6 +1576,18 @@ void scheduler_unit::cycle() {
         warp(warp_id).set_next_pc(pc);
         warp(warp_id).ibuffer_flush();
       }
+      // 44-8 (P4-1): a warp that passed the scoreboard (ready) but did not
+      // issue is epoch-covered ONLY when it is a memory op held by the FIX-A
+      // ldst-park gate (cleared via clear_warp_ldst_park -> epoch bump). Any
+      // other cause (pipe has_free, dual-issue constraints, non-mem unit
+      // contention) can change without an epoch event -> do not arm.
+      if (p4_this_ready && !warp_inst_issued) {
+        const bool p4_is_mem =
+            (pI->op == LOAD_OP) || (pI->op == STORE_OP) ||
+            (pI->op == MEMORY_BARRIER_OP) || (pI->op == TENSOR_CORE_LOAD_OP) ||
+            (pI->op == TENSOR_CORE_STORE_OP);
+        if (!(p4_is_mem && warp(warp_id).get_ldst_park())) p4_arm_ok = false;
+      }
       if (warp_inst_issued) {
         SCHED_DPRINTF(
             "Warp (warp_id %u, dynamic_warp_id %u) issued %u instructions\n",
@@ -1563,6 +1630,25 @@ void scheduler_unit::cycle() {
                                         // to memory)
   else if (!issued_inst)
     m_stats->shader_cycle_distro[2]++;  // pipeline stalled
+  // 44-8 (P4-1): arm the skip when nothing issued and every blocker seen this
+  // scan is epoch-covered. The epoch cannot have moved during a no-issue scan
+  // (all bump sites are outside this function or on the issue path), so the
+  // value captured at entry still describes the state the verdicts froze on.
+  if (!issued_inst && p4_arm_ok) {
+    m_memo_armed = true;
+    m_memo_epoch = p4_epoch_now;
+    m_memo_bucket = (!valid_inst) ? 0 : ((!ready_inst) ? 1 : 2);
+  } else {
+    m_memo_armed = false;
+  }
+#ifdef P4_CHECK
+  if (p4_predicted) {
+    assert(!issued_inst && "P4_CHECK: an armed scheduler issued");
+    const unsigned char p4_b = (!valid_inst) ? 0 : ((!ready_inst) ? 1 : 2);
+    assert(p4_b == p4_pred_bucket &&
+           "P4_CHECK: distro bucket changed under a frozen epoch");
+  }
+#endif
 }
 
 void scheduler_unit::do_on_warp_issued(
@@ -1802,14 +1888,59 @@ int shader_core_ctx::test_res_bus(int latency) {
   return -1;
 }
 
+// P9: execute() split so the ldst unit's three phases (P8) can be scheduled
+// apart from each other. m_ldst_unit is the LAST entry of m_fu (see the
+// constructor), so every other functional unit is already fully processed by the
+// time the ldst unit is reached -- which is what makes the cut clean.
+//
+// Order preserved exactly:
+//   original :  result-bus shift, FU[0..N-2] {cycle, active_lanes, issue},
+//               ldst cycle(), ldst active_lanes, ldst issue
+//   split    :  execute_a = shift + FU[0..N-2] + ldst cycle_a
+//               [ldst cycle_b runs between the two halves]
+//               execute_c = ldst cycle_c + ldst active_lanes + ldst issue
+//
+// The result bus is shifted once, at the very top of execute_a, and every
+// test_res_bus() call still happens after that shift and in the same FU order,
+// so result-bus reservation is unaffected.
+//
+// Precondition checked before splitting: ldst_unit::clock_multiplier() returns
+// m_config->mem_unit_ports, which is 1 in this configuration. cycle() therefore
+// runs exactly once per SM cycle; a multiplier > 1 would need a,b,c,a,b,c...
+// interleaving and this split would be wrong.
 void shader_core_ctx::execute() {
-  for (unsigned i = 0; i < num_result_bus; i++) {
-    *(m_result_bus[i]) >>= 1;
+  execute_a();
+  m_ldst_unit->cycle_b();
+  execute_c();
+}
+
+// Result-bus shift + every functional unit except the ldst unit, then the ldst
+// unit's per-SM front half (B1..B3).
+void shader_core_ctx::execute_a() {
+  assert(m_num_function_units > 0);
+  assert(m_fu[m_num_function_units - 1] == m_ldst_unit &&
+         "execute_a: the ldst unit must be the last functional unit");
+  assert(m_ldst_unit->clock_multiplier() == 1 &&
+         "execute_a: the phase split assumes one ldst cycle per SM cycle");
+  // 44-7 (P4-2): when no result bus holds a pending writeback bit, the
+  // 512-bit shifts are no-ops -- skip them. The counter is maintained at the
+  // two set sites (bit guaranteed clear by test_res_bus) and here on drain.
+  if (m_result_bus_active) {
+    for (unsigned i = 0; i < num_result_bus; i++) {
+      if (m_result_bus[i]->test(0)) m_result_bus_active--;
+      *(m_result_bus[i]) >>= 1;
+    }
   }
-  for (unsigned n = 0; n < m_num_function_units; n++) {
-    unsigned multiplier = m_fu[n]->clock_multiplier();
-    for (unsigned c = 0; c < multiplier; c++) m_fu[n]->cycle();
-    m_fu[n]->active_lanes_in_pipeline();
+  for (unsigned n = 0; n + 1 < m_num_function_units; n++) {
+    // 44-7 (P4-2): a completely idle unit's cycle() is a no-op (all three
+    // branches false, occupied zero so the shift moves nothing) and its
+    // active-lane accounting adds zero (power sim off path) -- skip both.
+    // The issue side below still runs: an idle unit can accept a new inst.
+    if (!m_fu[n]->pipe_idle()) {
+      unsigned multiplier = m_fu[n]->clock_multiplier();
+      for (unsigned c = 0; c < multiplier; c++) m_fu[n]->cycle();
+      m_fu[n]->active_lanes_in_pipeline();
+    }
     unsigned issue_port = m_issue_port[n];
     register_set &issue_inst = m_pipeline_reg[issue_port];
     unsigned reg_id;
@@ -1827,12 +1958,47 @@ void shader_core_ctx::execute() {
           (resbus = test_res_bus((*ready_reg)->latency)) != -1) {
         assert((*ready_reg)->latency < MAX_ALU_LATENCY);
         m_result_bus[resbus]->set((*ready_reg)->latency);
+        m_result_bus_active++;  // 44-7: test_res_bus picked a clear bit
         m_fu[n]->issue(issue_inst);
       } else if (!schedule_wb_now) {
         m_fu[n]->issue(issue_inst);
       } else {
         // stall issue (cannot reserve result bus)
       }
+    }
+  }
+  m_ldst_unit->cycle_a();
+}
+
+// The ldst unit's per-SM back half (B5..B9), then its active-lane accounting and
+// its issue logic -- i.e. the tail of the original FU loop for n == N-1.
+void shader_core_ctx::execute_c() {
+  const unsigned n = m_num_function_units - 1;
+  m_ldst_unit->cycle_c();
+  m_fu[n]->active_lanes_in_pipeline();
+  unsigned issue_port = m_issue_port[n];
+  register_set &issue_inst = m_pipeline_reg[issue_port];
+  unsigned reg_id;
+  bool partition_issue =
+      m_config->sub_core_model && m_fu[n]->is_issue_partitioned();
+  if (partition_issue) {
+    reg_id = m_fu[n]->get_issue_reg_id();
+  }
+  warp_inst_t **ready_reg = issue_inst.get_ready(partition_issue, reg_id);
+  if (issue_inst.has_ready(partition_issue, reg_id) &&
+      m_fu[n]->can_issue(**ready_reg)) {
+    bool schedule_wb_now = !m_fu[n]->stallable();
+    int resbus = -1;
+    if (schedule_wb_now &&
+        (resbus = test_res_bus((*ready_reg)->latency)) != -1) {
+      assert((*ready_reg)->latency < MAX_ALU_LATENCY);
+      m_result_bus[resbus]->set((*ready_reg)->latency);
+      m_result_bus_active++;  // 44-7: test_res_bus picked a clear bit
+      m_fu[n]->issue(issue_inst);
+    } else if (!schedule_wb_now) {
+      m_fu[n]->issue(issue_inst);
+    } else {
+      // stall issue (cannot reserve result bus)
     }
   }
 }
@@ -1900,6 +2066,7 @@ void shader_core_ctx::unset_depbar(const warp_inst_t &inst) {
     if (done_flag) {
       if (m_warp[inst.warp_id()]->m_waiting_ldgsts) {
         m_warp[inst.warp_id()]->m_waiting_ldgsts = false;
+        m_p4_issue_epoch++;  // 44-8 (E6)
       }
     }
   }
@@ -1923,7 +2090,13 @@ void shader_core_ctx::warp_inst_complete(const warp_inst_t &inst) {
     m_stats->m_num_sim_insn[m_sid] += inst.active_count();
 
   m_stats->m_num_sim_winsn[m_sid]++;
-  m_gpu->gpu_sim_insn += inst.active_count();
+  // G1: shared accumulator written from every SM inside the CORE phase.
+  // Integer addition is commutative and associative, so an atomic update is
+  // bit-exact regardless of thread count. Without -fopenmp the pragma is
+  // ignored and the sequential behaviour is unchanged.
+  const unsigned g1_active = inst.active_count();
+#pragma omp atomic
+  m_gpu->gpu_sim_insn += g1_active;
   inst.completed(m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle);
 }
 
@@ -1988,7 +2161,10 @@ bool ldst_unit::shared_cycle(warp_inst_t &inst, mem_stage_stall_type &rc_fail,
   if (stall) {
     fail_type = S_MEM;
     rc_fail = BK_CONF;
-    m_stats->gpgpu_n_shmem_bkconflict++;
+    {  // W5: shared scalar stat, incremented from every SM
+    #pragma omp atomic
+      m_stats->gpgpu_n_shmem_bkconflict++;
+    }
   } else
     rc_fail = NO_RC_FAIL;
   return !stall;
@@ -2059,8 +2235,26 @@ mem_stage_stall_type ldst_unit::process_memory_access_queue(cache_t *cache,
   return process_cache_access(cache, mf->get_addr(), inst, events, mf, status);
 }
 
+//mem_stage_stall_type ldst_unit::process_memory_access_queue_l1cache(
+//    l1_cache *cache, warp_inst_t &inst) {
+// mem_stage_stall_type ldst_unit::process_memory_access_queue_l1cache(
+//     l1_cache *cache, warp_inst_t &inst, bool tlb_done, new_addr_type translated_pa) {
+// Rebuilds a PA from the per-warp translation table. Every PA the ldst unit
+// produces goes through here, so the offset mask always matches the page size
+// that was used to translate the address.
+void ldst_unit::set_pa_from_xlat(mem_fetch *mf, uint64_t va, unsigned wid) {
+  gpu_module *gmod = m_gpu ? m_gpu->get_gpu_module() : NULL;
+  if (!gmod) return;
+  const unsigned pshift = gmod->page_shift_for_va(va);
+  const uint64_t vpn    = page_vpn(va, pshift);
+  const auto &tbl = xlat_table_for(pshift, wid);
+  auto it = tbl.find(vpn);
+  if (it == tbl.end()) return;  // untranslated: leave PA as-is, same as before
+  mf->set_pa((it->second.pfn() << GPU_PAGE_SHIFT) | page_offset(va, pshift));
+}
+
 mem_stage_stall_type ldst_unit::process_memory_access_queue_l1cache(
-    l1_cache *cache, warp_inst_t &inst) {
+    l1_cache *cache, warp_inst_t &inst, unsigned wid, bool tlb_on) {
   mem_stage_stall_type result = NO_RC_FAIL;
   if (inst.accessq_empty()) return result;
 
@@ -2070,10 +2264,12 @@ mem_stage_stall_type ldst_unit::process_memory_access_queue_l1cache(
 
       if (inst.accessq_empty()) return result;
 
+      const mem_access_t &a = inst.accessq_back();
       mem_fetch *mf =
           m_mf_allocator->alloc(inst, inst.accessq_back(),
                                 m_core->get_gpu()->gpu_sim_cycle +
                                     m_core->get_gpu()->gpu_tot_sim_cycle);
+      if (tlb_on) set_pa_from_xlat(mf, a.get_addr(), wid);
       unsigned bank_id = m_config->m_L1D_config.set_bank(mf->get_addr());
       assert(bank_id < m_config->m_L1D_config.l1_banks);
 
@@ -2094,7 +2290,10 @@ mem_stage_stall_type ldst_unit::process_memory_access_queue_l1cache(
         inst.accessq_pop_back();
       } else {
         result = BK_CONF;
-        m_stats->gpgpu_n_l1cache_bkconflict++;
+        {  // W5: shared scalar stat, incremented from every SM
+        #pragma omp atomic
+          m_stats->gpgpu_n_l1cache_bkconflict++;
+        }
         delete mf;
         break;  // do not try again, just break from the loop and try the next
                 // cycle
@@ -2108,6 +2307,8 @@ mem_stage_stall_type ldst_unit::process_memory_access_queue_l1cache(
         m_mf_allocator->alloc(inst, inst.accessq_back(),
                               m_core->get_gpu()->gpu_sim_cycle +
                                   m_core->get_gpu()->gpu_tot_sim_cycle);
+    const mem_access_t &a = inst.accessq_back();
+    if (tlb_on) set_pa_from_xlat(mf, a.get_addr(), wid);
     std::list<cache_event> events;
     enum cache_request_status status = cache->access(
         mf->get_addr(), mf,
@@ -2257,6 +2458,131 @@ bool ldst_unit::texture_cycle(warp_inst_t &inst, mem_stage_stall_type &rc_fail,
   return inst.accessq_empty();  // done if empty.
 }
 
+// bool ldst_unit::memory_cycle(warp_inst_t &inst,
+//                              mem_stage_stall_type &stall_reason,
+//                              mem_stage_access_type &access_type) {
+//   if (inst.empty() || ((inst.space.get_type() != global_space) &&
+//                        (inst.space.get_type() != local_space) &&
+//                        (inst.space.get_type() != param_space_local)))
+//     return true;
+//   if (inst.active_count() == 0) return true;
+//   if (inst.accessq_empty()) return true;
+
+//   mem_stage_stall_type stall_cond = NO_RC_FAIL;
+//   const mem_access_t &access = inst.accessq_back();
+
+//   bool bypassL1D = false;
+//   if (CACHE_GLOBAL == inst.cache_op || (m_L1D == NULL)) {
+//     bypassL1D = true;
+//   } else if (inst.space.is_global()) {  // global memory access
+//     // skip L1 cache if the option is enabled
+//     if (m_core->get_config()->gmem_skip_L1D && (CACHE_L1 != inst.cache_op))
+//       bypassL1D = true;
+//   }
+
+//   // Phase 4: L1 TLB lookup before the bypass/cache split.
+//   // Both bypassL1D and L1D-cache paths need VA->PA translation.
+//   // TLB is checked here once; the actual memory access proceeds below.
+//   bool tlb_translated = false;
+//   uint64_t translated_pa = 0;
+//   uint64_t cur_cycle  = m_core->get_gpu()->gpu_sim_cycle
+//                         + m_core->get_gpu()->gpu_tot_sim_cycle;
+
+//   if (m_l1_tlb_4k && m_gpu && m_gpu->get_gpu_module()) {
+//     uint64_t va         = access.get_addr();
+//     gpu_pte_t out_pte;
+//     gpu_l1_tlb::result_t tlb_res = m_l1_tlb_4k->access(va, inst.warp_id(), out_pte, cur_cycle);
+
+//     if (tlb_res == gpu_l1_tlb::HIT) {
+//       // TLB hit: compute PA and let the normal path proceed
+//       translated_pa = (out_pte.pfn() << GPU_PAGE_SHIFT) | (va & (GPU_PAGE_SIZE - 1));
+//       tlb_translated = true;
+//       printf("[L1_TLB] cycle=%llu SM=%u HIT va=0x%llx -> pa=0x%llx\n",
+//             (unsigned long long)cur_cycle, m_sid,
+//             (unsigned long long)va, (unsigned long long)translated_pa); // print_log
+
+//     } else if (tlb_res == gpu_l1_tlb::MSHR_HIT ||
+//                tlb_res == gpu_l1_tlb::LOOKUP_PENDING) {
+//       // Translation in-flight; stall this warp until GMMU completes.
+//       // P5 park DISABLED (issue<->dispatch race deadlock); fall back to P4 re-poll.
+//       if (m_decouple_tlb) {   // park (non-blocking) -> cycle() sets aside
+//         m_dispatch_parked = true;
+//         return true;                        // intercepted by park block before completion
+//       }
+//       stall_cond = TLB_STALL;
+//     } else {
+//       // Miss/pending: the L1 TLB (resolve_lookup/cycle) owns MSHR allocation and
+//       // the L1->L2 request queue. Just stall and retry (P4 re-poll; P5 park off).
+//       if (m_decouple_tlb) {   // park (non-blocking) -> cycle() sets aside
+//         m_dispatch_parked = true;
+//         return true;
+//       }
+//       stall_cond = TLB_STALL;
+//     }
+
+//     if (stall_cond == TLB_STALL) {
+//       stall_reason = TLB_STALL;
+//       bool iswrite = inst.is_store();
+//       access_type  = inst.space.is_local()
+//                       ? (iswrite ? L_MEM_ST : L_MEM_LD)
+//                       : (iswrite ? G_MEM_ST : G_MEM_LD);
+//       return false;
+//     }
+
+//     if (bypassL1D) {
+//       // bypass L1 cache
+//       unsigned control_size =
+//           inst.is_store() ? WRITE_PACKET_SIZE : READ_PACKET_SIZE;
+//       unsigned size = access.get_size() + control_size;
+//       // printf("Interconnect:Addr: %x, size=%d\n",access.get_addr(),size);
+//       if (m_memory_config->SST_mode &&
+//           (static_cast<sst_memory_interface *>(m_icnt)->full(
+//               size, inst.is_store() || inst.isatomic(), access.get_type()))) {
+//         // SST need mf type here
+//         // Cast it to sst_memory_interface pointer first as this full() method
+//         // is not a virtual method in parent class
+//         stall_cond = ICNT_RC_FAIL;
+//       } else if (!m_memory_config->SST_mode &&
+//                 (m_icnt->full(size, inst.is_store() || inst.isatomic()))) {
+//         stall_cond = ICNT_RC_FAIL;
+//       } else {
+//         // After (Phase 4): translation already done by L1 TLB above
+//         if (stall_cond == NO_RC_FAIL) {
+//           mem_fetch *mf = m_mf_allocator->alloc(inst, access, cur_cycle);
+//           // Apply PA from L1 TLB translation result
+//           if (tlb_translated && !mf->is_translated()) {
+//             mf->set_pa(translated_pa);
+//           }
+//           m_icnt->push(mf);
+//           inst.accessq_pop_back();
+//           if (inst.is_load()) {
+//             for (unsigned r = 0; r < MAX_OUTPUT_VALUES; r++)
+//               if (inst.out[r] > 0)
+//                 assert(m_pending_writes[inst.warp_id()][inst.out[r]] > 0);
+//           } else if (inst.is_store())
+//             m_core->inc_store_req(inst.warp_id());
+//         }
+//       }
+//     } else {
+//       assert(CACHE_UNDEFINED != inst.cache_op);
+//       // stall_cond = process_memory_access_queue_l1cache(m_L1D, inst);
+//       stall_cond = process_memory_access_queue_l1cache(m_L1D, inst, tlb_translated, translated_pa);
+//     }
+
+//     if (!inst.accessq_empty() && stall_cond == NO_RC_FAIL)
+//       stall_cond = COAL_STALL;
+//     if (stall_cond != NO_RC_FAIL) {
+//       stall_reason = stall_cond;
+//       bool iswrite = inst.is_store();
+//       if (inst.space.is_local())
+//         access_type = (iswrite) ? L_MEM_ST : L_MEM_LD;
+//       else
+//         access_type = (iswrite) ? G_MEM_ST : G_MEM_LD;
+//     }
+//     return inst.accessq_empty();
+//   }
+// }
+
 bool ldst_unit::memory_cycle(warp_inst_t &inst,
                              mem_stage_stall_type &stall_reason,
                              mem_stage_access_type &access_type) {
@@ -2267,41 +2593,131 @@ bool ldst_unit::memory_cycle(warp_inst_t &inst,
   if (inst.active_count() == 0) return true;
   if (inst.accessq_empty()) return true;
 
+  const unsigned wid     = inst.warp_id();
+  const uint64_t cur_cycle = m_core->get_gpu()->gpu_sim_cycle
+                           + m_core->get_gpu()->gpu_tot_sim_cycle;
+  const bool tlb_on = (m_l1_tlb_4k && m_gpu && m_gpu->get_gpu_module());
+  gpu_module *gmod = tlb_on ? m_gpu->get_gpu_module() : NULL;
+
+  // ---------- Phase 1: translate EVERY distinct page in accessq (1 lookup/page) ----------
+  if (tlb_on) {
+    if (m_config->gpgpu_tlb_ideal) {
+      // Ideal TLB: 0-cycle translation. Fill the per-page table by creating/walking
+      // the mapping functionally -- no MSHR, no walk latency, no park. Placement is
+      // irrelevant (no remote cost when translation is free). Baseline to isolate
+      // translation-latency overhead from data-access time.
+      gpu_page_table* pt   = gmod->get_page_table();
+      unsigned        chip = gmod->cluster_to_chiplet(m_tpc);
+      for (const mem_access_t &a : inst.get_accessq()) {
+        const uint64_t va     = a.get_addr();
+        const unsigned pshift = gmod->page_shift_for_va(va);
+        auto &tbl = xlat_table_for(pshift, wid);
+        const uint64_t vpn = page_vpn(va, pshift);
+        if (tbl.count(vpn)) continue;
+        const gpu_pte_t* pte = pt->walk(va);
+        if (!pte || !pte->present()) {    // map now (instant), levels in order
+          pt->ensure_node(va, 1, chip);   // PDP
+          pt->ensure_node(va, 2, chip);   // PD
+          if (pshift != GPU_HUGE_SHIFT)   // 2MB has no level-3 node; 4KB/64KB do
+            pt->ensure_node(va, 3, chip); // PT (4KB) or big PT (64KB)
+          pt->map_leaf(va, chip);         // data page
+          pte = pt->walk(va);
+        }
+        tbl[vpn] = *pte;
+      }
+      // fallthrough to Phase 2 with the table fully populated.
+    } else {
+      // A divergent warp access needs EVERY one of its distinct pages translated.
+      // Issuing them one per replay makes a 32-page instruction take 32 park/replay
+      // round trips, each paying a full translation latency -- a serialization the
+      // hardware does not have (a GPU MMU must absorb a whole divergent access's
+      // worth of concurrent translations; Power et al., HPCA 2014). Issue them all
+      // so they overlap in the TLB/MSHR, then park ONCE for whatever is unresolved.
+      // access() is per-request idempotent (blocks 1-2), so re-issuing an
+      // already-injected page on a later replay does not re-inject or re-time it.
+      // 44-5: if nothing that can change an in-flight page's answer has
+      // happened on this SM's TLBs since this same instruction's last full
+      // scan, the scan is a pure re-read and would end any_pending again --
+      // skip it. Guarded off when L1 TLB ports are modeled (PORT_BUSY probes
+      // record l1_port_polls per attempt, which skipping would lose).
+      const bool memo_ok = (m_l1_tlb_4k->ports() == 0) &&
+                           (!m_l1_tlb_64k || m_l1_tlb_64k->ports() == 0) &&
+                           (!m_l1_tlb_2m  || m_l1_tlb_2m->ports()  == 0);
+      if (memo_ok) {
+        auto pit = m_xlat_probe_memo.find(wid);
+        if (pit != m_xlat_probe_memo.end() &&
+            pit->second.second == inst.get_uid() &&
+            pit->second.first == l1_xlat_epoch_sum()) {
+          if (m_decouple_tlb) { m_dispatch_parked = true; return true; }
+          stall_reason = TLB_STALL;
+          bool iswrite = inst.is_store();
+          access_type  = inst.space.is_local() ? (iswrite ? L_MEM_ST : L_MEM_LD)
+                                              : (iswrite ? G_MEM_ST : G_MEM_LD);
+          return false;
+        }
+      }
+      bool any_pending = false;
+      for (const mem_access_t &a : inst.get_accessq()) {
+        const uint64_t va     = a.get_addr();
+        const unsigned pshift = gmod->page_shift_for_va(va);
+        gpu_l1_tlb *tlb = l1_tlb_for(pshift);
+        auto &tbl = xlat_table_for(pshift, wid);
+        const uint64_t vpn = page_vpn(va, pshift);
+        if (tbl.count(vpn)) continue;                  // already translated -> dedup skip
+        gpu_pte_t out_pte;
+        gpu_l1_tlb::result_t r = tlb->access(va, wid, out_pte, cur_cycle);
+        if (r == gpu_l1_tlb::HIT) {
+          tbl[vpn] = out_pte;                           // record; keep scanning for more pages
+          continue;
+        }
+        // PORT_BUSY means nothing was injected and no resource is held, so the
+        // page is simply retried on the next replay -- same handling as pending.
+        any_pending = true;
+      }
+      if (any_pending) {
+        // 44-5: remember the post-scan epoch; a later dispatch of this same
+        // instruction re-scans only after the epoch moves.
+        if (memo_ok)
+          m_xlat_probe_memo[wid] = {l1_xlat_epoch_sum(), inst.get_uid()};
+        if (m_decouple_tlb) { m_dispatch_parked = true; return true; }
+        stall_reason = TLB_STALL;
+        bool iswrite = inst.is_store();
+        access_type  = inst.space.is_local() ? (iswrite ? L_MEM_ST : L_MEM_LD)
+                                            : (iswrite ? G_MEM_ST : G_MEM_LD);
+        return false;
+      }
+    }
+    // fallthrough: every distinct page of this instruction is now in tbl.
+  }
+
+  // ---------- Phase 2: route each sector with ITS page's PA (from table) ----------
   mem_stage_stall_type stall_cond = NO_RC_FAIL;
   const mem_access_t &access = inst.accessq_back();
 
   bool bypassL1D = false;
   if (CACHE_GLOBAL == inst.cache_op || (m_L1D == NULL)) {
     bypassL1D = true;
-  } else if (inst.space.is_global()) {  // global memory access
-    // skip L1 cache if the option is enabled
+  } else if (inst.space.is_global()) {
     if (m_core->get_config()->gmem_skip_L1D && (CACHE_L1 != inst.cache_op))
       bypassL1D = true;
   }
+
   if (bypassL1D) {
-    // bypass L1 cache
     unsigned control_size =
         inst.is_store() ? WRITE_PACKET_SIZE : READ_PACKET_SIZE;
     unsigned size = access.get_size() + control_size;
-    // printf("Interconnect:Addr: %x, size=%d\n",access.get_addr(),size);
     if (m_memory_config->SST_mode &&
         (static_cast<sst_memory_interface *>(m_icnt)->full(
             size, inst.is_store() || inst.isatomic(), access.get_type()))) {
-      // SST need mf type here
-      // Cast it to sst_memory_interface pointer first as this full() method
-      // is not a virtual method in parent class
       stall_cond = ICNT_RC_FAIL;
     } else if (!m_memory_config->SST_mode &&
                (m_icnt->full(size, inst.is_store() || inst.isatomic()))) {
       stall_cond = ICNT_RC_FAIL;
     } else {
-      mem_fetch *mf =
-          m_mf_allocator->alloc(inst, access,
-                                m_core->get_gpu()->gpu_sim_cycle +
-                                    m_core->get_gpu()->gpu_tot_sim_cycle);
+      mem_fetch *mf = m_mf_allocator->alloc(inst, access, cur_cycle);
+      if (tlb_on) set_pa_from_xlat(mf, access.get_addr(), wid);  // per-sector PA from table
       m_icnt->push(mf);
       inst.accessq_pop_back();
-      // inst.clear_active( access.get_warp_mask() );
       if (inst.is_load()) {
         for (unsigned r = 0; r < MAX_OUTPUT_VALUES; r++)
           if (inst.out[r] > 0)
@@ -2311,17 +2727,29 @@ bool ldst_unit::memory_cycle(warp_inst_t &inst,
     }
   } else {
     assert(CACHE_UNDEFINED != inst.cache_op);
-    stall_cond = process_memory_access_queue_l1cache(m_L1D, inst);
+    stall_cond = process_memory_access_queue_l1cache(m_L1D, inst, wid, tlb_on);
   }
+
   if (!inst.accessq_empty() && stall_cond == NO_RC_FAIL)
     stall_cond = COAL_STALL;
   if (stall_cond != NO_RC_FAIL) {
     stall_reason = stall_cond;
     bool iswrite = inst.is_store();
-    if (inst.space.is_local())
-      access_type = (iswrite) ? L_MEM_ST : L_MEM_LD;
-    else
-      access_type = (iswrite) ? G_MEM_ST : G_MEM_LD;
+    access_type = inst.space.is_local() ? (iswrite ? L_MEM_ST : L_MEM_LD)
+                                        : (iswrite ? G_MEM_ST : G_MEM_LD);
+  }
+
+  // XLATLAT: translation finished and at least one access was actually routed
+  // this cycle. Pairs with m_xlatlat_stalled_cycles: issue capacity used vs lost.
+  if (stall_cond == NO_RC_FAIL || stall_cond == COAL_STALL)
+    m_xlatlat_mem_issue_cycles++;
+
+  // instruction fully drained -> drop its translation tables (all page sizes).
+  if (inst.accessq_empty()) {
+    m_xlat_table_4k.erase(wid);
+    m_xlat_table_64k.erase(wid);
+    m_xlat_table_2m.erase(wid);
+    m_xlat_probe_memo.erase(wid);  // 44-5
   }
   return inst.accessq_empty();
 }
@@ -2357,7 +2785,8 @@ void simd_function_unit::issue(register_set &source_reg) {
       m_config->sub_core_model && this->is_issue_partitioned();
   source_reg.move_out_to(partition_issue, this->get_issue_reg_id(),
                          m_dispatch_reg);
-  occupied.set(m_dispatch_reg->latency);
+  occupied.set(m_dispatch_reg->latency);  // bit was clear: can_issue() checked it
+  m_occupied_bits++;  // 44-7
 }
 
 sfu::sfu(register_set *result_port, const shader_core_config *config,
@@ -2561,6 +2990,7 @@ void pipelined_simd_unit::cycle() {
       }
     }
   }
+  if (occupied.test(0)) m_occupied_bits--;  // 44-7: a set bit shifts out
   occupied >>= 1;
 }
 
@@ -2611,6 +3041,8 @@ void ldst_unit::init(mem_fetch_interface *icnt,
                               get_shader_constant_cache_id(), icnt,
                               IN_L1C_MISS_QUEUE, OTHER_GPU_CACHE, m_gpu);
   m_L1D = NULL;
+  m_l1_tlb_4k = NULL;  // initialized in constructor after config is available
+  m_decouple_tlb = m_config->gpgpu_tlb_decouple;
   m_mem_rc = NO_RC_FAIL;
   m_num_writeback_clients =
       5;  // = shared memory, global/local (uncached), L1D, L1T, L1C
@@ -2638,8 +3070,55 @@ ldst_unit::ldst_unit(mem_fetch_interface *icnt,
     m_L1D = new l1_cache(L1D_name, m_config->m_L1D_config, m_sid,
                          get_shader_normal_cache_id(), m_icnt, m_mf_allocator,
                          IN_L1D_MISS_QUEUE, core->get_gpu(), L1_GPU_CACHE);
+    // (P4)
+    m_l1_tlb_4k = new gpu_l1_tlb(
+      m_config->gpgpu_l1_tlb_4k_sets,    // 1  (fully-associative)
+      m_config->gpgpu_l1_tlb_4k_assoc,   // 32
+      m_config->gpgpu_l1_tlb_4k_mshr_entries,  // 16
+      m_config->gpgpu_l1_tlb_4k_mshr_max_merge,
+      m_config->gpgpu_l1_tlb_4k_lookup_latency,
+      m_sid,
+      GPU_PAGE_SHIFT);                    // 12 (4KB)
+    printf("[L1_TLB_4k] init: SM=%u sets=%u assoc=%u mshr=%u max_merge=%u lat=%u\n",
+           m_sid, m_config->gpgpu_l1_tlb_4k_sets, m_config->gpgpu_l1_tlb_4k_assoc,
+           m_config->gpgpu_l1_tlb_4k_mshr_entries,
+           m_config->gpgpu_l1_tlb_4k_mshr_max_merge,
+           m_config->gpgpu_l1_tlb_4k_lookup_latency); // print_log
+
+    // 64KB L1 TLB: same class as the 4k one, only page_shift differs.
+    m_l1_tlb_64k = new gpu_l1_tlb(
+      m_config->gpgpu_l1_tlb_64k_sets,
+      m_config->gpgpu_l1_tlb_64k_assoc,
+      m_config->gpgpu_l1_tlb_64k_mshr_entries,
+      m_config->gpgpu_l1_tlb_64k_mshr_max_merge,
+      m_config->gpgpu_l1_tlb_64k_lookup_latency,
+      m_sid,
+      GPU_64K_SHIFT);                   // 16 (64KB)
+    printf("[L1_TLB_64k] init: SM=%u sets=%u assoc=%u mshr=%u max_merge=%u lat=%u\n",
+           m_sid, m_config->gpgpu_l1_tlb_64k_sets, m_config->gpgpu_l1_tlb_64k_assoc,
+           m_config->gpgpu_l1_tlb_64k_mshr_entries,
+           m_config->gpgpu_l1_tlb_64k_mshr_max_merge,
+           m_config->gpgpu_l1_tlb_64k_lookup_latency); // print_log
+
+    // 2MB L1 TLB: same class as the 4k one, only page_shift differs.
+    m_l1_tlb_2m = new gpu_l1_tlb(
+      m_config->gpgpu_l1_tlb_2m_sets,
+      m_config->gpgpu_l1_tlb_2m_assoc,
+      m_config->gpgpu_l1_tlb_2m_mshr_entries,
+      m_config->gpgpu_l1_tlb_2m_mshr_max_merge,
+      m_config->gpgpu_l1_tlb_2m_lookup_latency,
+      m_sid,
+      GPU_HUGE_SHIFT);                    // 21 (2MB)
+    printf("[L1_TLB_2m] init: SM=%u sets=%u assoc=%u mshr=%u max_merge=%u lat=%u\n",
+           m_sid, m_config->gpgpu_l1_tlb_2m_sets, m_config->gpgpu_l1_tlb_2m_assoc,
+           m_config->gpgpu_l1_tlb_2m_mshr_entries,
+           m_config->gpgpu_l1_tlb_2m_mshr_max_merge,
+           m_config->gpgpu_l1_tlb_2m_lookup_latency); // print_log
 
     l1_latency_queue.resize(m_config->m_L1D_config.l1_banks);
+    m_l1_tlb_2m->set_ports(m_config->gpgpu_l1_tlb_ports);
+    m_l1_tlb_64k->set_ports(m_config->gpgpu_l1_tlb_ports);
+    m_l1_tlb_4k->set_ports(m_config->gpgpu_l1_tlb_ports);
     assert(m_config->m_L1D_config.l1_latency > 0);
 
     for (unsigned j = 0; j < m_config->m_L1D_config.l1_banks; j++)
@@ -2831,7 +3310,21 @@ inst->space.get_type() != shared_space) { unsigned warp_id = inst->warp_id();
    pipelined_simd_unit::issue(reg_set);
 }
 */
+// P8: ldst_unit::cycle() split into three phases. The address-translation
+// section (cycle_b) is the only one that touches chiplet-shared state -- the
+// L2 TLB and the GMMU -- so isolating it lets the two per-SM phases around it
+// be scheduled at full SM width later, while cycle_b stays at chiplet width
+// (design doc, plan 3). The three bodies are moved VERBATIM: no statement is
+// added, removed, or reordered, and cycle() calls them back to back, so the
+// observable behaviour is identical to the single function it replaces.
 void ldst_unit::cycle() {
+  cycle_a();
+  cycle_b();
+  cycle_c();
+}
+
+// B1..B3: writeback, pipeline register shift, response FIFO drain. Per-SM only.
+void ldst_unit::cycle_a() {
   writeback();
 
   for (unsigned stage = 0; (stage + 1) < m_pipeline_depth; stage++)
@@ -2895,11 +3388,213 @@ void ldst_unit::cycle() {
     }
   }
 
+}
+
+// B4: address translation. Touches the chiplet-shared gpu_l2_tlb and gmmu.
+void ldst_unit::cycle_b() {
+  if (m_l1_tlb_4k && m_gpu && m_gpu->get_gpu_module()) {
+    gpu_module *gmod      = m_gpu->get_gpu_module();
+    unsigned chiplet_id   = gmod->cluster_to_chiplet(m_tpc);
+    uint64_t cur_cycle    = m_core->get_gpu()->gpu_sim_cycle
+                          + m_core->get_gpu()->gpu_tot_sim_cycle;
+
+    // Same servicing logic per page size; only the (L1, L2, shift) triple differs.
+    // The park/replay structures stay shared: a warp parks on a miss regardless
+    // of which TLB missed.
+    struct tlb_pair_t { gpu_l1_tlb *l1; gpu_l2_tlb *l2; unsigned shift; };
+    const tlb_pair_t pairs[3] = {
+      { m_l1_tlb_4k,  gmod->get_chiplet(chiplet_id)->get_l2_tlb_4k(),  GPU_PAGE_SHIFT },
+      { m_l1_tlb_64k, gmod->get_chiplet(chiplet_id)->get_l2_tlb_64k(), GPU_64K_SHIFT  },
+      { m_l1_tlb_2m,  gmod->get_chiplet(chiplet_id)->get_l2_tlb_2m(),  GPU_HUGE_SHIFT },
+    };
+
+    for (unsigned p = 0; p < 3; p++) {
+      gpu_l1_tlb *l1_tlb = pairs[p].l1;
+      gpu_l2_tlb *l2_tlb = pairs[p].l2;
+      if (!l1_tlb || !l2_tlb) continue;
+      l1_tlb_mshr &mshr = l1_tlb->mshr();
+
+      // Poll L2 TLB for completed VPN translations (MISS/MSHR_HIT path only).
+      // L2 HIT path fills L1 TLB directly in memory_cycle(); those VPNs have
+      // ready=true in L1 MSHR already and are not returned by get_pending_vpns().
+      for (uint64_t vpn : mshr.get_pending_vpns()) {
+        gpu_pte_t pte;
+        // query_completed() checks pte_ready and removes this cluster_id.
+        // Returns true once GMMU complete_walk() called l2_tlb->fill().
+        if (l2_tlb->query_completed(vpn, m_tpc, pte)) {
+          // XLATLAT: collect this (cluster, vpn)'s L2 boundaries so the fill can
+          // hand them to the request that drove the hand-off.
+          xlat_down_t down;
+          const bool have = l2_tlb->xlat_take_seg(m_tpc, vpn, down);
+          l1_tlb->fill(vpn, pte, cur_cycle, have ? &down : NULL);
+          #ifdef LOG_TLB
+          printf("[L1_TLB_%s] cycle=%llu SM=%u fill vpn=0x%llx pfn=0x%llx\n",
+                page_kind_tag(pairs[p].shift),
+                (unsigned long long)cur_cycle, m_sid,
+                (unsigned long long)vpn, (unsigned long long)pte.pfn()); // print_log
+          #endif
+        }
+      }
+      l1_tlb->cycle(cur_cycle);  // drain mark_ready'd MSHR entries; unchanged
+      // P5: drain completed translations, schedule parked warps for replay.
+      l1_tlb_mshr &cmshr = l1_tlb->mshr();
+      while (cmshr.access_ready()) {
+        l1_tlb_mshr::l1_fill_token tok = cmshr.next_access();
+        if (m_decouple_tlb)
+          for (unsigned w : tok.waiters) {
+            if (m_xlat_parked_4k.count(w)) m_xlat_replay_q_4k.push_back(w);
+            else                           m_xlat_wake_pending.insert(w);  // don't drop; deliver on re-park
+          }
+      }
+      // P5: wake parked warps whose lookup resolved to a cached HIT (no MSHR entry).
+      unsigned hit_w;
+      while (l1_tlb->pop_hit_wakeup(hit_w)) {
+        if (m_xlat_parked_4k.count(hit_w)) m_xlat_replay_q_4k.push_back(hit_w);
+        else                               m_xlat_wake_pending.insert(hit_w);  // don't drop; deliver on re-park
+      }
+      // Drain L1->L2 request queue (P3): send one queued miss to L2 per cycle.
+      // req_va is the page base; huge-page allocations are page-aligned, so it
+      // lands in the same VA range and page_shift_for_va() agrees with shift.
+      // Walk the queue instead of retrying only its head. The L2 holds a request
+      // for its whole probe latency, so a head-only drain delivers one lookup per
+      // lookup_latency per SM and everything behind it is head-of-line blocked --
+      // which is what capped translation throughput at 1/80 per SM. Issue is
+      // decoupled from completion in real hardware: you send the next request
+      // without waiting for the previous result. FIFO order is preserved so no
+      // request is pushed back indefinitely.
+      {
+        // issue_width is the SM->L2 LINK width: how many requests may be put on
+        // the wire per cycle. A request already inside the L2's lookup stage is
+        // not retransmitted, so it must not be charged -- charging it would let a
+        // few in-flight probes consume the whole width every cycle and re-create
+        // the head-of-line block (observed: L2 concurrent_max stuck at exactly
+        // issue_width). Only new hand-overs and rejections cost bandwidth.
+        const unsigned issue_width = m_core->get_config()->gpgpu_l2_tlb_issue_width;
+        unsigned sent = 0;
+        for (auto it = l1_tlb->l2_req_begin();
+             it != l1_tlb->l2_req_end() && sent < issue_width; ) {
+          // 44-3: while the L2 probe gate for this entry is still open, the
+          // call would answer LOOKUP_PENDING with no state change and no link
+          // use. Skip it entirely; reproduce the one gate_pending count the
+          // reached-entry poll would have made. next_poll never moves while
+          // pending (the gate is only rewritten on arm / post-expiry re-arm).
+          if (cur_cycle < it->next_poll) {
+            l2_tlb->note_gate_pending();
+            ++it;
+            continue;
+          }
+          // 44-4: the last poll answered MSHR_FULL. That verdict (and its fail
+          // type) is a pure function of L2 (array, MSHR) state, frozen while
+          // the L2 state epoch stands still -- skip the call and charge the
+          // same counters one reached-cycle at a time.
+          if (it->wait_epoch != 0 && l2_tlb->mshr_epoch() == it->wait_epoch) {
+            l2_tlb->note_mshr_full_skip(it->wait_merge);
+            ++it;
+            continue;
+          }
+          uint64_t  req_va  = it->vpn << pairs[p].shift;
+          gpu_pte_t l2_pte; bool l2_hit = false; bool link_used = true;
+          uint64_t  pending_until = 0;
+          unsigned  full_kind = 0;
+          bool resolved = gmod->l2_tlb_request(req_va, m_tpc, cur_cycle,
+                                               l2_pte, l2_hit, &link_used,
+                                               &pending_until, &full_kind);
+          if (pending_until) it->next_poll = pending_until;
+          if (full_kind) {          // 44-4: arm the epoch skip (no L2 mutation
+            it->wait_epoch = l2_tlb->mshr_epoch();  // happened on this verdict)
+            it->wait_merge = (full_kind == 1u);
+          } else {
+            it->wait_epoch = 0;     // any other answer: poll normally again
+          }
+          if (link_used) sent++;
+          if (resolved) {
+            if (l2_hit) {
+              // XLATLAT: an L2 array hit never reaches the MSHR, so its record is
+              // taken here rather than on the query_completed path.
+              xlat_down_t down;
+              const bool have = l2_tlb->xlat_take_seg(m_tpc, it->vpn, down);
+              l1_tlb->fill(it->vpn, l2_pte, cur_cycle, have ? &down : NULL);
+            }
+            it = l1_tlb->l2_req_erase(it);          // resolved -> remove
+          } else {
+            ++it;                                   // still pending -> skip, do not block
+          }
+        }
+      }
+    }
+  }
+}
+
+// B5..B9: cache cycles, XLATLAT sampling, replay / SAFETY NET, memory_cycle,
+// parked-dispatch handling and completion. Per-SM only.
+void ldst_unit::cycle_c() {
   m_L1T->cycle();
   m_L1C->cycle();
   if (m_L1D) {
     m_L1D->cycle();
     if (m_config->m_L1D_config.l1_latency > 0) L1_latency_queue_cycle();
+  }
+
+  // XLATLAT: sampled here, before the replay/backstop blocks pull a parked warp
+  // into the dispatch register -- afterwards m_dispatch_reg no longer reflects
+  // what the scheduler handed this unit, and the stall would read as zero.
+  {
+    m_xlatlat_cycles++;
+    const unsigned parked = (unsigned)m_xlat_parked_4k.size();
+    if (parked) {
+      m_xlatlat_parked_cycles++;
+      m_xlatlat_parked_sum += parked;
+      if (parked > m_xlatlat_parked_max) m_xlatlat_parked_max = parked;
+      // Nothing new to work on and warps waiting only on translation: this is
+      // the cycle count where translation latency is no longer hidden.
+      if (m_dispatch_reg->empty()) m_xlatlat_stalled_cycles++;
+    }
+  }
+
+  // replay a completed translation before processing (replay-first).
+  // D-PROBE: a closed gate with parked warps is the state that silences both
+  // wakeup paths. Count it before the branches so the dump can prove it.
+  if (!m_dispatch_reg->empty() && !m_xlat_parked_4k.empty())
+    m_dprobe_gate_closed_cycles++;
+  if (m_dispatch_reg->empty() && !m_xlat_replay_q_4k.empty()) {
+    m_dprobe_replay_fires++;
+    unsigned w = m_xlat_replay_q_4k.front(); m_xlat_replay_q_4k.pop_front();
+    // defensive: only dispatch if actually parked. A stale/duplicate replay id
+    // (warp already dispatched) would otherwise default-construct a garbage
+    // inst via operator[].
+    auto it = m_xlat_parked_4k.find(w);
+    if (it != m_xlat_parked_4k.end() && !it->second.empty()) {
+      *m_dispatch_reg = std::move(it->second.front());
+      it->second.pop_front();
+      if (it->second.empty()) m_xlat_parked_4k.erase(it);
+    }
+  }
+  // SAFETY NET (level-triggered replay): nothing queued for replay but parked
+  // warps remain -> retry one. Backstop against any lost edge-triggered wakeup.
+  // access() is idempotent: HIT if the page is now cached, re-park otherwise,
+  // in-flight lookups deduped via m_inflight_lookup_4k. So this only spends
+  // otherwise-idle dispatch slots (no cache/mem activity) and never re-injects
+  // duplicate lookups. With the persistent-wakeup fix above this should be rare.
+  else if (m_decouple_tlb && m_dispatch_reg->empty() &&
+           !m_xlat_parked_4k.empty()) {
+    // Option 3: take the oldest parked warp instead of an arbitrary bucket.
+    // Stale ids (already served through the replay queue) are skipped.
+    m_dprobe_safetynet_fires++;
+    m_dprobe_safetynet_last_cycle =
+        m_core->get_gpu()->gpu_sim_cycle + m_core->get_gpu()->gpu_tot_sim_cycle;
+    auto it = m_xlat_parked_4k.end();
+    while (!m_xlat_park_order.empty()) {
+      const unsigned cand = m_xlat_park_order.front();
+      m_xlat_park_order.pop_front();
+      it = m_xlat_parked_4k.find(cand);
+      if (it != m_xlat_parked_4k.end() && !it->second.empty()) break;
+      it = m_xlat_parked_4k.end();
+    }
+    if (it != m_xlat_parked_4k.end()) {
+      *m_dispatch_reg = std::move(it->second.front());
+      it->second.pop_front();
+      if (it->second.empty()) m_xlat_parked_4k.erase(it);
+    }
   }
 
   warp_inst_t &pipe_reg = *m_dispatch_reg;
@@ -2912,15 +3607,36 @@ void ldst_unit::cycle() {
   done &= memory_cycle(pipe_reg, rc_fail, type);
   m_mem_rc = rc_fail;
 
+  if (m_dispatch_parked) {                 // set-aside, free the dispatch reg
+    unsigned w = pipe_reg.warp_id();
+    m_xlat_parked_4k[w].push_back(std::move(pipe_reg));  // cleared right below
+    m_xlat_park_order.push_back(w);   // Option 3: serve in park order
+    m_dispatch_reg->clear();
+    m_dispatch_parked = false;
+    // A fill/wakeup that landed while this warp was momentarily unparked was
+    // stashed in m_xlat_wake_pending; deliver it now so the warp replays next
+    // cycle (deterministic, cycle-accurate) instead of relying on the backstop.
+    if (m_xlat_wake_pending.erase(w)) m_xlat_replay_q_4k.push_back(w);
+    return;   // do NOT complete / release regs / dec_inst_in_pipeline
+  }
+
   if (!done) {  // log stall types and return
     assert(rc_fail != NO_RC_FAIL);
-    m_stats->gpgpu_n_stall_shd_mem++;
+    {  // W5: shared scalar stat, incremented from every SM
+    #pragma omp atomic
+      m_stats->gpgpu_n_stall_shd_mem++;
+    }
     m_stats->gpu_stall_shd_mem_breakdown[type][rc_fail]++;
     return;
   }
 
   if (!pipe_reg.empty()) {
     unsigned warp_id = pipe_reg.warp_id();
+    // FIX-A: this mem op is done in the ldst (accessq drained, done==true here;
+    // the park path returned earlier). Release the ldst-occupancy flag so the
+    // scheduler can issue this warp's next memory op. (Register writeback for a
+    // load may still be pending; that is tracked separately by the scoreboard.)
+    m_core->clear_warp_ldst_park(warp_id);
     if (pipe_reg.is_load()) {
       if (pipe_reg.space.get_type() == shared_space) {
         if (m_pipeline_reg[m_config->smem_latency - 1]->empty()) {
@@ -2981,11 +3697,19 @@ void shader_core_ctx::register_cta_thread_exit(unsigned cta_num,
   m_cta_status[cta_num]--;
   if (!m_cta_status[cta_num]) {
     // Increment the completed CTAs
-    m_stats->ctas_completed++;
+    {  // W5: shared scalar stat, incremented from every SM
+    #pragma omp atomic
+      m_stats->ctas_completed++;
+    }
     m_gpu->inc_completed_cta();
+    m_gpu->note_issue_event();  // 39: slot freed -> issue-scan verdict may flip
     m_n_active_cta--;
     m_barriers.deallocate_barrier(cta_num);
+    m_p4_issue_epoch++;  // 44-8 (E3)
     shader_CTA_count_unlog(m_sid, 1);
+    if (accelsim_log_cta())
+      printf("[CTA_DONE] sm=%u hw_cta=%u cycle=%llu\n", m_sid, cta_num,
+             (unsigned long long)(m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle)); // print_log
 
     SHADER_DPRINTF(
         LIVENESS,
@@ -3009,6 +3733,20 @@ void shader_core_ctx::register_cta_thread_exit(unsigned cta_num,
 
     // Jin: for concurrent kernels on sm
     release_shader_resource_1block(cta_num, *kernel);
+    // G4: kernel teardown is the one place in the CORE phase that mutates state
+    // shared by every SM running this kernel, and none of it is a commutative
+    // counter that an atomic could cover:
+    //   kernel->dec_running()      - shared kernel object
+    //   m_finished_kernel.push_back() - std::vector, concurrent push_back is UB
+    //   m_running_kernels[k] = NULL   - read by get_more_cta_left()
+    // The read (kernel_more_cta_left / running()) and the write must also be one
+    // indivisible step, otherwise two SMs finishing the last CTAs of the same
+    // kernel can both see "not running" and both call set_kernel_done().
+    // Rare path (once per CTA retirement), so serialising it costs nothing.
+    // modern-gpu-simulator guards exactly this region the same way
+    // (remodeling/sm.cc:932).
+#pragma omp critical(kernel_teardown)
+    {
     kernel->dec_running();
     if (!m_gpu->kernel_more_cta_left(kernel)) {
       if (!kernel->running()) {
@@ -3020,6 +3758,7 @@ void shader_core_ctx::register_cta_thread_exit(unsigned cta_num,
         if (m_kernel == kernel) m_kernel = NULL;
         m_gpu->set_kernel_done(kernel);
       }
+    }
     }
   }
 }
@@ -3661,17 +4400,62 @@ void shader_core_config::set_pipeline_latency() {
   max_tensor_core_latency = tensor_latency;
 }
 
+// P10: the SM cycle in three phases. Only phase B touches chiplet-shared state
+// (the L2 TLB and the GMMU, via ldst_unit::cycle_b), so A and C can later run at
+// full SM width while B stays at chiplet width.
+//
+// The pipeline stage order is preserved exactly:
+//   writeback -> execute_a -> [cycle_b] -> execute_c -> read_operands -> issue
+//   -> decode/fetch
+// which is what execute() already did internally after P9.
 void shader_core_ctx::cycle() {
-  if (!isactive() && get_not_completed() == 0) return;
+  cycle_phase_a();
+  cycle_phase_b();
+  cycle_phase_c();
+}
+
+unsigned long long shader_core_ctx::xlat_l1_fingerprint() const {
+  return m_ldst_unit ? m_ldst_unit->xlat_l1_fingerprint() : 0ull;
+}
+
+void shader_core_ctx::cycle_phase_a() {
+  // The "is this SM worth cycling" test is evaluated ONCE, here, and remembered.
+  // writeback() and execute_a() can retire threads, so re-testing in phases B
+  // and C could yield a different answer and leave an SM half-cycled. Latching
+  // the decision keeps all three phases consistent with the single test the
+  // original cycle() performed.
+  m_phase_active = (isactive() || get_not_completed() != 0);
+  if (!m_phase_active) return;
 
   m_stats->shader_cycles[m_sid]++;
   writeback();
-  execute();
-  read_operands();
-  issue();
-  for (unsigned int i = 0; i < m_config->inst_fetch_throughput; ++i) {
-    decode();
-    fetch();
+  execute_a();
+}
+
+void shader_core_ctx::cycle_phase_b() {
+  if (!m_phase_active) return;
+  m_ldst_unit->cycle_b();
+}
+
+void shader_core_ctx::cycle_phase_c() {
+  if (!m_phase_active) return;
+  // The three guards below partition this phase exactly; each is inert unless
+  // ACCELSIM_SERIAL_SUBSYS names it. See par_serial_probe.h.
+  {
+    par_probe_guard g(PAR_PROBE_EXEC);
+    execute_c();
+    read_operands();
+  }
+  {
+    par_probe_guard g(PAR_PROBE_ISSUE);
+    issue();
+  }
+  {
+    par_probe_guard g(PAR_PROBE_FETCH);
+    for (unsigned int i = 0; i < m_config->inst_fetch_throughput; ++i) {
+      decode();
+      fetch();
+    }
   }
 }
 
@@ -3949,7 +4733,10 @@ void shader_core_ctx::warp_exit(unsigned warp_id) {
   }
   // if (m_warp[warp_id].get_n_completed() == get_config()->warp_size)
   // if (this->m_simt_stack[warp_id]->get_num_entries() == 0)
-  if (done) m_barriers.warp_exit(warp_id);
+  if (done) {
+    m_barriers.warp_exit(warp_id);
+    m_p4_issue_epoch++;  // 44-8 (E3)
+  }
 }
 
 bool shader_core_ctx::check_if_non_released_reduction_barrier(
@@ -4001,6 +4788,7 @@ void shader_core_ctx::set_max_cta(const kernel_info_t &kernel) {
 void shader_core_ctx::decrement_atomic_count(unsigned wid, unsigned n) {
   assert(m_warp[wid]->get_n_atomic() >= n);
   m_warp[wid]->dec_n_atomic(n);
+  m_p4_issue_epoch++;  // 44-8 (E5)
 }
 
 void shader_core_ctx::broadcast_barrier_reduction(unsigned cta_id,
@@ -4459,7 +5247,9 @@ void exec_simt_core_cluster::create_shader_core_ctx() {
   }
 }
 
-simt_core_cluster::simt_core_cluster(class gpgpu_sim *gpu, unsigned cluster_id,
+simt_core_cluster::simt_core_cluster(class gpgpu_sim *gpu, 
+                                     class gpu_module *module,
+                                     unsigned cluster_id,
                                      const shader_core_config *config,
                                      const memory_config *mem_config,
                                      shader_core_stats *stats,
@@ -4469,17 +5259,45 @@ simt_core_cluster::simt_core_cluster(class gpgpu_sim *gpu, unsigned cluster_id,
                           1;  // this causes first launch to use hw cta 0
   m_cluster_id = cluster_id;
   m_gpu = gpu;
+  m_gpu_module = module;
   m_stats = stats;
   m_memory_stats = mstats;
   m_mem_config = mem_config;
 }
 
 void simt_core_cluster::core_cycle() {
+  core_cycle_phase_a();
+  core_cycle_phase_b();
+  core_cycle_phase_c();
+}
+
+unsigned long long simt_core_cluster::xlat_l1_fingerprint() const {
+  unsigned long long h = 0;
+  for (unsigned i = 0; i < m_config->n_simt_cores_per_cluster; i++)
+    h += m_core[i]->xlat_l1_fingerprint();
+  return h;
+}
+
+void simt_core_cluster::core_cycle_phase_a() {
   for (std::list<unsigned>::iterator it = m_core_sim_order.begin();
        it != m_core_sim_order.end(); ++it) {
-    m_core[*it]->cycle();
+    m_core[*it]->cycle_phase_a();
   }
+}
 
+void simt_core_cluster::core_cycle_phase_b() {
+  for (std::list<unsigned>::iterator it = m_core_sim_order.begin();
+       it != m_core_sim_order.end(); ++it) {
+    m_core[*it]->cycle_phase_b();
+  }
+}
+
+void simt_core_cluster::core_cycle_phase_c() {
+  for (std::list<unsigned>::iterator it = m_core_sim_order.begin();
+       it != m_core_sim_order.end(); ++it) {
+    m_core[*it]->cycle_phase_c();
+  }
+  // Rotation happens once per cluster cycle, so it belongs to the last phase.
   if (m_config->simt_core_sim_order == 1) {
     m_core_sim_order.splice(m_core_sim_order.end(), m_core_sim_order,
                             m_core_sim_order.begin());
@@ -4535,22 +5353,130 @@ unsigned simt_core_cluster::get_n_active_sms() const {
 
 unsigned simt_core_cluster::issue_block2core() {
   unsigned num_blocks_issued = 0;
+  
+  // LASP: Determine preferred chiplet for CTA scheduling
+  unsigned preferred_chiplet = (unsigned)-1;
+  kernel_info_t *selected_kernel = NULL;
+  
+  // First pass: select kernel and determine preferred chiplet
   for (unsigned i = 0; i < m_config->n_simt_cores_per_cluster; i++) {
     unsigned core =
         (i + m_cta_issue_next_core + 1) % m_config->n_simt_cores_per_cluster;
 
     kernel_info_t *kernel;
-    // Jin: fetch kernel according to concurrent kernel setting
-    if (m_config->gpgpu_concurrent_kernel_sm) {  // concurrent kernel on sm
-      // always select latest issued kernel
+    if (m_config->gpgpu_concurrent_kernel_sm) {
       kernel_info_t *k = m_gpu->select_kernel();
       kernel = k;
     } else {
-      // first select core kernel, if no more cta, get a new kernel
-      // only when core completes
       kernel = m_core[core]->get_kernel();
       if (!m_gpu->kernel_more_cta_left(kernel)) {
-        // wait till current kernel finishes
+        if (m_core[core]->get_not_completed() == 0) {
+          kernel_info_t *k = m_gpu->select_kernel();
+          if (k) m_core[core]->set_kernel(k);
+          kernel = k;
+        }
+      }
+    }
+
+    if (m_gpu->kernel_more_cta_left(kernel)) {
+      selected_kernel = kernel;
+
+      // LASP binding (config -gpgpu_lasp_policy) takes precedence over
+      // STATIC_BINDING. With LASP off every kernel keeps the ctor default
+      // KERNEL_WIDE, so this branch is dead and the paths below are reached
+      // unchanged. Every binding is a pure function of the next CTA id, so
+      // the CTA->chiplet map cannot drift with timing (same guarantee
+      // STATIC_BINDING relies on); silent like STATIC_BINDING.
+      if (kernel->m_lasp_config.policy != lasp::KERNEL_WIDE &&
+          m_gpu->get_gpu_module()) {
+        unsigned num_chiplets = m_gpu->get_gpu_module()->get_num_chiplets();
+        dim3 grid_dim = kernel->get_grid_dim();
+        dim3 next_cta = kernel->get_next_cta_id();
+        if (kernel->m_lasp_config.policy == lasp::ROW_BINDING) {
+          // grid row (blockIdx.y) -> chiplet, contiguous row blocks
+          unsigned rows_per_chiplet =
+              (grid_dim.y + num_chiplets - 1) / num_chiplets;
+          preferred_chiplet = next_cta.y / rows_per_chiplet;
+        } else if (kernel->m_lasp_config.policy == lasp::COL_BINDING) {
+          // grid column (blockIdx.x) -> chiplet, contiguous column blocks
+          unsigned cols_per_chiplet =
+              (grid_dim.x + num_chiplets - 1) / num_chiplets;
+          preferred_chiplet = next_cta.x / cols_per_chiplet;
+        } else {
+          // CHUNK_BINDING: batches of chunk_size consecutive CTAs
+          // round-robin across chiplets (align-aware when chunk_size =
+          // page_size / datablock_size; kernel-wide when = ceil(#CTAs/4))
+          unsigned lin = next_cta.x + next_cta.y * grid_dim.x +
+                         next_cta.z * grid_dim.x * grid_dim.y;
+          unsigned cs = kernel->m_lasp_config.chunk_size;
+          if (cs == 0) cs = 1;
+          preferred_chiplet = (lin / cs) % num_chiplets;
+        }
+        if (preferred_chiplet >= num_chiplets)
+          preferred_chiplet = num_chiplets - 1;
+        break;
+      }
+
+      // STATIC_BINDING: home chiplet is a pure function of the CTA id, so the
+      // CTA->chiplet map cannot drift with timing. Reuses the strict-affinity
+      // enforcement below; deliberately silent (no per-CTA logging).
+      if (m_gpu->get_config().get_cta_sched_policy() == CTA_SCHED_STATIC_BINDING &&
+          m_gpu->get_gpu_module()) {
+        unsigned n_chiplets = m_gpu->get_gpu_module()->get_num_chiplets();
+        preferred_chiplet = kernel->get_next_cta_id_single() % n_chiplets;
+        break;
+      }
+      break;
+    }
+  }
+  
+  // Second pass: issue ONLY to preferred chiplet (strict affinity enforcement)
+  if (preferred_chiplet != (unsigned)-1 && selected_kernel) {
+    // Get actual number of chiplets from config
+    unsigned n_chiplets = m_gpu->get_gpu_module()->get_num_chiplets();
+    unsigned clusters_per_chiplet = m_config->n_simt_clusters / n_chiplets;
+    unsigned chiplet_start_cluster = preferred_chiplet * clusters_per_chiplet;
+    unsigned chiplet_end_cluster = chiplet_start_cluster + clusters_per_chiplet;
+    
+    // Check if current cluster matches preferred chiplet
+    if (m_cluster_id >= chiplet_start_cluster && m_cluster_id < chiplet_end_cluster) {
+      // We're in the preferred chiplet, try to issue
+      for (unsigned i = 0; i < m_config->n_simt_cores_per_cluster; i++) {
+        unsigned core =
+            (i + m_cta_issue_next_core + 1) % m_config->n_simt_cores_per_cluster;
+        
+        kernel_info_t *kernel = m_core[core]->get_kernel();
+        if (!kernel) kernel = selected_kernel;
+        
+        if (m_gpu->kernel_more_cta_left(kernel) &&
+            m_core[core]->can_issue_1block(*kernel)) {
+          m_core[core]->issue_block2core(*kernel);
+          num_blocks_issued++;
+          m_cta_issue_next_core = core;
+          return num_blocks_issued;
+        }
+      }
+    }
+    // If NOT in preferred chiplet, do NOT issue - wait for preferred cluster
+    // This enforces strict data locality
+    if (m_cluster_id < chiplet_start_cluster || m_cluster_id >= chiplet_end_cluster) {
+      return 0;  // Don't issue - enforce affinity
+    }
+  }
+  
+  // Fallback: only if NO LASP policy is active
+  if (preferred_chiplet == (unsigned)-1) {
+  for (unsigned i = 0; i < m_config->n_simt_cores_per_cluster; i++) {
+    unsigned core =
+        (i + m_cta_issue_next_core + 1) % m_config->n_simt_cores_per_cluster;
+
+    kernel_info_t *kernel;
+    if (m_config->gpgpu_concurrent_kernel_sm) {
+      kernel_info_t *k = m_gpu->select_kernel();
+      kernel = k;
+    } else {
+      kernel = m_core[core]->get_kernel();
+      if (!m_gpu->kernel_more_cta_left(kernel)) {
         if (m_core[core]->get_not_completed() == 0) {
           kernel_info_t *k = m_gpu->select_kernel();
           if (k) m_core[core]->set_kernel(k);
@@ -4560,8 +5486,6 @@ unsigned simt_core_cluster::issue_block2core() {
     }
 
     if (m_gpu->kernel_more_cta_left(kernel) &&
-        //            (m_core[core]->get_n_active_cta() <
-        //            m_config->max_cta(*kernel)) ) {
         m_core[core]->can_issue_1block(*kernel)) {
       m_core[core]->issue_block2core(*kernel);
       num_blocks_issued++;
@@ -4569,6 +5493,7 @@ unsigned simt_core_cluster::issue_block2core() {
       break;
     }
   }
+  }  // Close the if (preferred_chiplet == (unsigned)-1) block
   return num_blocks_issued;
 }
 
@@ -4620,54 +5545,93 @@ void simt_core_cluster::icnt_inject_request_packet(class mem_fetch *mf) {
   mf->set_status(IN_ICNT_TO_MEM,
                  m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
   if (!mf->get_is_write() && !mf->isatomic())
-    ::icnt_push(m_cluster_id, m_config->mem2device(destination), (void *)mf,
+    get_module()->icnt_push(m_cluster_id, m_config->mem2device(destination), (void *)mf,
                 mf->get_ctrl_size());
   else
-    ::icnt_push(m_cluster_id, m_config->mem2device(destination), (void *)mf,
+    get_module()->icnt_push(m_cluster_id, m_config->mem2device(destination), (void *)mf,
                 mf->size());
 }
 
 void simt_core_cluster::update_icnt_stats(class mem_fetch *mf) {
   // stats
   if (mf->get_is_write())
-    m_stats->made_write_mfs++;
+    {  // W5: shared scalar stat, incremented from every SM
+    #pragma omp atomic
+      m_stats->made_write_mfs++;
+    }
   else
-    m_stats->made_read_mfs++;
+    {  // W5: shared scalar stat, incremented from every SM
+    #pragma omp atomic
+      m_stats->made_read_mfs++;
+    }
   switch (mf->get_access_type()) {
     case CONST_ACC_R:
-      m_stats->gpgpu_n_mem_const++;
+      {  // W5: shared scalar stat, incremented from every SM
+      #pragma omp atomic
+        m_stats->gpgpu_n_mem_const++;
+      }
       break;
     case TEXTURE_ACC_R:
-      m_stats->gpgpu_n_mem_texture++;
+      {  // W5: shared scalar stat, incremented from every SM
+      #pragma omp atomic
+        m_stats->gpgpu_n_mem_texture++;
+      }
       break;
     case GLOBAL_ACC_R:
-      m_stats->gpgpu_n_mem_read_global++;
+      {  // W5: shared scalar stat, incremented from every SM
+      #pragma omp atomic
+        m_stats->gpgpu_n_mem_read_global++;
+      }
       break;
     // case GLOBAL_ACC_R: m_stats->gpgpu_n_mem_read_global++;
     // printf("read_global%d\n",m_stats->gpgpu_n_mem_read_global); break;
     case GLOBAL_ACC_W:
-      m_stats->gpgpu_n_mem_write_global++;
+      {  // W5: shared scalar stat, incremented from every SM
+      #pragma omp atomic
+        m_stats->gpgpu_n_mem_write_global++;
+      }
       break;
     case LOCAL_ACC_R:
-      m_stats->gpgpu_n_mem_read_local++;
+      {  // W5: shared scalar stat, incremented from every SM
+      #pragma omp atomic
+        m_stats->gpgpu_n_mem_read_local++;
+      }
       break;
     case LOCAL_ACC_W:
-      m_stats->gpgpu_n_mem_write_local++;
+      {  // W5: shared scalar stat, incremented from every SM
+      #pragma omp atomic
+        m_stats->gpgpu_n_mem_write_local++;
+      }
       break;
     case INST_ACC_R:
-      m_stats->gpgpu_n_mem_read_inst++;
+      {  // W5: shared scalar stat, incremented from every SM
+      #pragma omp atomic
+        m_stats->gpgpu_n_mem_read_inst++;
+      }
       break;
     case L1_WRBK_ACC:
-      m_stats->gpgpu_n_mem_write_global++;
+      {  // W5: shared scalar stat, incremented from every SM
+      #pragma omp atomic
+        m_stats->gpgpu_n_mem_write_global++;
+      }
       break;
     case L2_WRBK_ACC:
-      m_stats->gpgpu_n_mem_l2_writeback++;
+      {  // W5: shared scalar stat, incremented from every SM
+      #pragma omp atomic
+        m_stats->gpgpu_n_mem_l2_writeback++;
+      }
       break;
     case L1_WR_ALLOC_R:
-      m_stats->gpgpu_n_mem_l1_write_allocate++;
+      {  // W5: shared scalar stat, incremented from every SM
+      #pragma omp atomic
+        m_stats->gpgpu_n_mem_l1_write_allocate++;
+      }
       break;
     case L2_WR_ALLOC_R:
-      m_stats->gpgpu_n_mem_l2_write_allocate++;
+      {  // W5: shared scalar stat, incremented from every SM
+      #pragma omp atomic
+        m_stats->gpgpu_n_mem_l2_write_allocate++;
+      }
       break;
     default:
       assert(0);
@@ -4710,6 +5674,13 @@ void sst_simt_core_cluster::icnt_inject_request_packet_to_SST(
 }
 
 void simt_core_cluster::icnt_cycle() {
+  // POPGATE_ (temp): measure how often this cluster cannot drain the icnt because
+  // its SM response FIFO is full. All TLB-fill replies of a chiplet are routed to
+  // its representative cluster and popped here; a starved pop stalls them.
+  // Counters are cumulative; printed per-kernel from gpgpu_sim::print_stats().
+  m_popgate_icnt_cycles++;
+  if (m_response_fifo.size() >= m_config->n_simt_ejection_buffer_size)
+    m_popgate_gated++;
   if (!m_response_fifo.empty()) {
     mem_fetch *mf = m_response_fifo.front();
     unsigned cid = m_config->sid_to_cid(mf->get_sid());
@@ -4729,7 +5700,7 @@ void simt_core_cluster::icnt_cycle() {
     }
   }
   if (m_response_fifo.size() < m_config->n_simt_ejection_buffer_size) {
-    mem_fetch *mf = (mem_fetch *)::icnt_pop(m_cluster_id);
+    mem_fetch *mf = (mem_fetch *)m_gpu_module->icnt_pop(m_cluster_id);
     if (!mf) return;
     assert(mf->get_tpc() == m_cluster_id);
     assert(mf->get_type() == READ_REPLY || mf->get_type() == WRITE_ACK);
@@ -4742,6 +5713,30 @@ void simt_core_cluster::icnt_cycle() {
     m_stats->m_incoming_traffic_stats->record_traffic(mf, packet_size);
     mf->set_status(IN_CLUSTER_TO_SHADER_QUEUE,
                    m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+    // FUNNEL_ (temp): normal-reply xbar latency by source mem chiplet (same split as
+    // PTW: transit = t1->dest arrival, lasthop = arrival->pop). Normal vs PTW compare.
+    {
+      unsigned long long now = m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle;
+      unsigned long long t1  = mf->get_return_timestamp();
+      unsigned long long arr = mf->get_icnt_receive_time();
+      if (t1 != 0 && arr != 0 && arr >= t1 && now >= arr) {
+        gpu_module* gm = m_gpu->get_gpu_module();
+        unsigned sch = gm ? gm->mem_sub_partition_to_chiplet(mf->get_sub_partition_id()) : 0;
+        unsigned dch = gm ? gm->cluster_to_chiplet(m_cluster_id) : 0;
+        if (sch < 8) {
+          extern unsigned long long g_normrep_transit_sum[8], g_normrep_lasthop_sum[8],
+              g_normrep_cnt[8];
+          g_normrep_transit_sum[sch] += (arr - t1);
+          g_normrep_lasthop_sum[sch] += (now - arr);
+          g_normrep_cnt[sch]++;
+          if (dch < 8) {
+            extern unsigned long long g_normrep_mtx_transit[8][8], g_normrep_mtx_cnt[8][8];
+            g_normrep_mtx_transit[sch][dch] += (arr - t1);
+            g_normrep_mtx_cnt[sch][dch]++;
+          }
+        }
+      }
+    }
     // m_memory_stats->memlatstat_read_done(mf,m_shader_config->max_warps_per_shader);
     m_response_fifo.push_back(mf);
     m_stats->n_mem_to_simt[m_cluster_id] += mf->get_num_flits(false);
@@ -4897,6 +5892,7 @@ void exec_shader_core_ctx::checkExecutionStatusAndUpdate(warp_inst_t &inst,
   if (ptx_thread_done(tid)) {
     m_warp[inst.warp_id()]->set_completed(t);
     m_warp[inst.warp_id()]->ibuffer_flush();
+    p4_note_issue_event();  // 44-8 (E8): out-of-scheduler flush (PTX path)
   }
 
   // PC-Histogram Update
@@ -4908,4 +5904,67 @@ void exec_shader_core_ctx::checkExecutionStatusAndUpdate(warp_inst_t &inst,
       cflog_update_thread_pc(m_sid, tid, pc);
     }
   }
+}
+
+// XLATDBG: warps this LDST unit parked while waiting for an address translation.
+// XLATLAT: what fraction of this SM's memory-issue capacity translation is
+// consuming. `stalled` is the count of cycles where the unit had nothing new to
+// dispatch and warps were parked on translation -- an upper bound on how much
+// translation latency can possibly cost this SM in performance. If it is small,
+// latency hiding is absorbing the translation cost no matter how large the
+// per-request latency is.
+void ldst_unit::xlat_print_stats(FILE* fp, unsigned sid) const {
+  const double c = m_xlatlat_cycles ? (double)m_xlatlat_cycles : 1.0;
+  fprintf(fp,
+          "[LDST_XLATLAT] SM=%u cycles=%llu parked_cyc=%llu (%.2f%%) "
+          "stalled_cyc=%llu (%.2f%%) parked_avg=%.3f parked_max=%u "
+          "mem_issue_cyc=%llu (%.2f%%)\n",
+          sid, m_xlatlat_cycles, m_xlatlat_parked_cycles,
+          100.0 * m_xlatlat_parked_cycles / c, m_xlatlat_stalled_cycles,
+          100.0 * m_xlatlat_stalled_cycles / c,
+          (double)m_xlatlat_parked_sum / c, m_xlatlat_parked_max,
+          m_xlatlat_mem_issue_cycles, 100.0 * m_xlatlat_mem_issue_cycles / c);
+}
+
+void ldst_unit::xlatdbg_dump_parked(FILE* fp, unsigned sid) const {
+  size_t n = 0;
+  for (const auto& kv : m_xlat_parked_4k) n += kv.second.size();
+  if (n) {
+    fprintf(fp, "XLATDBG_DEADLOCK:   sm=%u parked_warps=%zu insts=%zu order_q=%zu\n",
+            sid, m_xlat_parked_4k.size(), n, m_xlat_park_order.size());
+    // D-PROBE: distinguish "gate closed" (D1) from "park-order exhausted" (D2).
+    fprintf(fp, "XLATDBG_DEADLOCK:   sm=%u DPROBE dispatch_empty=%d dispatch_wid=%d "
+                "dispatch_pc=0x%x replay_q=%zu last_rc_fail=%d "
+                "replay_fires=%llu safetynet_fires=%llu safetynet_last_cycle=%llu "
+                "gate_closed_cycles=%llu\n",
+            sid, m_dispatch_reg->empty() ? 1 : 0,
+            m_dispatch_reg->empty() ? -1 : (int)m_dispatch_reg->warp_id(),
+            m_dispatch_reg->empty() ? 0u : m_dispatch_reg->pc,
+            m_xlat_replay_q_4k.size(), (int)m_mem_rc,
+            m_dprobe_replay_fires, m_dprobe_safetynet_fires,
+            m_dprobe_safetynet_last_cycle, m_dprobe_gate_closed_cycles);
+    for (const auto& kv : m_xlat_parked_4k)
+      if (!kv.second.empty())
+        fprintf(fp, "XLATDBG_DEADLOCK:     wid=%u parked=%zu pc=0x%x\n",
+                kv.first, kv.second.size(), kv.second.front().pc);
+  }
+  if (m_l1_tlb_4k)  m_l1_tlb_4k->xlatdbg_dump(fp, sid, "4k");
+  if (m_l1_tlb_64k) m_l1_tlb_64k->xlatdbg_dump(fp, sid, "64k");
+  if (m_l1_tlb_2m)  m_l1_tlb_2m->xlatdbg_dump(fp, sid, "2m");
+  // Ask the L2 what it would answer for the request stuck at the head of this
+  // L1's queue. That single answer is the reason nothing behind it moves.
+  if (m_l1_tlb_4k && m_gpu && m_gpu->get_gpu_module()) {
+    uint64_t front_vpn = 0;
+    if (m_l1_tlb_4k->l2_req_front(front_vpn)) {
+      gpu_module* gmod = m_gpu->get_gpu_module();
+      unsigned chip = gmod->cluster_to_chiplet(m_tpc);
+      uint64_t cur = m_core->get_gpu()->gpu_sim_cycle + m_core->get_gpu()->gpu_tot_sim_cycle;
+      gmod->get_chiplet(chip)->get_l2_tlb_4k()->xlatdbg_probe(fp, front_vpn, m_tpc, cur);
+    }
+  }
+}
+
+void simt_core_cluster::xlatdbg_dump_waiters(FILE* fp) const {
+  for (unsigned i = 0; i < m_config->n_simt_cores_per_cluster; i++)
+    if (m_core[i]) m_core[i]->xlatdbg_dump(fp);
 }

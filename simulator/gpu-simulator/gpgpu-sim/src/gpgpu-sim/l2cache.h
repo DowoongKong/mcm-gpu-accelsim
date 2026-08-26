@@ -88,6 +88,11 @@ class memory_partition_unit {
   void visualizer_print(gzFile visualizer_file) const;
   void print_stat(FILE *fp) { m_dram->print_stat(fp); }
   void visualize() const { m_dram->visualize(); }
+  // ACCEPT_ (temp): DRAM BW utilization of this partition (bwutil/n_cmd).
+  double get_dram_bwutil() const {
+    unsigned long long nc = m_dram->get_ncmd();
+    return nc ? (double)m_dram->get_bwutil() / nc : 0.0;
+  }
   void print(FILE *fp) const;
   void handle_memcpy_to_gpu(size_t dst_start_addr, unsigned subpart_id,
                             mem_access_sector_mask_t mask);

@@ -48,6 +48,8 @@ typedef void *yyscan_t;
 #include "../stream_manager.h"
 #include "cuda_device_runtime.h"
 #include "decuda_pred_table/decuda_pred_table.h"
+#include "../lasp/lasp_heuristic.h"
+#include "../lasp/lasp_scheduler.h"
 #include "memory.h"
 #include "opcodes.h"
 #include "ptx-stats.h"
@@ -446,6 +448,14 @@ addr_t generic_to_local(unsigned smid, unsigned hwtid, addr_t addr) {
 addr_t generic_to_global(addr_t addr) { return addr; }
 
 void *gpgpu_t::gpu_malloc(size_t size) {
+  // A huge-page allocation must start and end on a page boundary, otherwise one
+  // page would span two allocations with different page sizes. 4KB allocations
+  // keep the original 256B padding so the VA layout is unchanged.
+  const unsigned pshift = decide_page_shift(size);
+  const unsigned long long palign = 1ULL << pshift;
+  if (pshift != 12 && (m_dev_malloc % palign))
+    m_dev_malloc += (palign - (m_dev_malloc % palign));
+
   unsigned long long result = m_dev_malloc;
   if (g_debug_execution >= 3) {
     printf(
@@ -455,12 +465,28 @@ void *gpgpu_t::gpu_malloc(size_t size) {
     fflush(stdout);
   }
   m_dev_malloc += size;
-  if (size % 256)
+  if (pshift != 12) {
+    if (m_dev_malloc % palign)
+      m_dev_malloc += (palign - (m_dev_malloc % palign));
+  } else if (size % 256) {
     m_dev_malloc += (256 - size % 256);  // align to 256 byte boundaries
+  }
+
+  // Notify subclass of the full padded allocation range. (P3)
+  // aligned_size = m_dev_malloc - result (includes padding).
+  size_t aligned_size = (size_t)(m_dev_malloc - result);
+  on_gpu_malloc(result, aligned_size, pshift);
+
   return (void *)result;
 }
 
 void *gpgpu_t::gpu_mallocarray(size_t size) {
+  // Same page-size alignment rule as gpu_malloc().
+  const unsigned pshift = decide_page_shift(size);
+  const unsigned long long palign = 1ULL << pshift;
+  if (pshift != 12 && (m_dev_malloc % palign))
+    m_dev_malloc += (palign - (m_dev_malloc % palign));
+
   unsigned long long result = m_dev_malloc;
   if (g_debug_execution >= 3) {
     printf(
@@ -470,8 +496,18 @@ void *gpgpu_t::gpu_mallocarray(size_t size) {
     fflush(stdout);
   }
   m_dev_malloc += size;
-  if (size % 256)
+  if (pshift != 12) {
+    if (m_dev_malloc % palign)
+      m_dev_malloc += (palign - (m_dev_malloc % palign));
+  } else if (size % 256) {
     m_dev_malloc += (256 - size % 256);  // align to 256 byte boundaries
+  }
+
+  // Notify subclass of the full padded allocation range. (P3)
+  // aligned_size = m_dev_malloc - result (includes padding).
+  size_t aligned_size = (size_t)(m_dev_malloc - result);
+  on_gpu_malloc(result, aligned_size, pshift);
+
   return (void *)result;
 }
 
@@ -2154,6 +2190,7 @@ unsigned ptx_sim_init_thread(kernel_info_t &kernel,
 
   std::map<unsigned, memory_space *> &local_mem_lookup =
       local_memory_lookup[sid];
+  
   while (kernel.more_threads_in_cta()) {
     dim3 ctaid3d = kernel.get_next_cta_id();
     unsigned new_tid = kernel.get_next_thread_id();
@@ -2212,7 +2249,8 @@ unsigned ptx_sim_init_thread(kernel_info_t &kernel,
     printf("GPGPU-Sim PTX simulator:  <-- FINISHING THREAD ALLOCATION\n");
     fflush(stdout);
   }
-
+  
+  // Increment to next CTA after all threads in this CTA are allocated
   kernel.increment_cta_id();
 
   assert(active_threads.size() <= threads_left);
@@ -2234,6 +2272,15 @@ kernel_info_t *cuda_sim::gpgpu_opencl_ptx_sim_init_grid(
   kernel_info_t *result =
       new kernel_info_t(gridDim, blockDim, entry, gpu->getNameArrayMapping(),
                         gpu->getNameInfoMapping());
+  
+  // ========================================================================
+  // LASP: Apply heuristic scheduling policy at kernel launch time
+  // ========================================================================
+  unsigned num_chiplets = 4;  // MCM-GPU has 4 chiplets
+  lasp::kernel_lasp_config_t lasp_config = 
+      lasp_heuristic::analyze_kernel(result, num_chiplets);
+  result->m_lasp_config = lasp_config;
+  
   unsigned argcount = args.size();
   unsigned argn = 1;
   for (gpgpu_ptx_sim_arg_list_t::iterator a = args.begin(); a != args.end();

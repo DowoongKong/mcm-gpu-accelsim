@@ -127,6 +127,11 @@ class dram_t {
   class mem_fetch *return_queue_pop();
   class mem_fetch *return_queue_top();
 
+  // ACCEPT_ (temp): DRAM bandwidth utilization = bwutil/n_cmd (fraction of command
+  // cycles doing useful data transfer). High -> DRAM busy; low -> not DRAM-BW bound.
+  unsigned long long get_bwutil() const { return bwutil; }
+  unsigned long long get_ncmd() const { return n_cmd; }
+
   void push(class mem_fetch *data);
   void cycle();
   void dram_log(int task);

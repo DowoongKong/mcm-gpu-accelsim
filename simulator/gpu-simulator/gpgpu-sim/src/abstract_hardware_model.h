@@ -37,6 +37,8 @@ class gpgpu_sim;
 class kernel_info_t;
 class gpgpu_context;
 
+#include "lasp/lasp_simple.h"
+
 // Set a hard limit of 32 CTAs per shader [cuda only has 8]
 #define MAX_CTA_PER_SHADER 32
 #define MAX_BARRIERS_PER_CTA 16
@@ -378,6 +380,9 @@ class kernel_info_t {
 
   unsigned m_kernel_TB_latency;  // this used for any CPU-GPU kernel latency and
                                  // counted in the gpu_cycle
+  
+  // LASP configuration for CTA scheduling
+  lasp::kernel_lasp_config_t m_lasp_config;
 };
 
 class core_config {
@@ -483,7 +488,15 @@ class simt_stack {
 // Let's just upgrade to C++11 so we can use constexpr here...
 // start allocating from this address (lower values used for allocating globals
 // in .ptx file)
-const unsigned long long GLOBAL_HEAP_START = 0xC0000000;
+// const unsigned long long GLOBAL_HEAP_START = 0xC0000000;
+const unsigned long long GLOBAL_HEAP_START = 0xC0000000ULL;
+
+// VA heap start for cudaMalloc: placed at 512GB so that PML4 index = 1 (non-zero)
+// and PDP index varies per 1GB, exercising all 4 levels of the page table.
+// Must be >= GLOBAL_HEAP_START so that whichspace() returns global_space.
+// GLOBAL_HEAP_START is kept as the PA base for PMM/DRAM; this is the VA base only.
+// const unsigned long long GPU_VA_HEAP_START = 0x0000008000000000ULL;  // 512GB
+
 // Volta max shmem size is 96kB
 const unsigned long long SHARED_MEM_SIZE_MAX = 96 * (1 << 10);
 // Volta max local mem is 16kB
@@ -604,6 +617,15 @@ class gpgpu_t {
 
   void *gpu_malloc(size_t size);
   void *gpu_mallocarray(size_t count);
+  // for PMM/DRAM to track GPU mallocs. page_shift tells the subclass which page
+  // size this allocation was laid out for.
+  virtual void on_gpu_malloc(uint64_t va, size_t aligned_size,
+                             unsigned page_shift) {}
+  // Page shift to use for an allocation of this size. Base returns 12 (4KB),
+  // which reproduces the original behaviour; gpgpu_sim overrides it from config.
+  // 12 is spelled out rather than GPU_PAGE_SHIFT because including gpu-module.h
+  // here would be circular.
+  virtual unsigned decide_page_shift(size_t size) const { return 12; }
   void gpu_memset(size_t dst_start_addr, int c, size_t count);
   void memcpy_to_gpu(size_t dst_start_addr, const void *src, size_t count);
   void memcpy_from_gpu(void *dst, size_t src_start_addr, size_t count);
@@ -1096,6 +1118,16 @@ class warp_inst_t : public inst_t {
     m_depbar_group_no = 0;
   }
   virtual ~warp_inst_t() {}
+  // A user-declared destructor suppresses the implicit move operations, so
+  // every assignment of a warp_inst_t was a deep copy of m_per_scalar_thread
+  // (32 entries) and m_accessq. The decoupled-TLB park/replay path assigns
+  // these millions of times per run; making the moves explicit keeps that path
+  // from deep-copying. Semantics are unchanged -- moved-from objects are always
+  // cleared or overwritten right after.
+  warp_inst_t(warp_inst_t &&) = default;
+  warp_inst_t &operator=(warp_inst_t &&) = default;
+  warp_inst_t(const warp_inst_t &) = default;
+  warp_inst_t &operator=(const warp_inst_t &) = default;
 
   // modifiers
   void broadcast_barrier_reduction(const active_mask_t &access_mask);
@@ -1222,6 +1254,7 @@ class warp_inst_t : public inst_t {
   bool accessq_empty() const { return m_accessq.empty(); }
   unsigned accessq_count() const { return m_accessq.size(); }
   const mem_access_t &accessq_back() { return m_accessq.back(); }
+  const std::list<mem_access_t> &get_accessq() const { return m_accessq; }  // per-page TLB scan
   void accessq_pop_back() { m_accessq.pop_back(); }
 
   bool dispatch_delay() {

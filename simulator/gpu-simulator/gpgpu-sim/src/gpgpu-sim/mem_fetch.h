@@ -37,7 +37,9 @@ enum mf_type {
   READ_REQUEST = 0,
   WRITE_REQUEST,
   READ_REPLY,  // send to shader
-  WRITE_ACK
+  WRITE_ACK,
+  TLB_FILL_ACC,   // GMMU page table walk read request (sent to memory) (P3-1)
+  TLB_FILL_REPLY  // reply to GMMU page table walk read (intercepted before SM) (P3-1)
 };
 
 #define MF_TUP_BEGIN(X) enum X {
@@ -70,6 +72,8 @@ class mem_fetch {
     } else if (m_type == WRITE_REQUEST) {
       assert(get_is_write());
       m_type = WRITE_ACK;
+    } else if (m_type == TLB_FILL_ACC) {  // NEW: convert PTW request to reply (P3-1)
+      m_type = TLB_FILL_REPLY;
     }
   }
   void do_atomic();
@@ -87,6 +91,15 @@ class mem_fetch {
   unsigned size() const { return m_data_size + m_ctrl_size; }
   bool is_write() { return m_access.is_write(); }
   void set_addr(new_addr_type addr) { m_access.set_addr(addr); }
+  new_addr_type get_va() const { return m_va; } // Returns the original virtual address before TLB translation.
+  bool is_translated() const { return m_translated; } // Returns true if TLB translation has completed for this request.
+  // (P3-1)
+  int        get_tlb_depth()  const { return m_tlb_depth; }
+  mem_fetch* get_parent_mf()  const { return m_parent_mf; }
+  void set_tlb_depth(int d)         { m_tlb_depth = d; }
+  void set_parent_mf(mem_fetch* p)  { m_parent_mf = p; }
+  void set_type(enum mf_type t)     { m_type = t; }  // used by GMMU to override READ_REQUEST to TLB_FILL_ACC
+  void set_pa(new_addr_type pa); // Called on TLB hit. Sets PA and recomputes m_raw_addr/m_partition_addr for correct routing.
   new_addr_type get_addr() const { return m_access.get_addr(); }
   unsigned get_access_size() const { return m_access.get_size(); }
   new_addr_type get_partition_addr() const { return m_partition_addr; }
@@ -126,9 +139,13 @@ class mem_fetch {
   const memory_config *get_mem_config() { return m_mem_config; }
 
   unsigned get_num_flits(bool simt_to_mem);
+  unsigned get_num_flits(bool simt_to_mem, bool local_access);
+  unsigned get_icnt_flit_size() const { return icnt_flit_size; }
 
   mem_fetch *get_original_mf() { return original_mf; }
   mem_fetch *get_original_wr_mf() { return original_wr_mf; }
+  bool is_local_access() const { return m_local_access; }
+  void set_local_access(bool local) { m_local_access = local; }
 
  private:
   // request source information
@@ -155,8 +172,7 @@ class mem_fetch {
   enum mf_type m_type;
 
   // statistics
-  unsigned
-      m_timestamp;  // set to gpu_sim_cycle+gpu_tot_sim_cycle at struct creation
+  unsigned m_timestamp;  // set to gpu_sim_cycle+gpu_tot_sim_cycle at struct creation
   unsigned m_timestamp2;  // set to gpu_sim_cycle+gpu_tot_sim_cycle when pushed
                           // onto icnt to shader; only used for reads
   unsigned m_icnt_receive_time;  // set to gpu_sim_cycle + interconnect_latency
@@ -171,6 +187,14 @@ class mem_fetch {
 
   const memory_config *m_mem_config;
   unsigned icnt_flit_size;
+  bool m_local_access;
+
+  new_addr_type m_va;    // original VA before TLB translation
+  bool m_translated;     // true after set_pa() is called
+
+  // (P3-1)
+  int        m_tlb_depth;    // PT walk level (0=PML4, 1=PDP, 2=PD, 3=PT leaf). -1 = not a PTW mf.
+  mem_fetch* m_parent_mf;    // phantom parent_mf that carries {va, cluster_id}. nullptr if not PTW.
 
   mem_fetch
       *original_mf;  // this pointer is set up when a request is divided into

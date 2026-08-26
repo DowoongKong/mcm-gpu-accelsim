@@ -55,6 +55,13 @@ class Scoreboard {
   int get_sid() const { return m_sid; }
 
   unsigned m_sid;
+ public:
+  // 44-8 (P4-1): bumped by every register release. Part of the per-SM
+  // issue-event epoch: a release can flip checkCollision AND resolve a
+  // mem-barrier (warp_waiting_at_mem_barrier tests !pendingWrites()).
+  uint64_t release_epoch() const { return m_release_epoch; }
+ private:
+  uint64_t m_release_epoch = 0;
 
   // keeps track of pending writes to registers
   // indexed by warp id, reg_id => pending write count

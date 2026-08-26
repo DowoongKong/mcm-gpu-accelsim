@@ -70,6 +70,7 @@ void Scoreboard::reserveRegister(unsigned wid, unsigned regnum) {
 
 // Unmark register as write-pending
 void Scoreboard::releaseRegister(unsigned wid, unsigned regnum) {
+  m_release_epoch++;  // 44-8 (E1)
   if (!(reg_table[wid].find(regnum) != reg_table[wid].end())) return;
   SHADER_DPRINTF(SCOREBOARD, "Release register - warp:%d, reg: %d\n", wid,
                  regnum);
@@ -126,26 +127,19 @@ void Scoreboard::releaseRegisters(const class warp_inst_t* inst) {
  * true if WAW or RAW hazard (no WAR since in-order issue)
  **/
 bool Scoreboard::checkCollision(unsigned wid, const class inst_t* inst) const {
-  // Get list of all input and output registers
-  std::set<int> inst_regs;
-
-  for (unsigned iii = 0; iii < inst->outcount; iii++)
-    inst_regs.insert(inst->out[iii]);
-
-  for (unsigned jjj = 0; jjj < inst->incount; jjj++)
-    inst_regs.insert(inst->in[jjj]);
-
-  if (inst->pred > 0) inst_regs.insert(inst->pred);
-  if (inst->ar1 > 0) inst_regs.insert(inst->ar1);
-  if (inst->ar2 > 0) inst_regs.insert(inst->ar2);
-
-  // Check for collision, get the intersection of reserved registers and
-  // instruction registers
-  std::set<int>::const_iterator it2;
-  for (it2 = inst_regs.begin(); it2 != inst_regs.end(); it2++)
-    if (reg_table[wid].find(*it2) != reg_table[wid].end()) {
-      return true;
-    }
+  // 44-6 (P4-0): the verdict is "does ANY of the instruction's registers sit
+  // in reg_table[wid]" -- an existence check, so deduplicating them through a
+  // heap-allocated std::set first changed nothing but cost a malloc + O(log)
+  // inserts per call on the issue hot path. Probe each register directly.
+  // Same membership lookups, same result, no temporary container.
+  const std::set<unsigned>& tbl = reg_table[wid];
+  for (unsigned i = 0; i < inst->outcount; i++)
+    if (tbl.find(inst->out[i]) != tbl.end()) return true;
+  for (unsigned j = 0; j < inst->incount; j++)
+    if (tbl.find(inst->in[j]) != tbl.end()) return true;
+  if (inst->pred > 0 && tbl.find(inst->pred) != tbl.end()) return true;
+  if (inst->ar1 > 0 && tbl.find(inst->ar1) != tbl.end()) return true;
+  if (inst->ar2 > 0 && tbl.find(inst->ar2) != tbl.end()) return true;
   return false;
 }
 
