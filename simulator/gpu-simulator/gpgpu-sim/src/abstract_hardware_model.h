@@ -488,14 +488,11 @@ class simt_stack {
 // Let's just upgrade to C++11 so we can use constexpr here...
 // start allocating from this address (lower values used for allocating globals
 // in .ptx file)
-// const unsigned long long GLOBAL_HEAP_START = 0xC0000000;
+// Device-heap VA base (3GB): cudaMalloc hands out VAs from here upward, and
+// whichspace() classifies any address >= this as global_space. (An experiment
+// that moved the VA base to 512GB to force 4-level page walks was abandoned;
+// see git history.)
 const unsigned long long GLOBAL_HEAP_START = 0xC0000000ULL;
-
-// VA heap start for cudaMalloc: placed at 512GB so that PML4 index = 1 (non-zero)
-// and PDP index varies per 1GB, exercising all 4 levels of the page table.
-// Must be >= GLOBAL_HEAP_START so that whichspace() returns global_space.
-// GLOBAL_HEAP_START is kept as the PA base for PMM/DRAM; this is the VA base only.
-// const unsigned long long GPU_VA_HEAP_START = 0x0000008000000000ULL;  // 512GB
 
 // Volta max shmem size is 96kB
 const unsigned long long SHARED_MEM_SIZE_MAX = 96 * (1 << 10);

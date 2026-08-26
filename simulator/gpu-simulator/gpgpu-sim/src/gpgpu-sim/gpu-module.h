@@ -7,9 +7,9 @@
 #include "../lasp/lasp_simple.h"
 #include "../abstract_hardware_model.h"
 
-#include <queue>  // new
-#include <cstdint>  // new
-#include <unordered_map>  // new: for page table node maps
+#include <queue>
+#include <cstdint>
+#include <unordered_map>  // page table node maps
 
 // #define LOG_TLB
 // #define LOG_PAGE_TABLE
@@ -17,8 +17,8 @@
 // #define LOG_PTW
 // #define LOG_PMM
 
-#define GPU_PAGE_SHIFT 12  // new: 4KB page size
-#define GPU_PAGE_SIZE  (1ULL << GPU_PAGE_SHIFT)  // new: Mask to get page offset
+#define GPU_PAGE_SHIFT 12  // base (4KB) page
+#define GPU_PAGE_SIZE  (1ULL << GPU_PAGE_SHIFT)
 // huge page (2MB): the PD (level 2) entry itself is the leaf, flagged by the PS
 // bit. Mirrors Pascal's PDE0 "Valid=1 means this entry is a 2MB PTE".
 #define GPU_HUGE_SHIFT     21
@@ -153,11 +153,6 @@ class gpu_page_table {
   // walk_depth: set to the number of PT levels actually traversed (0-4);
   // used by Phase 6 GMMU to compute per-step DRAM access latency.
   const gpu_pte_t* walk(uint64_t va, int* walk_depth = nullptr) const;
-
-  // // Map va to a physical page on chiplet_id (FIRST_TOUCH policy).
-  // // Data page and all newly allocated PT nodes (PDP/PD/PT) go to chiplet_id.
-  // // PML4 root stays on chiplet 0 (one global root, unavoidable remote for all GMMUs).
-  // void map(uint64_t va, unsigned chiplet_id);
 
   // Ensure the PT structural node at `level` for va exists.
   // Creates only the node at this level and updates the parent PTE to P=1.
@@ -559,9 +554,7 @@ class gpu_module {
   // Used for huge pages (2MB = GPU_HUGE_FRAMES). Returns -1 if unavailable.
   uint64_t pmm_alloc_contiguous(unsigned chiplet_id, uint64_t n_frames);
 
-  // Page table interface (new, Phase 2)
-  // // Map a virtual address to a physical page on the given chiplet.
-  // void map_va(uint64_t va, unsigned chiplet_id);
+  // Page table interface.
   // Walk the page table for va. Returns the leaf PTE, or nullptr on page fault.
   const gpu_pte_t* walk_va(uint64_t va, int* walk_depth = nullptr) const;
   
@@ -665,7 +658,8 @@ class gpu_module {
   // Current kernel's block dimension for memory affinity
   dim3 m_current_kernel_block_dim;
 
-  gpu_page_table* m_page_table;  // new: single GPU-wide page table (Phase 2)s
+  gpu_page_table* m_page_table;  // single GPU-wide page table (node PAs get
+                                 // per-chiplet copies under -gmmu_local_ptw)
   
   std::vector<va_alloc_t> m_va_alloc_list;  // VA ranges from all cudaMalloc calls (P3)
   std::vector<class gmmu*> m_gmmus;          // one GMMU per chiplet, indexed by chiplet_id (P3)

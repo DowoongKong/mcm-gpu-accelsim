@@ -205,7 +205,6 @@ gpgpu_t::gpgpu_t(const gpgpu_functional_sim_config &config, gpgpu_context *ctx)
   m_surf_mem = new memory_space_impl<8192>("surf", 64 * 1024);
 
   m_dev_malloc = GLOBAL_HEAP_START;
-  // m_dev_malloc = GPU_VA_HEAP_START;  // new
   checkpoint_option = m_function_model_config.get_checkpoint_option();
   checkpoint_kernel = m_function_model_config.get_checkpoint_kernel();
   checkpoint_CTA = m_function_model_config.get_checkpoint_CTA();

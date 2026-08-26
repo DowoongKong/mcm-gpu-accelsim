@@ -104,7 +104,7 @@ gpu_module::gpu_module(gpgpu_sim* top, unsigned n_chiplets, unsigned n_clusters,
       m_stats_file(NULL),
       m_remote_access_count(0),
       m_local_access_count(0),
-      m_page_table(NULL),  // new Phase 2 GPU-wide page table
+      m_page_table(NULL),
       m_current_lasp_config(NULL),
       m_current_kernel_block_dim(dim3(256, 1, 1)) {
   assert(m_n_chiplets >= 1);
@@ -152,23 +152,24 @@ void gpu_module::init() {
       const unsigned g = mb + i;
       assert(g < m_n_mem);
       m_mem_to_chiplet[g] = cid;
-      m_mem_sub_partition_to_chiplet[2*g] = cid;   // Assume 2 sub-parts per mem part
+      // CONSTRAINT: hardcodes 2 sub-partitions per memory channel instead of
+      // reading m_n_sub_partition_per_memory_channel (same assumption in
+      // chiplet::bind_mem_range). Wrong owner maps if a config ever changes
+      // -gpgpu_n_sub_partition_per_mchannel. findings.ko.md SMELL-2.
+      m_mem_sub_partition_to_chiplet[2*g] = cid;
       m_mem_sub_partition_to_chiplet[2*g+1] = cid;
     }
   }
 
-  // PMM initialization: scan full PA space, assign each page to its owning chiplet.
-  //uint64_t base_pa     = GLOBAL_HEAP_START;
-  static const uint64_t GPU_PA_BASE  = 0ULL;
+  // PMM initialization: split the physical frame space [0, total_pages) into
+  // one contiguous ascending range per chiplet. PFNs start at 0 -- the PA space
+  // is separate from the VA heap (GLOBAL_HEAP_START); the page table maps
+  // between them. Remainder frames go to the LAST chiplet (unlike split_range,
+  // which favors lower indices -- the two splits need not agree, they cover
+  // different resources).
   uint64_t total_pages = (uint64_t)m_top->get_config().get_gpu_mem_size_mb()
                         * 1024ULL * 1024ULL / GPU_PAGE_SIZE;
   uint64_t pages_per_chiplet         = total_pages / m_n_chiplets;
-
-  // for (uint64_t i = 0; i < total_pages; i++) {
-  //   uint64_t pfn = (base_pa >> GPU_PAGE_SHIFT) + i;
-  //   unsigned cid = pfn_to_chiplet_via_addrdec(pfn << GPU_PAGE_SHIFT);
-  //   m_chiplets[cid]->free_page(pfn);
-  // }
 
   for (unsigned cid = 0; cid < m_n_chiplets; cid++) {
     uint64_t pfn_start = (uint64_t)cid * pages_per_chiplet;
@@ -197,7 +198,7 @@ void gpu_module::init() {
   
   // Phase 2: create the GPU-wide page table after PMM is ready
   m_page_table = new gpu_page_table(this);
-  printf("[PAGE_TABLE] init: gpu_page_table created\n"); // print_log
+  printf("[PAGE_TABLE] init: gpu_page_table created\n");
 
   // Optional: freeze placement from a reference run's snapshot and pre-map the
   // whole page table before the first kernel, so the measured region takes zero
@@ -229,7 +230,7 @@ void gpu_module::init() {
                                m_page_table, &m_cluster_to_chiplet, &m_va_alloc_list,
                                self));
     printf("[GMMU] init: chiplet=%u n_ptw=%u pwq_depth=%u pwc_entries=%u\n",
-           c, n_ptw, pwq_depth, pwc_entries); // print_log
+           c, n_ptw, pwq_depth, pwc_entries);
   }
   
   // Create one L2 TLB per chiplet.
@@ -252,7 +253,7 @@ void gpu_module::init() {
            c,
            m_top->get_config().get_l2_tlb_sets(),
            m_top->get_config().get_l2_tlb_assoc(),
-           m_top->get_config().get_l2_tlb_mshr_entries()); // print_log
+           m_top->get_config().get_l2_tlb_mshr_entries());
 
     // 64KB L2 TLB: same class, only page_shift differs.
     gpu_l2_tlb* l2tlb_64k = new gpu_l2_tlb(
@@ -270,7 +271,7 @@ void gpu_module::init() {
            c,
            m_top->get_config().get_l2_tlb_64k_sets(),
            m_top->get_config().get_l2_tlb_64k_assoc(),
-           m_top->get_config().get_l2_tlb_64k_mshr_entries()); // print_log
+           m_top->get_config().get_l2_tlb_64k_mshr_entries());
 
     // 2MB L2 TLB: same class, only page_shift differs.
     gpu_l2_tlb* l2tlb_2m = new gpu_l2_tlb(
@@ -288,7 +289,7 @@ void gpu_module::init() {
            c,
            m_top->get_config().get_l2_tlb_2m_sets(),
            m_top->get_config().get_l2_tlb_2m_assoc(),
-           m_top->get_config().get_l2_tlb_2m_mshr_entries()); // print_log
+           m_top->get_config().get_l2_tlb_2m_mshr_entries());
   }
   
   // inter-chiplet one-way latency: ns -> core cycles (round). 0 keeps legacy behavior.
@@ -372,7 +373,7 @@ void gpu_module::icnt_deliver(unsigned input_deviceID,
     if (accelsim_log_ptw()) {
     fprintf(log_file, "[MCM_PTW] chiplet%u -> chiplet%u : %s (reply)\n",
             src_chiplet, dst_chiplet,
-            (src_chiplet != dst_chiplet) ? "REMOTE" : "LOCAL"); // print_log
+            (src_chiplet != dst_chiplet) ? "REMOTE" : "LOCAL");
     }
     ::icnt_push(input_deviceID, output_deviceID, data, size);
     return;
@@ -387,7 +388,7 @@ void gpu_module::icnt_deliver(unsigned input_deviceID,
     if (accelsim_log_ptw()) {
     fprintf(log_file, "[MCM_PTW] chiplet%u -> chiplet%u : %s\n",
             cluster_to_chiplet(device2cluster(input_deviceID)),
-            dst_chiplet, remote ? "REMOTE" : "LOCAL"); // print_log
+            dst_chiplet, remote ? "REMOTE" : "LOCAL");
     }
     ::icnt_push(input_deviceID, output_deviceID, data, size);
     return;
@@ -421,7 +422,7 @@ void gpu_module::icnt_deliver(unsigned input_deviceID,
     fprintf(log_file,
             "[MCM_ACCESS] chiplet%u cluster%u -> chiplet%u mem%u : %s\n",
             src_chiplet_id, clusterid, dst_chiplet_id, memid,
-            remote ? "REMOTE" : "LOCAL"); // print_log
+            remote ? "REMOTE" : "LOCAL");
     #endif
   } else if (mf->get_type() == READ_REPLY || mf->get_type() == WRITE_ACK) {
     unsigned memid     = device2mem(input_deviceID);
@@ -433,7 +434,7 @@ void gpu_module::icnt_deliver(unsigned input_deviceID,
     fprintf(log_file,
             "[MCM_ACCESS] chiplet%u mem%u -> chiplet%u cluster%u : %s\n",
             src_chiplet_id, memid, dst_chiplet_id, clusterid,
-            remote ? "REMOTE" : "LOCAL"); // print_log
+            remote ? "REMOTE" : "LOCAL");
     #endif
   }
 
@@ -518,7 +519,7 @@ bool gpu_module::l2_tlb_request(uint64_t va, unsigned cluster_id,
       if (full_kind) *full_kind = l2tlb->last_full_merge() ? 1u : 2u;  // 44-4
       #ifdef LOG_TLB
       printf("[L2_TLB] chiplet=%u cluster=%u vpn=0x%llx -> MSHR_FULL\n",
-               chiplet_id, cluster_id, (unsigned long long)page_vpn(va, pshift)); // print_log
+               chiplet_id, cluster_id, (unsigned long long)page_vpn(va, pshift));
       #endif
       return false;
 
@@ -542,7 +543,7 @@ bool gpu_module::l2_tlb_request(uint64_t va, unsigned cluster_id,
       l2tlb->xlat_mark_pwq_enq(cluster_id, page_vpn(va, pshift), cycle);
       #ifdef LOG_TLB
       printf("[L2_TLB] chiplet=%u cluster=%u vpn=0x%llx -> MISS\n",
-               chiplet_id, cluster_id, (unsigned long long)page_vpn(va, pshift)); // print_log
+               chiplet_id, cluster_id, (unsigned long long)page_vpn(va, pshift));
       #endif
       return true;
 
@@ -550,7 +551,7 @@ bool gpu_module::l2_tlb_request(uint64_t va, unsigned cluster_id,
       // VPN already in-flight; cluster_id merged into existing MSHR entry.
       #ifdef LOG_TLB
       printf("[L2_TLB] chiplet=%u cluster=%u vpn=0x%llx -> MSHR_HIT\n",
-               chiplet_id, cluster_id, (unsigned long long)page_vpn(va, pshift)); // print_log
+               chiplet_id, cluster_id, (unsigned long long)page_vpn(va, pshift));
       #endif
       return true;
     
@@ -857,7 +858,7 @@ uint64_t gpu_module::pmm_alloc_page(unsigned chiplet_id) {
   #ifdef LOG_PMM
     printf("[PMM] alloc: chiplet=%u pfn=0x%llx free_remaining=%zu\n",
            chiplet_id, (unsigned long long)pfn,
-           m_chiplets[chiplet_id]->free_page_count()); // print_log
+           m_chiplets[chiplet_id]->free_page_count());
   #endif
   return pfn;
 }
@@ -867,7 +868,7 @@ uint64_t gpu_module::pmm_alloc_contiguous(unsigned chiplet_id, uint64_t n_frames
   #ifdef LOG_PMM
   printf("[PMM] alloc_contiguous: chiplet=%u n=%llu base_pfn=0x%llx free=%zu\n",
          chiplet_id, (unsigned long long)n_frames, (unsigned long long)pfn,
-         m_chiplets[chiplet_id]->free_page_count()); // print_log
+         m_chiplets[chiplet_id]->free_page_count());
   #endif
   return pfn;
 }
@@ -876,24 +877,20 @@ void gpu_module::pmm_free_page(uint64_t pfn, unsigned chiplet_id) {
   m_chiplets[chiplet_id]->free_page(pfn);
 }
 
-// // new gpu_module warpper functions for page table operations
-// void gpu_module::map_va(uint64_t va, unsigned chiplet_id) {
-//   assert(m_page_table != NULL);
-//   m_page_table->map(va, chiplet_id);
-// }
-
 const gpu_pte_t* gpu_module::walk_va(uint64_t va, int* walk_depth) const {
   assert(m_page_table != NULL);
   return m_page_table->walk(va, walk_depth);
 }
 
 
-// unsigned gpu_module::pfn_to_chiplet_via_addrdec(uint64_t pa) const {
-//   addrdec_t tlx;
-//   m_top->getMemoryConfig()->m_address_mapping.addrdec_tlx(pa, &tlx);
-//   return mem_sub_partition_to_chiplet(tlx.sub_partition);
-// }
-
+// MISNOMER (kept for now, findings.ko.md SMELL-3): despite the name this does
+// NOT consult addrdec -- it splits the PFN space linearly, mirroring exactly
+// the per-chiplet ranges pmm_set_range() built in init() (remainder to the
+// last chiplet). It answers "which chiplet's PMM owns this frame", which is
+// only the same thing as "which chiplet's DRAM channel serves this PA" if the
+// config's addrdec chip bits agree with the linear split -- that agreement is
+// a config obligation, not enforced here. An earlier addrdec-based version
+// was replaced by this one; see git history.
 unsigned gpu_module::pfn_to_chiplet_via_addrdec(uint64_t pa) const {
   uint64_t total_pages       = (uint64_t)m_top->get_config().get_gpu_mem_size_mb()
                                * 1024ULL * 1024ULL / GPU_PAGE_SIZE;
@@ -929,9 +926,6 @@ gpu_page_table::~gpu_page_table() {
   for (auto& kv : m_pt64k_nodes) delete kv.second;
 }
 
-// Give `node` one page per OTHER chiplet so every chiplet can walk it locally.
-// No-op unless -gmmu_local_ptw. The pages are genuinely consumed, so
-// pt_page_count() reports the n_chiplets-fold cost.
 bool gpu_module::local_ptw_enabled() const {
   return m_top->get_config().get_gmmu_local_ptw();
 }
@@ -945,6 +939,9 @@ unsigned gpu_module::uniform_page_shift() const {
   return (small == big) ? small : 0;
 }
 
+// Give `node` one page per OTHER chiplet so every chiplet can walk it locally.
+// No-op unless -gmmu_local_ptw. The pages are genuinely consumed, so
+// pt_page_count() reports the n_chiplets-fold cost.
 bool gpu_page_table::alloc_replicas(pt_node_t* node, unsigned owner) {
   if (!m_mod->local_ptw_enabled()) return true;   // baseline: nothing to do
   const unsigned n_chip = m_mod->get_num_chiplets();
@@ -953,7 +950,7 @@ bool gpu_page_table::alloc_replicas(pt_node_t* node, unsigned owner) {
     if (node->base_pa_rep[c] != node->base_pa) continue;   // already replicated
     uint64_t rep_pfn = m_mod->pmm_alloc_page(c);
     if (rep_pfn == (uint64_t)-1) {
-      printf("[PAGE_TABLE] alloc_node: PMM exhausted on chiplet %u (replica)\n", c); // print_log
+      printf("[PAGE_TABLE] alloc_node: PMM exhausted on chiplet %u (replica)\n", c);
       return false;
     }
     node->base_pa_rep[c] = rep_pfn << GPU_PAGE_SHIFT;
@@ -978,7 +975,7 @@ pt_node_t* gpu_page_table::alloc_node(unsigned chiplet_id, bool with_replicas) {
   // 512-entry table, not a 64KB data page.
   uint64_t pfn = m_mod->pmm_alloc_page(chiplet_id);
   if (pfn == (uint64_t)-1) {
-    printf("[PAGE_TABLE] alloc_node: PMM exhausted on chiplet %u\n", chiplet_id); // print_log
+    printf("[PAGE_TABLE] alloc_node: PMM exhausted on chiplet %u\n", chiplet_id);
     return NULL;
   }
   pt_node_t* node = new pt_node_t();
@@ -1139,7 +1136,7 @@ uint64_t gpu_page_table::ensure_node(uint64_t va, int level, unsigned chiplet_id
         printf("[PAGE_TABLE] ensure_node: va=0x%llx level=1(PDP)"
                " chiplet=%u base_pa=0x%llx\n",
                (unsigned long long)va, chiplet_id,
-               (unsigned long long)node->base_pa); // print_log
+               (unsigned long long)node->base_pa);
         #endif
       }
       return m_pdp_nodes[key]->base_pa;
@@ -1160,7 +1157,7 @@ uint64_t gpu_page_table::ensure_node(uint64_t va, int level, unsigned chiplet_id
         printf("[PAGE_TABLE] ensure_node: va=0x%llx level=2(PD)"
                " chiplet=%u base_pa=0x%llx\n",
                (unsigned long long)va, chiplet_id,
-               (unsigned long long)node->base_pa); // print_log
+               (unsigned long long)node->base_pa);
         #endif
       }
       return m_pd_nodes[key]->base_pa;
@@ -1194,7 +1191,7 @@ uint64_t gpu_page_table::ensure_node(uint64_t va, int level, unsigned chiplet_id
         printf("[PAGE_TABLE] ensure_node: va=0x%llx level=3(%s)"
                " chiplet=%u base_pa=0x%llx\n",
                (unsigned long long)va, (is_64k ? "PT64K" : "PT"), chiplet_id,
-               (unsigned long long)node->base_pa); // print_log
+               (unsigned long long)node->base_pa);
         #endif
       }
       return nodes[key]->base_pa;
@@ -1259,7 +1256,7 @@ void gpu_page_table::map_leaf(uint64_t va, unsigned chiplet_id) {
     #ifdef LOG_PAGE_TABLE
     printf("[PAGE_TABLE] map_leaf(2M): va=0x%llx chiplet=%u base_pfn=0x%llx\n",
            (unsigned long long)va, chiplet_id,
-           (unsigned long long)base_pfn); // print_log
+           (unsigned long long)base_pfn);
     #endif
     return;
   }
@@ -1290,7 +1287,7 @@ void gpu_page_table::map_leaf(uint64_t va, unsigned chiplet_id) {
     #ifdef LOG_PAGE_TABLE
     printf("[PAGE_TABLE] map_leaf(64K): va=0x%llx chiplet=%u base_pfn=0x%llx\n",
            (unsigned long long)va, chiplet_id,
-           (unsigned long long)base_pfn64k); // print_log
+           (unsigned long long)base_pfn64k);
     #endif
     return;
   }
@@ -1313,7 +1310,7 @@ void gpu_page_table::map_leaf(uint64_t va, unsigned chiplet_id) {
   #ifdef LOG_PAGE_TABLE
   printf("[PAGE_TABLE] map_leaf: va=0x%llx chiplet=%u data_pfn=0x%llx\n",
          (unsigned long long)va, chiplet_id,
-         (unsigned long long)data_pfn); // print_log
+         (unsigned long long)data_pfn);
   #endif
 }
 
@@ -1462,12 +1459,12 @@ bool gpu_page_table::dump_placement(const char* path) const {
   const unsigned shift = config_uniform_page_shift();
   if (shift == 0) {
     printf("[PLACEMENT] dump: refusing -- -gpgpu_page_size_policy is size-dependent; "
-           "a placement map is only well defined for a single page size\n");  // print_log
+           "a placement map is only well defined for a single page size\n"); 
     return false;
   }
   FILE* f = fopen(path, "w");
   if (!f) {
-    printf("[PLACEMENT] dump: cannot open %s\n", path);  // print_log
+    printf("[PLACEMENT] dump: cannot open %s\n", path); 
     return false;
   }
   fprintf(f, "# gpgpu-sim placement snapshot v2\n");
@@ -1508,20 +1505,20 @@ bool gpu_page_table::dump_placement(const char* path) const {
   printf("[PLACEMENT] dump: %s  page_shift=%u data_vpns=%zu (mapped=%zu) "
          "pdp=%zu pd=%zu pt=%zu\n",
          path, shift, m_data_owner.size(), mapped,
-         m_pdp_owner.size(), m_pd_owner.size(), m_pt_owner.size());  // print_log
+         m_pdp_owner.size(), m_pd_owner.size(), m_pt_owner.size()); 
   return true;
 }
 
 bool gpu_page_table::load_placement(const char* path) {
   FILE* f = fopen(path, "r");
   if (!f) {
-    printf("[PLACEMENT] load: cannot open %s\n", path);  // print_log
+    printf("[PLACEMENT] load: cannot open %s\n", path); 
     return false;
   }
   const unsigned want = config_uniform_page_shift();
   if (want == 0) {
     printf("[PLACEMENT] load: FATAL -- -gpgpu_page_size_policy is size-dependent; "
-           "premap runs before any cudaMalloc and cannot replay mixed page sizes\n");  // print_log
+           "premap runs before any cudaMalloc and cannot replay mixed page sizes\n"); 
     fclose(f);
     abort();
   }
@@ -1563,20 +1560,20 @@ bool gpu_page_table::load_placement(const char* path) {
   if (file_shift < 0) {
     printf("[PLACEMENT] load: FATAL -- %s has no '# page_shift' header "
            "(v1 map from a 4KB-only build?). Regenerate the reference run.\n",
-           path);  // print_log
+           path); 
     abort();
   }
   if ((unsigned)file_shift != want) {
     printf("[PLACEMENT] load: FATAL -- %s was dumped with page_shift=%d but this "
            "config uses page_shift=%u. A placement map is page-size specific.\n",
-           path, file_shift, want);  // print_log
+           path, file_shift, want); 
     abort();
   }
 
   m_placement_page_shift = file_shift;
   m_placement_frozen = true;
   printf("[PLACEMENT] load: %s  page_shift=%d data_vpns=%zu nodes=%zu (placement frozen)\n",
-         path, file_shift, n_data, n_node);  // print_log
+         path, file_shift, n_data, n_node); 
   return true;
 }
 
@@ -1627,7 +1624,7 @@ void gpu_page_table::premap_from_placement() {
   printf("[PLACEMENT] premap: mapped %zu data pages (page_shift=%u), "
          "pt_nodes=%zu pt_pages=%zu (%.2f MB)\n",
          vpns.size(), shift, pt_node_count(), pt_page_count(),
-         (double)(pt_page_count() * GPU_PAGE_SIZE) / (1024.0 * 1024.0));  // print_log
+         (double)(pt_page_count() * GPU_PAGE_SIZE) / (1024.0 * 1024.0)); 
 }
 // ============================================================================
 

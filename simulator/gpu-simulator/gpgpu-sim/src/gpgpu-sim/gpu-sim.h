@@ -67,7 +67,7 @@
 #define DUMPLOG 333
 
 class gpgpu_context;
-class gpu_module; //jb
+class gpu_module;  // MCM chiplet topology wrapper (gpu-module.h)
 
 extern tr1_hash_map<new_addr_type, unsigned> address_random_interleaving;
 
@@ -547,10 +547,8 @@ class gpgpu_sim_config : public power_config,
   unsigned num_shader() const { return m_shader_config.num_shader(); }
   unsigned num_cluster() const { return m_shader_config.n_simt_clusters; }
   unsigned get_max_concurrent_kernel() const { return max_concurrent_kernel; }
-  // jb
   unsigned get_num_chiplets() const { return m_n_chiplets; }
   unsigned get_icnt_inter_hop_latency_ns() const { return icnt_inter_hop_latency_ns; }
-
 
   /**
    * @brief Check if we are in SST mode
@@ -571,16 +569,16 @@ class gpgpu_sim_config : public power_config,
 
   bool flush_l1() const { return gpgpu_flush_l1_cache; }
   unsigned get_gpu_mem_size_mb() const { return gpu_mem_size_mb; }
-  unsigned get_gmmu_n_ptw()      const { return gmmu_n_ptw; }      // P3
-  unsigned get_gmmu_pwq_depth()  const { return gmmu_pwq_depth; }  // P3
-  unsigned get_gmmu_pwc_entries() const { return gmmu_pwc_entries; }  // P3
+  unsigned get_gmmu_n_ptw()      const { return gmmu_n_ptw; }
+  unsigned get_gmmu_pwq_depth()  const { return gmmu_pwq_depth; }
+  unsigned get_gmmu_pwc_entries() const { return gmmu_pwc_entries; }
   const char* get_gmmu_placement_dump() const { return gmmu_placement_dump; }
   const char* get_gmmu_placement_load() const { return gmmu_placement_load; }
   bool get_gmmu_local_ptw() const { return gmmu_local_ptw; }
   unsigned get_l2_tlb_ports() const { return m_shader_config.gpgpu_l2_tlb_ports; }
-  unsigned get_l2_tlb_sets()         const { return m_l2_tlb_sets; }  // P5
-  unsigned get_l2_tlb_assoc()        const { return m_l2_tlb_assoc; }  // P5
-  unsigned get_l2_tlb_mshr_entries() const { return m_l2_tlb_mshr_entries; }  // P5
+  unsigned get_l2_tlb_sets()         const { return m_l2_tlb_sets; }
+  unsigned get_l2_tlb_assoc()        const { return m_l2_tlb_assoc; }
+  unsigned get_l2_tlb_mshr_entries() const { return m_l2_tlb_mshr_entries; }
   unsigned get_l2_tlb_mshr_max_merge() const { return m_l2_tlb_mshr_max_merge; }
   unsigned get_l2_tlb_lookup_latency() const { return m_l2_tlb_lookup_latency; }
   // L2 TLB (64KB / 2MB): mirror the getters above. The unsuffixed ones stay 4KB-only.
@@ -649,9 +647,8 @@ class gpgpu_sim_config : public power_config,
   unsigned int gpgpu_compute_capability_minor;
   unsigned long long liveness_message_freq;
 
-  // jb
-  unsigned m_n_chiplets;
-  unsigned m_cta_sched_policy;  // set by -gpgpu_cta_scheduling_policy (P3-5)
+  unsigned m_n_chiplets;        // set by -gpgpu_n_chiplets (1 = monolithic)
+  unsigned m_cta_sched_policy;  // set by -gpgpu_cta_scheduling_policy
   // LASP CTA scheduling (LADM, MICRO'20), selected per run via config (S40).
   // 0=off keeps the pre-LASP issue path; the locality type is supplied
   // manually (oracle locality table stand-in for the paper's compiler pass).
@@ -662,13 +659,14 @@ class gpgpu_sim_config : public power_config,
   unsigned get_lasp_policy() const { return m_lasp_policy; }
   unsigned get_lasp_chunk_size() const { return m_lasp_chunk_size; }
  private:
-  unsigned gpu_mem_size_mb;  // new: total device memory size in MB
+  unsigned gpu_mem_size_mb;  // total device memory in MB; sizes the PMM page pool
 
-  // P3
+  // Per-chiplet GMMU sizing (walkers, page-walk queue, page-walk caches).
   unsigned gmmu_n_ptw;
   unsigned gmmu_pwq_depth;
   unsigned gmmu_pwc_entries;
-  
+
+
   // Placement snapshot for the local-PTW experiment (see
   // docs/localptw_port_design.ko.md). Both default to "" (disabled), in which
   // case first-touch placement behaves exactly as before.
@@ -682,7 +680,7 @@ class gpgpu_sim_config : public power_config,
   // 0 = baseline (one distributed page table).
   bool gmmu_local_ptw;
 
-  // P5
+  // Per-chiplet L2 TLB geometry, one group per page size (4KB/64KB/2MB).
   unsigned m_l2_tlb_sets;          // set by -gpgpu_l2_tlb_sets
   unsigned m_l2_tlb_assoc;         // set by -gpgpu_l2_tlb_assoc
   unsigned m_l2_tlb_mshr_entries;  // set by -gpgpu_l2_tlb_mshr_entries
@@ -872,9 +870,11 @@ class gpgpu_sim : public gpgpu_t {
   void shader_print_scheduler_stat(FILE *fout, bool print_dynamic_info) const;
   void visualizer_printstat();
   void print_shader_cycle_distro(FILE *fout) const;
-  
-  // NEW: Phase 1 - bind global arrays into chiplet ranges (no remote timing yet)
-  void init_gpu_module_phase1(); //jb
+
+  // DEAD: declared but never defined or called (the module is built in the
+  // gpgpu_sim constructor instead). Kept only until the audit's fix pass;
+  // see docs/audit/findings.ko.md DEAD-1.
+  void init_gpu_module_phase1();
 
   void gpgpu_debug();
 
@@ -884,9 +884,11 @@ class gpgpu_sim : public gpgpu_t {
   class memory_partition_unit **m_memory_partition_unit;
   class memory_sub_partition **m_memory_sub_partition;
 
-  // NEW: Phase 1 MCM wrapper (does not change baseline behavior when num_chiplets == 1)
-  gpu_module *m_gpu_module; //jb
-  unsigned m_n_chiplets; //jb
+  // MCM topology wrapper: owns the chiplets and their GMMUs, L2 TLBs, PMMs and
+  // the (shared or per-chiplet) page table. With m_n_chiplets == 1 the split is
+  // degenerate and the simulator reproduces the monolithic baseline.
+  gpu_module *m_gpu_module;
+  unsigned m_n_chiplets;
 
   std::vector<kernel_info_t *> m_running_kernels;
   unsigned m_last_issued_kernel;
@@ -1047,7 +1049,9 @@ class exec_gpgpu_sim : public gpgpu_sim {
   exec_gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
       : gpgpu_sim(config, ctx) {
     createSIMTCluster();
-    m_gpu_module->bind_global_arrays(m_cluster, m_memory_partition_unit); // 
+    // Bind here, not in the gpgpu_sim ctor: m_cluster exists only after
+    // createSIMTCluster(), which runs in this subclass constructor.
+    m_gpu_module->bind_global_arrays(m_cluster, m_memory_partition_unit);
   }
 
   virtual void createSIMTCluster();

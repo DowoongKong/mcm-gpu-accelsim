@@ -529,7 +529,7 @@ void gpu_l1_tlb::print_stats(FILE *f) const {
           page_kind_tag(m_page_shift),
           m_sm_id, m_hits, m_misses, m_mshr_hits,
           m_mshr_merge_full, m_mshr_entries_full, m_resv_fail_cycles,
-          total ? 100.0 * m_hits / total : 0.0); // print_log
+          total ? 100.0 * m_hits / total : 0.0);
   // Which resource actually limits translation throughput: ports, the L1->L2
   // queue, or something downstream. port_busy==0 means the port cap never bound.
   fprintf(f, "[L1_TLB_%s_PORT] SM=%u ports=%u port_busy=%llu concurrent_max=%u l2_req_q_max=%u\n",
@@ -905,7 +905,7 @@ void gpu_l2_tlb::print_stats(FILE* f) const {
           m_chiplet_id, m_hits, m_misses,
           m_mshr_hits, m_mshr_merge_full, m_mshr_entries_full,
           m_resv_fail_cycles,
-          total ? 100.0 * m_hits / total : 0.0); // print_log
+          total ? 100.0 * m_hits / total : 0.0);
   fprintf(f, "[L2_TLB_%s_PORT] chiplet=%u ports=%u port_busy=%llu concurrent_max=%u\n",
           page_kind_tag(m_page_shift), m_chiplet_id, m_n_ports,
           m_port_busy_stalls, m_concurrent_max);

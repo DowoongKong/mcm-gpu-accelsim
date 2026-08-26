@@ -45,8 +45,8 @@
 #include "mem_fetch.h"
 #include "shader.h"
 #include "shader_trace.h"
-#include "gpu-module.h" //jb
-#include "gmmu.h"       // P3: full gmmu definition for ->cycle()
+#include "gpu-module.h"  // MCM chiplet topology wrapper
+#include "gmmu.h"        // full definition needed: gmmu->cycle() is called below
 #include "par_serial_probe.h"
 #include "../lasp/lasp_simple.h"
 #include "../lasp/lasp_heuristic.h"
@@ -931,15 +931,15 @@ void gpgpu_sim_config::reg_options(option_parser_t opp) {
                          "thread block launch latency in cycles. Default: 0",
                          "0");
   
-  // jb minseong
+  // MCM-GPU topology. 1 chiplet == monolithic baseline; SMs and memory
+  // partitions are split into n contiguous groups by gpu_module.
   option_parser_register(opp, "-gpgpu_n_chiplets", OPT_UINT32, &m_n_chiplets,
                        "number of chiplets in MCM GPU (Phase 1 scaffolding)",
                        "1");
-  // new
+  // Sizes the PMM physical-page pool that first-touch placement draws from.
   option_parser_register(opp, "-gpu_mem_size_mb", OPT_UINT32,
                         &gpu_mem_size_mb,
                         "total device memory size in MB", "4096");
-  // P3
   option_parser_register(opp, "-gmmu_n_ptw", OPT_UINT32,
                         &gmmu_n_ptw,
                         "number of parallel page table walkers per chiplet GMMU",
@@ -1309,7 +1309,10 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
 
   gpu_kernel_time.clear();
 
-  // jb
+  // MCM: build the chiplet topology wrapper before the memory system below, so
+  // icnt_configure_chiplets() can read its owner maps. Note bind_global_arrays()
+  // cannot run here: m_cluster is only created by createSIMTCluster() in the
+  // exec/sst/trace subclass constructor, which is where the bind happens.
   m_gpu_module = NULL;
 
   m_n_chiplets = m_config.get_num_chiplets();
@@ -1322,13 +1325,12 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
     m_gpu_module = new gpu_module(this, m_n_chiplets, n_clusters, n_mem, n_mem_parts);
 
     m_gpu_module->init();
-    // m_gpu_module->bind_global_arrays(m_cluster, m_memory_partition_unit);
     m_gpu_module->set_stats_file(stdout);
 
-    // Debug print to confirm correctness (especially for num_chiplets==1)
+    // Prints the SM/partition-to-chiplet split; doubles as the visual check
+    // that num_chiplets==1 reproduces the monolithic layout.
     m_gpu_module->dump_partitioning();
   }
-  ////
 
   // TODO: somehow move this logic to the sst_gpgpu_sim constructor?
   if (!m_config.is_SST_mode()) {
@@ -2615,7 +2617,7 @@ void shader_core_ctx::issue_block2core(kernel_info_t &kernel) {
     printf("[CTA_ISSUE] kernel=%u cta=%u xyz=(%u,%u,%u) sm=%u cluster=%u chiplet=%u hw_cta=%u cycle=%llu\n",
            kernel.get_uid(), ctaid, xyz.x, xyz.y, xyz.z, m_sid, m_tpc, chiplet,
            free_cta_hw_id,
-           (unsigned long long)(m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle)); // print_log
+           (unsigned long long)(m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle));
   }
 
   shader_CTA_count_log(m_sid, 1);
@@ -2715,18 +2717,9 @@ std::vector<unsigned> RoundRobinChipletScheduler::cluster_order(
 }
 // ============================================================
 
-// void gpgpu_sim::issue_block2core() {
-//   unsigned last_issued = m_last_cluster_issue;
-//   for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
-//     unsigned idx = (i + last_issued + 1) % m_shader_config->n_simt_clusters;
-//     unsigned num = m_cluster[idx]->issue_block2core();
-//     if (num) {
-//       m_last_cluster_issue = idx;
-//       m_total_cta_launched += num;
-//     }
-//   }
-// }
-
+// The pre-MCM issue_block2core() body survives as SequentialScheduler above
+// (policy 0): identical visit order, so config files without
+// -gpgpu_cta_scheduling_policy behave exactly as upstream.
 void gpgpu_sim::issue_block2core() {
   // 32: when no kernel has CTAs left (kernel drain -- most BFS cycles), the
   // whole scan below is side-effect free: select_kernel()'s mutations are all
@@ -2857,7 +2850,7 @@ void gpgpu_sim::cycle() {
     // BFS32 k1~k5), because this block's per-call payload is small (13-20s
     // absolute) relative to the fork/join cost of two new parallel regions
     // re-entered ~500k times. See implog §26 for the full before/after numbers.
-     // P4: GMMU is per-chiplet, clocked with L2 domai
+    // GMMU is per-chiplet and clocked with the L2 domain.
     for (unsigned c = 0; c < m_n_chiplets; c++) {
       m_gpu_module->get_gmmu(c)->cycle(
           gpu_sim_cycle + gpu_tot_sim_cycle);
@@ -2912,7 +2905,7 @@ void gpgpu_sim::cycle() {
 
   if (clock_mask & ICNT) {
     const unsigned long long __pt2 = g_phase_timing_on ? phase_now_ns() : 0;
-    g_icnt_now = gpu_sim_cycle + gpu_tot_sim_cycle;  // FUNNEL_ (temp): xbar 도착 스탬프용
+    g_icnt_now = gpu_sim_cycle + gpu_tot_sim_cycle;  // FUNNEL_ (temp): xbar arrival timestamp
     icnt_transfer();
     m_gpu_module->advance_inter_chiplet(gpu_sim_cycle + gpu_tot_sim_cycle);
     if (g_phase_timing_on) {
@@ -3492,33 +3485,7 @@ void sst_gpgpu_sim::SST_cycle() {
 #endif
 }
 
-// // jb
-// void gpgpu_sim::init_gpu_module_phase1() {
-//   // Phase 1 goal:
-//   // - Do not change how clusters/memory partitions are created.
-//   // - Just create a gpu_module wrapper and bind contiguous ranges to chiplets.
-
-//   if (m_gpu_module) return;
-
-//   // Total counts from existing configs
-//   const unsigned n_clusters = m_shader_config->n_simt_clusters;
-
-//   // In GPGPU-Sim, m_memory_partition_unit is sized by m_memory_config->m_n_mem
-//   const unsigned n_mem_parts = m_memory_config->m_n_mem;
-
-//   m_gpu_module = new gpu_module(this, m_n_chiplets);
-
-//   // Partition policy: contiguous ranges per chiplet
-//   m_gpu_module->init(n_clusters, n_mem_parts);
-
-//   // Bind: chiplets will point into the already-created global arrays
-//   m_gpu_module->bind_global_arrays(m_cluster, m_memory_partition_unit);
-
-//   // Optional debug print (strongly recommended for your "chiplet=1 equals baseline" check)
-//   // m_gpu_module->dump_partitioning();
-// }
-
-// P3: hook for gpu_module to observe mallocs and track virtual address ranges
+// Hook for gpu_module to observe mallocs and track virtual address ranges
 void gpgpu_sim::on_gpu_malloc(uint64_t va, size_t aligned_size,
                               unsigned page_shift) {
   if (m_gpu_module)
