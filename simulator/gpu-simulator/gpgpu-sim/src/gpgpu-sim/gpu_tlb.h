@@ -325,6 +325,11 @@ class gpu_l2_tlb {
   void xlat_mark_pwq_enq(unsigned cluster_id, uint64_t vpn_val, uint64_t cur);
   bool xlat_take_seg(unsigned cluster_id, uint64_t vpn_val, xlat_down_t& out);
 
+  // P-1 (speed-audit V3 fix): bumped by every fill(). An SM's completion poll
+  // can only find work after a fill on this L2 TLB instance, so the poll is
+  // skipped while this stands still (see ldst_unit::cycle_b).
+  uint64_t fill_seq() const { return m_fill_seq; }
+
   // Called by gmmu::complete_walk() when PTW finishes.
   // Inserts pte into TLB array (LRU eviction) and marks L2 MSHR pte_ready.
   // XLATLAT: `walk` holds the walk's scalars and current_cycle is t7. The GMMU
@@ -423,6 +428,7 @@ class gpu_l2_tlb {
   }
  private:
   uint64_t m_mshr_epoch = 1;
+  uint64_t m_fill_seq = 0;   // P-1: see fill_seq()
   bool m_last_full_merge = false;
 
   unsigned long long m_gate_expire  = 0;   // branch (1): window elapsed -> resolve()

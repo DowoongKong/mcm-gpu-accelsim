@@ -695,6 +695,7 @@ gpu_l2_tlb::resolve(uint64_t vpn_val, unsigned sidx, unsigned cluster_id,
 void gpu_l2_tlb::fill(uint64_t vpn_val, const gpu_pte_t& pte,
                        uint64_t current_cycle, const xlat_walk_t* walk) {
   m_mshr_epoch++;  // 44-4: array contents + pte_ready change verdicts
+  m_fill_seq++;    // P-1: wake the pollers (see fill_seq())
   // Insert into TLB array with LRU replacement.
   unsigned sidx = set_idx(vpn_val);
   int      way  = find_way(sidx, vpn_val);

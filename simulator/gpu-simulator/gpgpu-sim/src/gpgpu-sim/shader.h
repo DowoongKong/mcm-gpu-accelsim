@@ -1585,6 +1585,13 @@ class ldst_unit : public pipelined_simd_unit {
   // scan is a pure re-read answering any_pending again, so it is skipped.
   // Erased when the instruction drains (with its xlat tables) or on a new uid.
   std::unordered_map<unsigned, std::pair<uint64_t, unsigned>> m_xlat_probe_memo;
+  // P-1 (speed-audit V3 fix): last L2 fill_seq() this unit's completion poll
+  // observed, one per (4k, 64k, 2m) TLB pair. The pending-VPN scan in cycle_b
+  // runs only when the matching L2 TLB filled since -- a skipped scan would
+  // have consumed nothing (query_completed() is mutation-free when false and
+  // get_pending_vpns() is const), so the consumption ORDER is untouched and
+  // digests are bit-identical; only the mostly-false per-cycle polling goes.
+  uint64_t m_l2_fill_seen[3] = {0, 0, 0};
   uint64_t l1_xlat_epoch_sum() const {
     uint64_t e = 0;
     if (m_l1_tlb_4k)  e += m_l1_tlb_4k->change_epoch();

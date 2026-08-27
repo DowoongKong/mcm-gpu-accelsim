@@ -3306,23 +3306,32 @@ void ldst_unit::cycle_b() {
       // Poll L2 TLB for completed VPN translations (MISS/MSHR_HIT path only).
       // L2 HIT path fills L1 TLB directly in memory_cycle(); those VPNs have
       // ready=true in L1 MSHR already and are not returned by get_pending_vpns().
-      for (uint64_t vpn : mshr.get_pending_vpns()) {
-        gpu_pte_t pte;
-        // query_completed() checks pte_ready and removes this cluster_id.
-        // Returns true once GMMU complete_walk() called l2_tlb->fill().
-        if (l2_tlb->query_completed(vpn, m_tpc, pte)) {
-          // XLATLAT: collect this (cluster, vpn)'s L2 boundaries so the fill can
-          // hand them to the request that drove the hand-off.
-          xlat_down_t down;
-          const bool have = l2_tlb->xlat_take_seg(m_tpc, vpn, down);
-          l1_tlb->fill(vpn, pte, cur_cycle, have ? &down : NULL);
-          #ifdef LOG_TLB
-          printf("[L1_TLB_%s] cycle=%llu SM=%u fill vpn=0x%llx pfn=0x%llx\n",
-                page_kind_tag(pairs[p].shift),
-                (unsigned long long)cur_cycle, m_sid,
-                (unsigned long long)vpn, (unsigned long long)pte.pfn());
-          #endif
+      // P-1 (speed-audit V3 fix): the scan can only find work after a fill on
+      // this L2 TLB (nothing else sets pte_ready), and a scan that finds
+      // nothing mutates nothing -- so skip it while fill_seq() stands still.
+      // The scan itself is unchanged, so when it does run, it consumes
+      // completions in exactly the order the per-cycle poll always did.
+      // An unused TLB (empty 64k/2m config) never fills -> never scans.
+      if (l2_tlb->fill_seq() != m_l2_fill_seen[p]) {
+        for (uint64_t vpn : mshr.get_pending_vpns()) {
+          gpu_pte_t pte;
+          // query_completed() checks pte_ready and removes this cluster_id.
+          // Returns true once GMMU complete_walk() called l2_tlb->fill().
+          if (l2_tlb->query_completed(vpn, m_tpc, pte)) {
+            // XLATLAT: collect this (cluster, vpn)'s L2 boundaries so the fill
+            // can hand them to the request that drove the hand-off.
+            xlat_down_t down;
+            const bool have = l2_tlb->xlat_take_seg(m_tpc, vpn, down);
+            l1_tlb->fill(vpn, pte, cur_cycle, have ? &down : NULL);
+            #ifdef LOG_TLB
+            printf("[L1_TLB_%s] cycle=%llu SM=%u fill vpn=0x%llx pfn=0x%llx\n",
+                  page_kind_tag(pairs[p].shift),
+                  (unsigned long long)cur_cycle, m_sid,
+                  (unsigned long long)vpn, (unsigned long long)pte.pfn());
+            #endif
+          }
         }
+        m_l2_fill_seen[p] = l2_tlb->fill_seq();
       }
       l1_tlb->cycle(cur_cycle);  // drain mark_ready'd MSHR entries; unchanged
       // P5: drain completed translations, schedule parked warps for replay.
