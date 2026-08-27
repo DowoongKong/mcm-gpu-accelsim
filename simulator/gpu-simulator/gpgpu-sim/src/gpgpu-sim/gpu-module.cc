@@ -663,67 +663,13 @@ void gpu_module::dump_partitioning(FILE* fout) const {
   fprintf(fout, "==========================================\n");
 }
 
-// void gpu_module::allocate_memory_partitions_lasp() {
-//   // Allocate memory partitions to chiplets based on LASP policy
-//   if (!m_current_lasp_config) {
-//     fprintf(stdout, "[LASP-MEMORY] No LASP config - using default allocation\n");
-//     fflush(stdout);
-//     return;
-//   }
-
-//   fprintf(stdout, "[LASP-MEMORY] Allocating memory partitions based on %s policy\n",
-//           lasp::policy_to_string(m_current_lasp_config->policy));
-//   fflush(stdout);
-
-//   unsigned n_mem_partitions = m_n_mem;
-//   unsigned partitions_per_chiplet = (n_mem_partitions + m_n_chiplets - 1) / m_n_chiplets;
-
-//   if (m_current_lasp_config->policy == lasp::CHUNK_BINDING) {
-//     // Allocate memory partitions in round-robin fashion across chiplets
-//     for (unsigned mem_id = 0; mem_id < n_mem_partitions; ++mem_id) {
-//       unsigned chiplet_id = mem_id % m_n_chiplets;
-      
-//       // Update sub-partition mapping (2 sub-partitions per mem partition)
-//       m_mem_sub_partition_to_chiplet[2 * mem_id] = chiplet_id;
-//       m_mem_sub_partition_to_chiplet[2 * mem_id + 1] = chiplet_id;
-      
-//       fprintf(stdout, "[LASP-MEMORY] mem_partition[%u] -> chiplet %u\n", 
-//               mem_id, chiplet_id);
-//     }
-//   }
-//   else if (m_current_lasp_config->policy == lasp::ROW_BINDING) {
-//     // Allocate based on row distribution
-//     for (unsigned mem_id = 0; mem_id < n_mem_partitions; ++mem_id) {
-//       unsigned chiplet_id = (mem_id / 4) % m_n_chiplets;
-      
-//       m_mem_sub_partition_to_chiplet[2 * mem_id] = chiplet_id;
-//       m_mem_sub_partition_to_chiplet[2 * mem_id + 1] = chiplet_id;
-      
-//       fprintf(stdout, "[LASP-MEMORY] mem_partition[%u] -> chiplet %u (ROW)\n", 
-//               mem_id, chiplet_id);
-//     }
-//   }
-//   else if (m_current_lasp_config->policy == lasp::COL_BINDING) {
-//     // Allocate based on column distribution
-//     for (unsigned mem_id = 0; mem_id < n_mem_partitions; ++mem_id) {
-//       unsigned chiplet_id = (mem_id % 4) % m_n_chiplets;
-      
-//       m_mem_sub_partition_to_chiplet[2 * mem_id] = chiplet_id;
-//       m_mem_sub_partition_to_chiplet[2 * mem_id + 1] = chiplet_id;
-      
-//       fprintf(stdout, "[LASP-MEMORY] mem_partition[%u] -> chiplet %u (COL)\n", 
-//               mem_id, chiplet_id);
-//     }
-//   }
-
-//   fflush(stdout);
-// }
-
+// DEAD-4 (findings.ko.md): declared and defined but never called; kept as a
+// no-op until the fix pass so the design note below survives.
 void gpu_module::allocate_memory_partitions_lasp() {
   // No-op for baseline MCM-GPU (demand paging + First Touch + Round Robin CTA).
   //
   // m_mem_sub_partition_to_chiplet[] encodes the physical chiplet ownership
-  // derived from the address mapping and is set correctly in init().
+  // (contiguous split_range() split, set in init() -- see SMELL-3).
   // LASP is a CTA scheduling policy and must not alter this physical mapping.
   //
   // LASP-aware memory placement (e.g., co-locating CTA data with its chiplet)

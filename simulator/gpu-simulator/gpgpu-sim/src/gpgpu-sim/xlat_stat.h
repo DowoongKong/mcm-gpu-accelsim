@@ -284,7 +284,7 @@ struct xlat_sum_t {
     const double walk_svc = (double)s7 / N;
     const double merge_wait = (double)(smid - (s3 + s4 + s5 + rest)) / N;
     const double pwq_wait = (double)s6 / N, fill_return = (double)s8 / N;
-    // rest tiles into s6+s7+s8 only for walk owners; the un-walked残 of rest
+    // rest tiles into s6+s7+s8 only for walk owners; the un-walked remainder of rest
     // (merged L2 requests waiting on the owner's walk) is wait, not service.
     const double rest_unwalked = (double)(rest - (s6 + s7 + s8)) / N;
     const double svc = l1_probe + l2_probe + walk_svc;
