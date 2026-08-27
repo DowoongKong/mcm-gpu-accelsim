@@ -129,6 +129,9 @@ gpu_module::~gpu_module() {
 
 void gpu_module::init() {
   create_chiplets();
+  // P-6: cache the uniform page shift (config is final by now). See the member
+  // comment; page_shift_for_va() uses it as an O(1) fast path.
+  m_uniform_shift = uniform_page_shift();
 
   // Build owner maps.
   m_cluster_to_chiplet.assign(m_n_clusters, 0);
@@ -1671,6 +1674,13 @@ bool gpu_module::is_va_allocated(uint64_t va) const {
 // allocations. If that ever grows into the thousands, switch m_va_alloc_list to
 // a std::map keyed by va_base and use upper_bound.
 unsigned gpu_module::page_shift_for_va(uint64_t va) const {
+  // P-6 fast path: under a fixed policy every registered allocation carries
+  // m_uniform_shift (decide_page_shift() is size-independent then) and the
+  // fallback below returns it as well -- so the answer is m_uniform_shift for
+  // every va and the scan is redundant. This function sits on the translation
+  // hot path (per distinct page per access scan, per walk level, per L1->L2
+  // drain probe), which is what makes the shortcut worth having.
+  if (m_uniform_shift) return m_uniform_shift;
   for (const auto& a : m_va_alloc_list) {
     if (va >= a.va_base && va < a.va_base + (uint64_t)a.aligned_size)
       return a.page_shift;

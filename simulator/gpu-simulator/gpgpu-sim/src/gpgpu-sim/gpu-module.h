@@ -662,6 +662,12 @@ class gpu_module {
                                  // per-chiplet copies under -gmmu_local_ptw)
   
   std::vector<va_alloc_t> m_va_alloc_list;  // VA ranges from all cudaMalloc calls (P3)
+  // P-6 (speed-audit V4 residue): uniform_page_shift() cached at init. Nonzero
+  // under a FIXED page-size policy, where page_shift_for_va() provably answers
+  // this value for EVERY va (registered allocations all carry it, and the
+  // out-of-range fallback returns it too) -- so the hot allocation-list scan
+  // can be skipped entirely. 0 under automatic policies (3-5): scan required.
+  unsigned m_uniform_shift = 0;
   std::vector<class gmmu*> m_gmmus;          // one GMMU per chiplet, indexed by chiplet_id (P3)
   
   // --- inter-chiplet fixed one-way latency (0 = disabled) ---
