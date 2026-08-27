@@ -5556,9 +5556,12 @@ void sst_simt_core_cluster::icnt_inject_request_packet_to_SST(
 }
 
 void simt_core_cluster::icnt_cycle() {
-  // POPGATE_ (temp): measure how often this cluster cannot drain the icnt because
-  // its SM response FIFO is full. All TLB-fill replies of a chiplet are routed to
-  // its representative cluster and popped here; a starved pop stalls them.
+  // POPGATE_ (temp): measure how often this cluster cannot drain the icnt
+  // because its SM response FIFO is full. NOTE: written pre-Fix-A, when every
+  // TLB-fill reply of a chiplet converged on its representative cluster; with
+  // the Fix-A endpoint round-robin, replies spread over all of the chiplet's
+  // clusters, so the repr-cluster row understates PTW gating (see the matching
+  // note at the [POPGATE] print in gpu-sim.cc).
   // Counters are cumulative; printed per-kernel from gpgpu_sim::print_stats().
   m_popgate_icnt_cycles++;
   if (m_response_fifo.size() >= m_config->n_simt_ejection_buffer_size)

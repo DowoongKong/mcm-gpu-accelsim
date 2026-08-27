@@ -80,7 +80,7 @@ bool gmmu::translate(uint64_t va, unsigned cluster_id, uint64_t cycle) {
 }
 
 void gmmu::cycle(uint64_t current_cycle) {
-  m_last_cycle = current_cycle;   // updated here; used by done_tlb_req() (cycle=0 workaround)
+  m_last_cycle = current_cycle;   // fallback clock for done_tlb_req()
   m_total_cycles++;               // counts every cycle() invocation for occupancy denominator
 
   // 39: idle early-exit. Every branch below is gated on one of these queues;
@@ -319,9 +319,11 @@ void gmmu::pt_walk(mem_fetch* parent_mf, int level, uint64_t table_pa,
   }
 }
 
-// Called from gpu_module::icnt_push when a TLB_FILL_REPLY is intercepted. (P3-1)
+// Called from gpu_module::icnt_pop() when a TLB_FILL_REPLY arrives at this
+// chiplet (the true arrival cycle is passed in).
 void gmmu::done_tlb_req(mem_fetch* child_mf, uint64_t current_cycle) {
-  // gpu_module::icnt_push() passes cycle=0; fall back to last known cycle.
+  // Defensive only: the sole caller passes the real cycle. 0 can occur just
+  // at simulation start, where m_last_cycle (0) is the right substitute.
   if (current_cycle == 0) current_cycle = m_last_cycle;
   
   int       level     = child_mf->get_tlb_depth();

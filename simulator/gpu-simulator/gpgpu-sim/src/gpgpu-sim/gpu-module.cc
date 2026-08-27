@@ -470,7 +470,12 @@ void gpu_module::advance_inter_chiplet(uint64_t now) {
   while (!m_inter_delay_q.empty() && m_inter_delay_q.front().release <= now) {
     delayed_pkt_t p = m_inter_delay_q.front();
     mem_fetch* mf = static_cast<mem_fetch*>(p.data);
-    // PTW reply is intercepted (done_tlb_req) and never enters the network buffer.
+    // TLB_FILL_REPLY is exempted from the input-buffer check: it is consumed
+    // at the destination pop (gpu_module::icnt_pop -> done_tlb_req), never by
+    // the SM response FIFO. NOTE (findings.ko.md SMELL-11): it still enters
+    // the network via icnt_deliver below, so this exemption bypasses input
+    // backpressure for PTW replies. Legacy path only: active when
+    // -icnt_inter_hop_latency_ns > 0, which the ring config asserts against.
     // For everything else, respect the network input buffer (head-of-line block).
     if (mf->get_type() != TLB_FILL_REPLY && !icnt_has_buffer(p.in, p.size))
       break;
@@ -580,8 +585,9 @@ void* gpu_module::icnt_pop(unsigned output_deviceID) {
     if (mf->get_type() == TLB_FILL_REPLY) {
       unsigned chiplet_id = cluster_to_chiplet(device2cluster(output_deviceID));
       uint64_t cur = m_top->gpu_sim_cycle + m_top->gpu_tot_sim_cycle;
-      m_gmmus[chiplet_id]->done_tlb_req(mf, cur);   // 실제 도착 cycle = ring 왕복 반영
-      return nullptr;                               // SM에는 숨김
+      // cur is the true arrival cycle, so the ring round-trip is included.
+      m_gmmus[chiplet_id]->done_tlb_req(mf, cur);
+      return nullptr;   // consumed here; the SM never sees PTW replies
     }
   }
   return data;
@@ -612,7 +618,7 @@ bool gpu_module::is_remote_access(unsigned inputDeviceID,
   }
   // TLB_FILL and other control messages route through icnt;
   // chiplet routing is handled by the address itself, not by src/dst IDs.
-  return false;  //new
+  return false;
 }
 
 
@@ -622,53 +628,11 @@ unsigned gpu_module::cluster_to_chiplet(unsigned global_id) const {
 }
 
 unsigned gpu_module::mem_sub_partition_to_chiplet(unsigned global_id) const {
-  // // Always check LASP config first, regardless of policy
-  // if (m_current_lasp_config) {
-  //   lasp::scheduling_policy_t policy = m_current_lasp_config->policy;
-    
-  //   if (policy == lasp::ROW_BINDING) {
-  //     // Row-based memory allocation
-  //     unsigned row = global_id / 4;
-  //     unsigned chiplet = (row / 2) % m_n_chiplets;
-  //     // fprintf(stdout, "[LASP-MEM-ROW] global_id=%u -> chiplet=%u\n", global_id, chiplet);
-  //     fflush(stdout);
-  //     return chiplet;
-  //   } 
-  //   else if (policy == lasp::COL_BINDING) {
-  //     // Column-based memory allocation
-  //     unsigned col = global_id % 4;
-  //     unsigned chiplet = (col / 2) % m_n_chiplets;
-  //     // fprintf(stdout, "[LASP-MEM-COL] global_id=%u -> chiplet=%u\n", global_id, chiplet);
-  //     fflush(stdout);
-  //     return chiplet;
-  //   } 
-  //   else if (policy == lasp::CHUNK_BINDING) {
-  //     // Chunk-based memory allocation: distribute by CTA (not by thread ID)
-  //     // Calculate threads per CTA from current kernel's block dimension
-  //     unsigned threads_per_cta = m_current_kernel_block_dim.x * 
-  //                                 m_current_kernel_block_dim.y * 
-  //                                 m_current_kernel_block_dim.z;
-      
-  //     if (threads_per_cta == 0) threads_per_cta = 256;  // Fallback to default
-      
-  //     unsigned cta_id = global_id / threads_per_cta;
-  //     unsigned chiplet = (cta_id / m_current_lasp_config->chunk_size) % m_n_chiplets;
-  //     // fprintf(stdout, "[LASP-MEM-CHUNK] global_id=%u (CTA=%u, threads/cta=%u) -> chiplet=%u\n", 
-  //     //        global_id, cta_id, threads_per_cta, chiplet);
-  //     fflush(stdout);
-  //     return chiplet;
-  //   }
-  //   else if (policy == lasp::KERNEL_WIDE) {
-  //     //fprintf(stdout, "[LASP-MEM-DEFAULT] global_id=%u using default\n", global_id);
-  //     fflush(stdout);
-  //   }
-  // }
-
-  // Look up physical chiplet ownership from the static mapping table.
-  // This table is set in init() based on the address mapping and is the
-  // authoritative source for which chiplet owns a given sub-partition.
-  // LASP is a CTA scheduling policy and does not change physical DRAM ownership.
-  // Default behavior: use pre-computed mapping
+  // Static owner map built in init() from the contiguous split_range() split
+  // (NOT from addrdec -- see SMELL-3); authoritative for which chiplet owns a
+  // given sub-partition. LASP is a CTA scheduling policy and deliberately does
+  // not change physical DRAM ownership (an abandoned experiment that remapped
+  // ownership per LASP policy was deleted here; see git history).
   assert(global_id < m_mem_sub_partition_to_chiplet.size());
   return m_mem_sub_partition_to_chiplet[global_id];
 }

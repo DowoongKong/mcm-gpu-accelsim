@@ -72,8 +72,8 @@ class gmmu {
   // done_tlb_req() -> complete_walk(), which fills the L2 TLB.
   void cycle(uint64_t current_cycle);
 
-  // NEW: called from gpu_module::icnt_push when a TLB_FILL_REPLY is intercepted. (P3-1)
-  // Advances the PTW to the next level or completes the walk.
+  // Called from gpu_module::icnt_pop when a TLB_FILL_REPLY arrives at this
+  // chiplet. Advances the PTW to the next level or completes the walk.
   void done_tlb_req(mem_fetch* child_mf, uint64_t current_cycle);
 
   bool pwq_full() const { return m_pwq.size() >= m_pwq_max_depth; }

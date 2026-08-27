@@ -1802,9 +1802,10 @@ void gpgpu_sim::print_stats(unsigned long long streamID) {
                dram_ch_cnt[c] ? 100.0 * dram_util_sum[c] / dram_ch_cnt[c] : 0.0);
       }
     }
-    // POPGATE_ (temp): per-chiplet representative-cluster icnt-pop gating.
-    // All TLB-fill replies of a chiplet are routed to its repr cluster and
-    // popped in simt_core_cluster::icnt_cycle(), gated by the SM response FIFO.
+    // POPGATE_ (temp): per-chiplet repr-cluster icnt-pop gating. Written
+    // pre-Fix-A; with the endpoint round-robin, PTW replies spread across all
+    // clusters of the chiplet, so this row now samples only the repr cluster's
+    // share (a lower bound, not the whole chiplet's PTW gating).
     for (unsigned c = 0; c < m_gpu_module->get_num_chiplets(); c++) {
       unsigned repr = m_gpu_module->get_chiplet(c)->get_cluster_global_begin();
       unsigned long long icnt_cycles = 0, gated = 0;
