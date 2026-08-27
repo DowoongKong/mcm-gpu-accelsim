@@ -12,25 +12,26 @@ namespace lasp {
 // ============================================================================
 // Defines the CTA scheduling strategies for LASP
 //
+// Formulas below are the LIVE implementation's (simt_core_cluster::
+// issue_block2core); an earlier version of this comment had ROW/COL swapped.
+//
 // ROW_BINDING:
 //   - Same y-coordinate CTAs are assigned to the same chiplet
-//   - Use case: Row-major data access (e.g., GEMM matrix A)
-//   - Formula: chiplet_id = TB_x / (grid_x / num_chiplets)
+//   - Use case: row-major data access (e.g., GEMM matrix A)
+//   - chiplet = TB_y / ceil(grid_y / num_chiplets)   (contiguous row blocks)
 //
 // COL_BINDING:
 //   - Same x-coordinate CTAs are assigned to the same chiplet
-//   - Use case: Column-major data access (e.g., GEMM matrix B)
-//   - Formula: chiplet_id = TB_y / (grid_y / num_chiplets)
+//   - Use case: column-major data access (e.g., GEMM matrix B)
+//   - chiplet = TB_x / ceil(grid_x / num_chiplets)   (contiguous column blocks)
 //
 // CHUNK_BINDING:
-//   - CTAs are grouped by chunk_size and round-robin across chiplets
-//   - Use case: Strided/tiled data access patterns
-//   - Formula: chiplet_id = (TB_id / chunk_size) % num_chiplets
+//   - chunk_size consecutive linear CTA ids round-robin across chiplets
+//   - Use case: strided/tiled access; chunk_size=1 is plain round-robin
+//   - chiplet = (linear_TB_id / chunk_size) % num_chiplets
 //
 // KERNEL_WIDE:
-//   - Default: uniform distribution (existing behavior)
-//   - Use case: Unpredictable memory access patterns
-//   - Formula: chiplet_id = TB_id / (total_ctas / num_chiplets)
+//   - Default: NO binding; the pre-LASP issue path runs unchanged
 //
 enum scheduling_policy_t {
   ROW_BINDING = 0,

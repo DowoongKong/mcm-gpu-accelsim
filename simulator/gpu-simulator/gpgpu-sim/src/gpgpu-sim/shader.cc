@@ -5236,11 +5236,11 @@ unsigned simt_core_cluster::get_n_active_sms() const {
 unsigned simt_core_cluster::issue_block2core() {
   unsigned num_blocks_issued = 0;
   
-  // LASP: Determine preferred chiplet for CTA scheduling
+  // Pass 1: select the kernel and, when a binding policy is active (LASP or
+  // STATIC_BINDING), compute the next CTA's home chiplet.
   unsigned preferred_chiplet = (unsigned)-1;
   kernel_info_t *selected_kernel = NULL;
-  
-  // First pass: select kernel and determine preferred chiplet
+
   for (unsigned i = 0; i < m_config->n_simt_cores_per_cluster; i++) {
     unsigned core =
         (i + m_cta_issue_next_core + 1) % m_config->n_simt_cores_per_cluster;
@@ -5312,17 +5312,15 @@ unsigned simt_core_cluster::issue_block2core() {
     }
   }
   
-  // Second pass: issue ONLY to preferred chiplet (strict affinity enforcement)
+  // Second pass: issue ONLY to the preferred chiplet (strict affinity).
   if (preferred_chiplet != (unsigned)-1 && selected_kernel) {
-    // Get actual number of chiplets from config
     unsigned n_chiplets = m_gpu->get_gpu_module()->get_num_chiplets();
     unsigned clusters_per_chiplet = m_config->n_simt_clusters / n_chiplets;
     unsigned chiplet_start_cluster = preferred_chiplet * clusters_per_chiplet;
     unsigned chiplet_end_cluster = chiplet_start_cluster + clusters_per_chiplet;
     
-    // Check if current cluster matches preferred chiplet
     if (m_cluster_id >= chiplet_start_cluster && m_cluster_id < chiplet_end_cluster) {
-      // We're in the preferred chiplet, try to issue
+      // This cluster belongs to the preferred chiplet: try to issue.
       for (unsigned i = 0; i < m_config->n_simt_cores_per_cluster; i++) {
         unsigned core =
             (i + m_cta_issue_next_core + 1) % m_config->n_simt_cores_per_cluster;
@@ -5339,14 +5337,14 @@ unsigned simt_core_cluster::issue_block2core() {
         }
       }
     }
-    // If NOT in preferred chiplet, do NOT issue - wait for preferred cluster
-    // This enforces strict data locality
+    // Not the preferred chiplet: refuse to issue (strict affinity -- the CTA
+    // waits for its home chiplet rather than spilling; see CTA_SCHED_STATIC_BINDING).
     if (m_cluster_id < chiplet_start_cluster || m_cluster_id >= chiplet_end_cluster) {
-      return 0;  // Don't issue - enforce affinity
+      return 0;
     }
   }
   
-  // Fallback: only if NO LASP policy is active
+  // No binding decided (LASP off and not STATIC_BINDING): original issue loop.
   if (preferred_chiplet == (unsigned)-1) {
   for (unsigned i = 0; i < m_config->n_simt_cores_per_cluster; i++) {
     unsigned core =
@@ -5375,7 +5373,7 @@ unsigned simt_core_cluster::issue_block2core() {
       break;
     }
   }
-  }  // Close the if (preferred_chiplet == (unsigned)-1) block
+  }
   return num_blocks_issued;
 }
 
