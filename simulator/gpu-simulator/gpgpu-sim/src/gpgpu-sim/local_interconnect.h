@@ -47,10 +47,10 @@ struct inct_config {
   Arbiteration_type arbiter_algo;
   unsigned verbose;
   unsigned grant_cycles;
-  unsigned use_ring;   // ADD: 1 = inter-chiplet ring, 0 = direct handoff (Phase 1)
-  unsigned ring_buf;   // ADD: ring per-link / eject buffer depth (packets)
-  unsigned ring_hop_latency;  // ADD(P3): ring per-hop latency in cycles (paper: 32)
-  unsigned ring_link_width;  // ADD(P4): flits drained per cycle per link (BW = LW * flit * freq)
+  unsigned use_ring;   // 1 = inter-chiplet ring, 0 = direct handoff
+  unsigned ring_buf;   // ring per-link / eject buffer depth (packets)
+  unsigned ring_hop_latency;  // ring per-hop latency in cycles (paper: 32)
+  unsigned ring_link_width;  // flits drained per cycle per link (BW = LW * flit * freq)
   unsigned xbar_port_width;  // intra-chiplet xbar: flits drained per cycle per OUTPUT port
                              // (per-port BW = xbar_port_width * flit_size * icnt_freq).
 };
@@ -61,7 +61,7 @@ class xbar_router {
               unsigned n_shader, unsigned n_mem,
               const struct inct_config& m_localinct_config,
               unsigned n_icp = 0,
-              bool inter_via_ring = false);  // ADD(P3): true -> xbar uses LOCAL flit size only
+              bool inter_via_ring = false);  // true -> xbar uses LOCAL flit size only
   ~xbar_router();
   void Push(unsigned input_deviceID, unsigned output_deviceID, void* data,
             unsigned int size);
@@ -113,12 +113,12 @@ class xbar_router {
     Packet(void* m_data, unsigned m_output_deviceID, unsigned m_flits) {
       data = m_data;
       output_deviceID = m_output_deviceID;
-      remaining_flits = m_flits; // minseong
+      remaining_flits = m_flits;
     }
 
     void* data;
     unsigned output_deviceID;
-    unsigned remaining_flits; // minseong
+    unsigned remaining_flits;
   };
   // 44-1: FIFO with an O(1) running total of remaining_flits. queue_flits()
   // used to COPY the whole std::queue and walk it on every Has_Buffer_* call
@@ -168,10 +168,9 @@ class xbar_router {
   unsigned m_port_width;  // flits drained per cycle per OUTPUT port (>=1). Sets the
                           // per-port intra-chiplet BW = m_port_width * flit * icnt_freq.
   unsigned _n_icp;  // number of inter-chiplet ports on this router (0 or 1)
-  bool m_inter_via_ring;  // ADD(P3): when true, do NOT inflate remote flits (ring owns inter BW)
+  bool m_inter_via_ring;  // when true, do NOT inflate remote flits (ring owns inter BW)
 
  public:
-  // minseong
   unsigned queue_flits(const flit_queue& q) const;  // 44-1: O(1)
   
   friend class LocalInterconnect;
@@ -306,7 +305,7 @@ class ring_net {
                    unsigned long long enter_link, enter_wire; /*BUCKET_*/
                    unsigned long long t_bw_sum, t_ej_sum;     /*BUCKET_*/ };
   unsigned N, m_buf, m_hop_latency;
-  unsigned m_link_width;  // ADD(P4): flits/cycle per link
+  unsigned m_link_width;  // flits/cycle per link
   unsigned long long m_cycle;
   mutable unsigned m_tie_rr = 0;  // round-robin cursor for equidistant direction split
   std::vector<std::vector<std::queue<RingPkt> > > link;  // bandwidth stage [node][dir]
@@ -374,9 +373,9 @@ class LocalInterconnect {
   std::vector<unsigned> m_n_local_cluster;  // [n_chiplets] cluster count per chiplet
   std::vector<unsigned> m_n_local_mem;      // [n_chiplets] mem-sub count per chiplet
 
-  bool m_use_ring = false;                 // ADD: ring vs Phase-1 direct handoff
-  std::vector<ring_net*> m_ring;           // ADD: one ring per subnet (when m_use_ring)
-  void handoff_ring();                     // ADD: ICP egress<->ring<->ICP ingress
+  bool m_use_ring = false;                 // ring vs Phase-1 direct handoff
+  std::vector<ring_net*> m_ring;           // one ring per subnet (when m_use_ring)
+  void handoff_ring();                     // ICP egress<->ring<->ICP ingress
 
   // RINGINJ_ (temp): per-(subnet,src chiplet) source-side ring egress accounting.
   // egress_busy: cycles the icp egress had >=1 packet pending at handoff time.
