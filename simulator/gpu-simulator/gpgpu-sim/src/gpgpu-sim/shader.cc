@@ -3324,14 +3324,14 @@ void ldst_unit::cycle_b() {
         l1_tlb_mshr::l1_fill_token tok = cmshr.next_access();
         if (m_decouple_tlb)
           for (unsigned w : tok.waiters) {
-            if (m_xlat_parked_4k.count(w)) m_xlat_replay_q_4k.push_back(w);
+            if (m_xlat_parked.count(w)) m_xlat_replay_q.push_back(w);
             else                           m_xlat_wake_pending.insert(w);  // don't drop; deliver on re-park
           }
       }
       // P5: wake parked warps whose lookup resolved to a cached HIT (no MSHR entry).
       unsigned hit_w;
       while (l1_tlb->pop_hit_wakeup(hit_w)) {
-        if (m_xlat_parked_4k.count(hit_w)) m_xlat_replay_q_4k.push_back(hit_w);
+        if (m_xlat_parked.count(hit_w)) m_xlat_replay_q.push_back(hit_w);
         else                               m_xlat_wake_pending.insert(hit_w);  // don't drop; deliver on re-park
       }
       // Drain L1->L2 request queue (P3): send one queued miss to L2 per cycle.
@@ -3422,7 +3422,7 @@ void ldst_unit::cycle_c() {
   // what the scheduler handed this unit, and the stall would read as zero.
   {
     m_xlatlat_cycles++;
-    const unsigned parked = (unsigned)m_xlat_parked_4k.size();
+    const unsigned parked = (unsigned)m_xlat_parked.size();
     if (parked) {
       m_xlatlat_parked_cycles++;
       m_xlatlat_parked_sum += parked;
@@ -3436,19 +3436,19 @@ void ldst_unit::cycle_c() {
   // replay a completed translation before processing (replay-first).
   // D-PROBE: a closed gate with parked warps is the state that silences both
   // wakeup paths. Count it before the branches so the dump can prove it.
-  if (!m_dispatch_reg->empty() && !m_xlat_parked_4k.empty())
+  if (!m_dispatch_reg->empty() && !m_xlat_parked.empty())
     m_dprobe_gate_closed_cycles++;
-  if (m_dispatch_reg->empty() && !m_xlat_replay_q_4k.empty()) {
+  if (m_dispatch_reg->empty() && !m_xlat_replay_q.empty()) {
     m_dprobe_replay_fires++;
-    unsigned w = m_xlat_replay_q_4k.front(); m_xlat_replay_q_4k.pop_front();
+    unsigned w = m_xlat_replay_q.front(); m_xlat_replay_q.pop_front();
     // defensive: only dispatch if actually parked. A stale/duplicate replay id
     // (warp already dispatched) would otherwise default-construct a garbage
     // inst via operator[].
-    auto it = m_xlat_parked_4k.find(w);
-    if (it != m_xlat_parked_4k.end() && !it->second.empty()) {
+    auto it = m_xlat_parked.find(w);
+    if (it != m_xlat_parked.end() && !it->second.empty()) {
       *m_dispatch_reg = std::move(it->second.front());
       it->second.pop_front();
-      if (it->second.empty()) m_xlat_parked_4k.erase(it);
+      if (it->second.empty()) m_xlat_parked.erase(it);
     }
   }
   // SAFETY NET (level-triggered replay): nothing queued for replay but parked
@@ -3458,24 +3458,24 @@ void ldst_unit::cycle_c() {
   // otherwise-idle dispatch slots (no cache/mem activity) and never re-injects
   // duplicate lookups. With the persistent-wakeup fix above this should be rare.
   else if (m_decouple_tlb && m_dispatch_reg->empty() &&
-           !m_xlat_parked_4k.empty()) {
+           !m_xlat_parked.empty()) {
     // Option 3: take the oldest parked warp instead of an arbitrary bucket.
     // Stale ids (already served through the replay queue) are skipped.
     m_dprobe_safetynet_fires++;
     m_dprobe_safetynet_last_cycle =
         m_core->get_gpu()->gpu_sim_cycle + m_core->get_gpu()->gpu_tot_sim_cycle;
-    auto it = m_xlat_parked_4k.end();
+    auto it = m_xlat_parked.end();
     while (!m_xlat_park_order.empty()) {
       const unsigned cand = m_xlat_park_order.front();
       m_xlat_park_order.pop_front();
-      it = m_xlat_parked_4k.find(cand);
-      if (it != m_xlat_parked_4k.end() && !it->second.empty()) break;
-      it = m_xlat_parked_4k.end();
+      it = m_xlat_parked.find(cand);
+      if (it != m_xlat_parked.end() && !it->second.empty()) break;
+      it = m_xlat_parked.end();
     }
-    if (it != m_xlat_parked_4k.end()) {
+    if (it != m_xlat_parked.end()) {
       *m_dispatch_reg = std::move(it->second.front());
       it->second.pop_front();
-      if (it->second.empty()) m_xlat_parked_4k.erase(it);
+      if (it->second.empty()) m_xlat_parked.erase(it);
     }
   }
 
@@ -3491,14 +3491,14 @@ void ldst_unit::cycle_c() {
 
   if (m_dispatch_parked) {                 // set-aside, free the dispatch reg
     unsigned w = pipe_reg.warp_id();
-    m_xlat_parked_4k[w].push_back(std::move(pipe_reg));  // cleared right below
+    m_xlat_parked[w].push_back(std::move(pipe_reg));  // cleared right below
     m_xlat_park_order.push_back(w);   // Option 3: serve in park order
     m_dispatch_reg->clear();
     m_dispatch_parked = false;
     // A fill/wakeup that landed while this warp was momentarily unparked was
     // stashed in m_xlat_wake_pending; deliver it now so the warp replays next
     // cycle (deterministic, cycle-accurate) instead of relying on the backstop.
-    if (m_xlat_wake_pending.erase(w)) m_xlat_replay_q_4k.push_back(w);
+    if (m_xlat_wake_pending.erase(w)) m_xlat_replay_q.push_back(w);
     return;   // do NOT complete / release regs / dec_inst_in_pipeline
   }
 
@@ -5811,10 +5811,10 @@ void ldst_unit::xlat_print_stats(FILE* fp, unsigned sid) const {
 
 void ldst_unit::xlatdbg_dump_parked(FILE* fp, unsigned sid) const {
   size_t n = 0;
-  for (const auto& kv : m_xlat_parked_4k) n += kv.second.size();
+  for (const auto& kv : m_xlat_parked) n += kv.second.size();
   if (n) {
     fprintf(fp, "XLATDBG_DEADLOCK:   sm=%u parked_warps=%zu insts=%zu order_q=%zu\n",
-            sid, m_xlat_parked_4k.size(), n, m_xlat_park_order.size());
+            sid, m_xlat_parked.size(), n, m_xlat_park_order.size());
     // D-PROBE: distinguish "gate closed" (D1) from "park-order exhausted" (D2).
     fprintf(fp, "XLATDBG_DEADLOCK:   sm=%u DPROBE dispatch_empty=%d dispatch_wid=%d "
                 "dispatch_pc=0x%x replay_q=%zu last_rc_fail=%d "
@@ -5823,10 +5823,10 @@ void ldst_unit::xlatdbg_dump_parked(FILE* fp, unsigned sid) const {
             sid, m_dispatch_reg->empty() ? 1 : 0,
             m_dispatch_reg->empty() ? -1 : (int)m_dispatch_reg->warp_id(),
             m_dispatch_reg->empty() ? 0u : m_dispatch_reg->pc,
-            m_xlat_replay_q_4k.size(), (int)m_mem_rc,
+            m_xlat_replay_q.size(), (int)m_mem_rc,
             m_dprobe_replay_fires, m_dprobe_safetynet_fires,
             m_dprobe_safetynet_last_cycle, m_dprobe_gate_closed_cycles);
-    for (const auto& kv : m_xlat_parked_4k)
+    for (const auto& kv : m_xlat_parked)
       if (!kv.second.empty())
         fprintf(fp, "XLATDBG_DEADLOCK:     wid=%u parked=%zu pc=0x%x\n",
                 kv.first, kv.second.size(), kv.second.front().pc);

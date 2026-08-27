@@ -98,7 +98,7 @@ gpu_l1_tlb::gpu_l1_tlb(unsigned num_sets, unsigned assoc,
       m_mshr(mshr_entries, mshr_max_merge),
       m_hits(0), m_misses(0), m_mshr_hits(0) {
   m_sets.resize(num_sets, std::vector<l1_tlb_entry_t>(assoc, {false, 0, {0}, 0}));
-  m_lookup_pipe_4k.assign(m_lookup_latency, {});
+  m_lookup_pipe.assign(m_lookup_latency, {});
 }
 
 int gpu_l1_tlb::find_way(unsigned sidx, uint64_t vpn) const {
@@ -166,10 +166,10 @@ gpu_l1_tlb::result_t gpu_l1_tlb::access(uint64_t va, unsigned warp_id,
   }
   // (2) Lookup already in the pipe (this request injected): wait, no re-inject.
   //     Idempotent: a re-poll never re-acquires a port or restarts the timer.
-  if (m_inflight_lookup_4k.count(rid)) return LOOKUP_PENDING;
+  if (m_inflight_lookup.count(rid)) return LOOKUP_PENDING;
   // (2b) Finite lookup ports. Nothing is injected and no resource is held, so the
   //      caller simply retries -- this is a bandwidth limit, not a stall record.
-  if (m_n_ports && m_inflight_lookup_4k.size() >= m_n_ports) {
+  if (m_n_ports && m_inflight_lookup.size() >= m_n_ports) {
     m_port_busy_stalls++;
     // XLATLAT: the only path where t0 < t1. Poll COUNT, not cycles.
     xlat_req_rec_t &rec = m_xlat_rec[rid];
@@ -178,10 +178,10 @@ gpu_l1_tlb::result_t gpu_l1_tlb::access(uint64_t va, unsigned warp_id,
     return PORT_BUSY;
   }
   // (3) New: inject at the pipe tail (head reached after lookup_latency cycles).
-  m_inflight_lookup_4k.insert(rid);
-  if (m_inflight_lookup_4k.size() > m_concurrent_max)
-    m_concurrent_max = (unsigned)m_inflight_lookup_4k.size();
-  m_lookup_pipe_4k[m_lookup_latency - 1].push_back({true, rid, vpn_val, warp_id});
+  m_inflight_lookup.insert(rid);
+  if (m_inflight_lookup.size() > m_concurrent_max)
+    m_concurrent_max = (unsigned)m_inflight_lookup.size();
+  m_lookup_pipe[m_lookup_latency - 1].push_back({true, rid, vpn_val, warp_id});
   // XLATLAT: t1, and t0 as well when the port was free on the first call (the
   // common case -- nothing else can consume a cycle before the injection).
   // Reaching here a second time means block (1) found a stale classification and
@@ -248,7 +248,7 @@ void gpu_l1_tlb::cycle(uint64_t cur) {
   std::vector<mshr_wait_ent> this_cycle_blocked;  // 36a: see ORDER note below
   // 36a helper: shared success bookkeeping (identical to the old resolved path).
   auto on_resolved = [&](const lookup_slot &head) {
-    m_inflight_lookup_4k.erase(head.rid);
+    m_inflight_lookup.erase(head.rid);
     auto it = m_resv_fail_start.find(head.rid);
     if (it != m_resv_fail_start.end()) {
       m_resv_fail_cycles += (cur - it->second);
@@ -260,7 +260,7 @@ void gpu_l1_tlb::cycle(uint64_t cur) {
       m_resv_fail_start.erase(it);
     }
   };
-  for (lookup_slot &head : m_lookup_pipe_4k[0]) {
+  for (lookup_slot &head : m_lookup_pipe[0]) {
     if (!head.valid) continue;
     bool resolved = resolve_lookup(head, cur);
     if (resolved) {
@@ -282,8 +282,8 @@ void gpu_l1_tlb::cycle(uint64_t cur) {
   for (auto it = this_cycle_blocked.rbegin(); it != this_cycle_blocked.rend(); ++it)
     m_mshr_wait_q.push_front(*it);
   for (unsigned s = 0; s + 1 < m_lookup_latency; ++s)
-    m_lookup_pipe_4k[s] = std::move(m_lookup_pipe_4k[s + 1]);
-  m_lookup_pipe_4k[m_lookup_latency - 1].clear();
+    m_lookup_pipe[s] = std::move(m_lookup_pipe[s + 1]);
+  m_lookup_pipe[m_lookup_latency - 1].clear();
   // Q6 fix (kept): an MSHR-full is not a failed probe; the blocked request
   // retries without re-paying m_lookup_latency. 36a changes only WHEN the
   // retry runs: the resolve verdict is a pure function of (array, MSHR)
@@ -322,16 +322,16 @@ void gpu_l1_tlb::cycle(uint64_t cur) {
 
 
 bool gpu_l1_tlb::l2_req_front(uint64_t &vpn_out) const {
-  if (m_l2_req_queue_4k.empty()) return false;
-  vpn_out = m_l2_req_queue_4k.front().vpn;
+  if (m_l2_req_queue.empty()) return false;
+  vpn_out = m_l2_req_queue.front().vpn;
   return true;
 }
-void gpu_l1_tlb::l2_req_pop() { m_l2_req_queue_4k.pop_front(); }
+void gpu_l1_tlb::l2_req_pop() { m_l2_req_queue.pop_front(); }
 
 bool gpu_l1_tlb::pop_hit_wakeup(unsigned &warp_id) {
-  if (m_hit_wakeup_4k.empty()) return false;
-  warp_id = m_hit_wakeup_4k.back();
-  m_hit_wakeup_4k.pop_back();
+  if (m_hit_wakeup.empty()) return false;
+  warp_id = m_hit_wakeup.back();
+  m_hit_wakeup.pop_back();
   return true;
 }
 
@@ -348,7 +348,7 @@ bool gpu_l1_tlb::resolve_lookup(const lookup_slot &s, uint64_t cur) {
     m_sets[sidx][way].lru_time = cur;
     m_resolved[s.rid] = HIT;                   // m_hits counted by access() block (1)
     m_resolve_epoch++;                         // 44-5: not covered by fill/MSHR epochs
-    m_hit_wakeup_4k.push_back(s.warp_id);      // P5: wake parked warp (no MSHR entry)
+    m_hit_wakeup.push_back(s.warp_id);      // P5: wake parked warp (no MSHR entry)
     if (xr != m_xlat_rec.end()) {
       xr->second.t_l1_resolve = cur;
       // The page is already in the array, so there is nothing to wait for: t8
@@ -378,9 +378,9 @@ bool gpu_l1_tlb::resolve_lookup(const lookup_slot &s, uint64_t cur) {
     xr->second.t_l1_resolve = cur;
     xr->second.bucket = XLAT_B_PTW;
   }
-  m_l2_req_queue_4k.push_back({s.vpn, s.warp_id, cur, 0, 0, false});  // hand off to L2 fifo (44-3/4: poll now)
-  if (m_l2_req_queue_4k.size() > m_l2_req_q_max)
-    m_l2_req_q_max = (unsigned)m_l2_req_queue_4k.size();
+  m_l2_req_queue.push_back({s.vpn, s.warp_id, cur, 0, 0, false});  // hand off to L2 fifo (44-3/4: poll now)
+  if (m_l2_req_queue.size() > m_l2_req_q_max)
+    m_l2_req_q_max = (unsigned)m_l2_req_queue.size();
   m_misses++;
   // Subsequent polls of this same (warp,vpn) request return MSHR_HIT: its
   // L2 request is in flight and the fill will complete it.
@@ -773,25 +773,25 @@ void gpu_l2_tlb::print_stats(FILE* f) const {
 }
 
 // XLATDBG: the decoupled L1 TLB's in-flight bookkeeping. A request sits in
-// m_inflight_lookup_4k from the moment it is injected until its fill arrives, so
+// m_inflight_lookup from the moment it is injected until its fill arrives, so
 // a non-empty set with an empty pipe means the fill never came back.
 void gpu_l1_tlb::xlatdbg_dump(FILE* fp, unsigned sid, const char* tag) const {
   size_t pipe = 0;
-  for (const auto& stage : m_lookup_pipe_4k) pipe += stage.size();
-  if (pipe == 0 && m_inflight_lookup_4k.empty() && m_resolved.empty() &&
-      m_l2_req_queue_4k.empty() && m_mshr.size() == 0)
+  for (const auto& stage : m_lookup_pipe) pipe += stage.size();
+  if (pipe == 0 && m_inflight_lookup.empty() && m_resolved.empty() &&
+      m_l2_req_queue.empty() && m_mshr.size() == 0)
     return;   // nothing outstanding: stay quiet so the dump stays readable
   fprintf(fp, "XLATDBG_DEADLOCK:   sm=%u tlb=%s pipe=%zu inflight=%zu resolved=%zu "
               "l2_req_q=%zu mshr_entries=%u",
-          sid, tag, pipe, m_inflight_lookup_4k.size(), m_resolved.size(),
-          m_l2_req_queue_4k.size(), m_mshr.size());
+          sid, tag, pipe, m_inflight_lookup.size(), m_resolved.size(),
+          m_l2_req_queue.size(), m_mshr.size());
   // The queue is FIFO and only the front is retried, so the front request is the
   // one that must be unblocked -- everything behind it is head-of-line blocked.
-  if (!m_l2_req_queue_4k.empty())
+  if (!m_l2_req_queue.empty())
     fprintf(fp, " front_vpn=0x%llx front_warp=%u queued_at=%llu",
-            (unsigned long long)m_l2_req_queue_4k.front().vpn,
-            m_l2_req_queue_4k.front().warp_id,
-            (unsigned long long)m_l2_req_queue_4k.front().enqueue_cycle);
+            (unsigned long long)m_l2_req_queue.front().vpn,
+            m_l2_req_queue.front().warp_id,
+            (unsigned long long)m_l2_req_queue.front().enqueue_cycle);
   fprintf(fp, "\n");
 }
 

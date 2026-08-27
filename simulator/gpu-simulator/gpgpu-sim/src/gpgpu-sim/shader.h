@@ -1440,7 +1440,7 @@ class ldst_unit : public pipelined_simd_unit {
         return false;
     }
     // Option 1: the unit-wide replay reservation used to live here --
-    //     if (m_decouple_tlb && !m_xlat_replay_q_4k.empty()) return false;
+    //     if (m_decouple_tlb && !m_xlat_replay_q.empty()) return false;
     // It is unnecessary. Replay only fills m_dispatch_reg when that register is
     // empty, ldst_unit::cycle() (execute) runs before issue() within a core
     // cycle, and the check below already refuses an issue once the dispatch
@@ -1543,10 +1543,10 @@ class ldst_unit : public pipelined_simd_unit {
   // XLATLAT: how much of the SM's memory issue capacity translation is holding.
   void xlat_print_stats(FILE* fp, unsigned sid) const;
  private:
-  std::unordered_map<unsigned, std::deque<warp_inst_t>> m_xlat_parked_4k;
-  std::deque<unsigned> m_xlat_replay_q_4k;                     // ready to replay
+  std::unordered_map<unsigned, std::deque<warp_inst_t>> m_xlat_parked;
+  std::deque<unsigned> m_xlat_replay_q;                     // ready to replay
   // Option 3: FIFO of parked warps, used by the SAFETY NET. Picking
-  // m_xlat_parked_4k.begin() serves warps in unordered_map bucket order, which
+  // m_xlat_parked.begin() serves warps in unordered_map bucket order, which
   // has no fairness -- a warp can be pushed back indefinitely. Measured park
   // residency was avg 1,632 / max 12,614 cycles against a 10-cycle probe
   // latency, i.e. the wait was queueing, not probing.
@@ -1578,7 +1578,7 @@ class ldst_unit : public pipelined_simd_unit {
   // per-warp translation table for the CURRENT outstanding mem instruction:
   //   warp_id -> (vpn -> pte). One TLB lookup per distinct page; the PFN fans
   //   out to every same-page mem_fetch. Cleared when the instruction's accessq
-  //   drains. (Assumes <=1 outstanding mem inst per warp, like m_xlat_parked_4k.)
+  //   drains. (Assumes <=1 outstanding mem inst per warp, like m_xlat_parked.)
   std::unordered_map<unsigned, std::unordered_map<uint64_t, gpu_pte_t>> m_xlat_table_4k;
   // 44-5: wid -> {L1 TLB change-epoch sum at the end of the last Phase-1 scan,
   // the instruction uid it belonged to}. While the epoch stands still the whole

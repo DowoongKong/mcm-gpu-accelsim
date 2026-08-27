@@ -144,14 +144,14 @@ class gpu_l1_tlb {
     unsigned long long h = 1469598103934665603ull;
     auto mix = [&h](unsigned long long v) { h ^= v; h *= 1099511628211ull; };
     mix(m_hits); mix(m_misses);
-    mix(m_inflight_lookup_4k.size()); mix(m_resolved.size());
-    mix(m_l2_req_queue_4k.size()); mix(m_mshr.size());
+    mix(m_inflight_lookup.size()); mix(m_resolved.size());
+    mix(m_l2_req_queue.size()); mix(m_mshr.size());
     unsigned long long tag_sum = 0, valid = 0;
     for (const auto &set : m_sets)
       for (const auto &e : set) if (e.valid) { valid++; tag_sum += e.vpn; }
     mix(valid); mix(tag_sum);
     unsigned long long pipe = 0;
-    for (const auto &stage : m_lookup_pipe_4k) pipe += stage.size();
+    for (const auto &stage : m_lookup_pipe) pipe += stage.size();
     mix(pipe);
     return h;
   }
@@ -202,18 +202,18 @@ class gpu_l1_tlb {
   }
   unsigned ports() const { return m_n_ports; }
  private:
-  // NOTE on the _4k suffixes below (findings.ko.md SMELL-10): historical names.
-  // Every gpu_l1_tlb INSTANCE (4k, 64k and 2m alike) uses these members for its
-  // own page size; nothing here is 4KB-specific. Index = remaining latency stage.
-  std::vector<std::vector<lookup_slot>> m_lookup_pipe_4k;
+  // Per-instance lookup pipe (each gpu_l1_tlb instance serves one page size).
+  // Index = remaining latency stage. (SMELL-10: the historical _4k suffixes on
+  // these members were dropped in the audit fix pass.)
+  std::vector<std::vector<lookup_slot>> m_lookup_pipe;
   // Lookup ports: cap on how many probes may sit in the pipe at once.
-  // 0 = unlimited (pre-existing behaviour). m_inflight_lookup_4k IS the
+  // 0 = unlimited (pre-existing behaviour). m_inflight_lookup IS the
   // occupancy set, so there is no second counter to drift out of sync.
   unsigned m_n_ports = 0;
   unsigned long long m_port_busy_stalls = 0;
   unsigned m_concurrent_max = 0;
   unsigned m_l2_req_q_max = 0;
-  std::unordered_set<uint64_t> m_inflight_lookup_4k;  // rid: prevent re-injection (re-poll idempotent)
+  std::unordered_set<uint64_t> m_inflight_lookup;  // rid: prevent re-injection (re-poll idempotent)
   std::unordered_map<uint64_t, result_t> m_resolved;  // rid -> MISS / MSHR_HIT (awaiting fill)
 
   unsigned long long m_hits;
@@ -261,17 +261,17 @@ class gpu_l1_tlb {
   // verdict was charging (merge cap vs table full) for exact synthesis.
   struct l1_tlb_req { uint64_t vpn; unsigned warp_id; uint64_t enqueue_cycle;
                       uint64_t next_poll; uint64_t wait_epoch; bool wait_merge; };
-  std::deque<l1_tlb_req> m_l2_req_queue_4k;   // cache: m_miss_queue
-  std::vector<unsigned>  m_hit_wakeup_4k;     // P5: parked warps resolved to HIT
+  std::deque<l1_tlb_req> m_l2_req_queue;   // cache: m_miss_queue
+  std::vector<unsigned>  m_hit_wakeup;     // P5: parked warps resolved to HIT
 
  public:
   // Iterate the pending-to-L2 queue. The drain must be able to issue past a
   // request the L2 is still probing, so head-only access is not enough.
   // (Declared here because it names l1_tlb_req, defined just above.)
   typedef std::deque<l1_tlb_req>::iterator l2_req_iter;
-  l2_req_iter l2_req_begin() { return m_l2_req_queue_4k.begin(); }
-  l2_req_iter l2_req_end()   { return m_l2_req_queue_4k.end(); }
-  l2_req_iter l2_req_erase(l2_req_iter it) { return m_l2_req_queue_4k.erase(it); }
+  l2_req_iter l2_req_begin() { return m_l2_req_queue.begin(); }
+  l2_req_iter l2_req_end()   { return m_l2_req_queue.end(); }
+  l2_req_iter l2_req_erase(l2_req_iter it) { return m_l2_req_queue.erase(it); }
 };
 
 //  L2 TLB MSHR entry
