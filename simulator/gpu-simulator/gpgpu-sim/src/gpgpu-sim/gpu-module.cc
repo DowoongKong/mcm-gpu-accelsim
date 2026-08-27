@@ -132,6 +132,13 @@ void gpu_module::init() {
   // P-6: cache the uniform page shift (config is final by now). See the member
   // comment; page_shift_for_va() uses it as an O(1) fast path.
   m_uniform_shift = uniform_page_shift();
+  // SMELL-5: the ACCELSIM_DIAG per-chiplet arrays (g_memfull_*, NORMREP) are
+  // statically sized for 8 chiplets; beyond that their rows are silently
+  // dropped. Warn once rather than abort -- only diagnostics are affected.
+  if (m_n_chiplets > 8)
+    fprintf(stderr,
+            "WARNING: >8 chiplets -- ACCELSIM_DIAG per-chiplet diagnostics "
+            "beyond chiplet 7 are dropped (findings SMELL-5).\n");
 
   // Build owner maps.
   m_cluster_to_chiplet.assign(m_n_clusters, 0);
@@ -327,18 +334,18 @@ void gpu_module::init() {
            m_top->get_config().get_l2_tlb_2m_mshr_entries());
   }
   
-  // inter-chiplet one-way latency: ns -> core cycles (round). 0 keeps legacy behavior.
-  {
-    unsigned long long ns  = m_top->get_config().get_icnt_inter_hop_latency_ns();
-    unsigned long long fhz = m_top->get_config().get_core_freq();   // Hz (e.g. 1.132e9)
-    m_inter_hop_cycles = (unsigned)((ns * fhz + 500000000ULL) / 1000000000ULL);
-    // P3: ring and the legacy fixed-latency delay queue must not both add inter
-    // latency. When the ring is on, set -icnt_inter_hop_latency_ns 0.
-    assert(!(icnt_ring_enabled() && m_n_chiplets > 1 && m_inter_hop_cycles > 0) &&
-          "ring + m_inter_delay_q both active: inter latency double-counted; "
-          "set -icnt_inter_hop_latency_ns 0 when -icnt_use_ring 1");
-    printf("[ICNT] inter-chiplet one-way latency = %llu ns = %u core cycles\n",
-           ns, m_inter_hop_cycles);
+  // C-4: the legacy fixed-latency inter-chiplet delay queue is gone. The
+  // option is still parsed for config compatibility (every current config sets
+  // it to 0) but a nonzero value now fails loudly instead of silently doing
+  // nothing.
+  if (m_top->get_config().get_icnt_inter_hop_latency_ns() != 0) {
+    fprintf(stderr,
+            "\nFATAL: -icnt_inter_hop_latency_ns is no longer modeled (the "
+            "legacy inter-chiplet\n       delay queue was removed). Model "
+            "inter-chiplet latency with the ring:\n       -icnt_use_ring 1 "
+            "-icnt_ring_hop_latency <cycles>.\n");
+    fflush(stderr);
+    abort();
   }
 
   #ifdef ADDR_XLAT_VERIFY
@@ -478,45 +485,10 @@ void gpu_module::icnt_deliver(unsigned input_deviceID,
 
 void gpu_module::icnt_push(unsigned input_deviceID, unsigned output_deviceID,
                            void* data, unsigned int size) {
-  mem_fetch* mf = static_cast<mem_fetch*>(data);
-  if (m_inter_hop_cycles > 0 && is_inter_chiplet_xing(input_deviceID, output_deviceID, mf)) {
-    uint64_t now = m_top->gpu_sim_cycle + m_top->gpu_tot_sim_cycle;
-    m_inter_delay_q.push({input_deviceID, output_deviceID, size, data,
-                          now + m_inter_hop_cycles});
-    return;                          // held on the inter-chiplet link; delivered later
-  }
-  icnt_deliver(input_deviceID, output_deviceID, data, size);   // local or latency off
-}
-
-bool gpu_module::is_inter_chiplet_xing(unsigned in, unsigned out, mem_fetch* mf) const {
-  switch (mf->get_type()) {
-    case READ_REQUEST: case WRITE_REQUEST: case TLB_FILL_ACC:   // cluster -> mem
-      return cluster_to_chiplet(device2cluster(in)) !=
-             mem_sub_partition_to_chiplet(device2mem(out));
-    case READ_REPLY: case WRITE_ACK: case TLB_FILL_REPLY:       // mem -> cluster
-      return mem_sub_partition_to_chiplet(device2mem(in)) !=
-             cluster_to_chiplet(device2cluster(out));
-    default:
-      return false;
-  }
-}
-
-void gpu_module::advance_inter_chiplet(uint64_t now) {
-  while (!m_inter_delay_q.empty() && m_inter_delay_q.front().release <= now) {
-    delayed_pkt_t p = m_inter_delay_q.front();
-    mem_fetch* mf = static_cast<mem_fetch*>(p.data);
-    // TLB_FILL_REPLY is exempted from the input-buffer check: it is consumed
-    // at the destination pop (gpu_module::icnt_pop -> done_tlb_req), never by
-    // the SM response FIFO. NOTE (findings.ko.md SMELL-11): it still enters
-    // the network via icnt_deliver below, so this exemption bypasses input
-    // backpressure for PTW replies. Legacy path only: active when
-    // -icnt_inter_hop_latency_ns > 0, which the ring config asserts against.
-    // For everything else, respect the network input buffer (head-of-line block).
-    if (mf->get_type() != TLB_FILL_REPLY && !icnt_has_buffer(p.in, p.size))
-      break;
-    m_inter_delay_q.pop();
-    icnt_deliver(p.in, p.out, p.data, p.size);
-  }
+  // C-4: direct delivery. The legacy fixed-latency delay queue that used to
+  // sit here (SMELL-11: it also exempted PTW replies from input backpressure)
+  // was removed; the ring owns all inter-chiplet latency and bandwidth.
+  icnt_deliver(input_deviceID, output_deviceID, data, size);
 }
 
 // P5: L2 TLB request from shader core. Returns true if request is accepted (either hit or MSHR allocated).

@@ -492,8 +492,6 @@ class gpu_module {
   // Hooking push and pop
   void icnt_push(unsigned input_deviceID, unsigned output_deviceID,
                  void* data, unsigned int size);
-  // Drain inter-chiplet delay queue; call once per ICNT cycle.
-  void advance_inter_chiplet(uint64_t now);
   void* icnt_pop(unsigned output_deviceID);
   
   // Set stats file for logging MCM access
@@ -670,19 +668,11 @@ class gpu_module {
   unsigned m_uniform_shift = 0;
   std::vector<class gmmu*> m_gmmus;          // one GMMU per chiplet, indexed by chiplet_id (P3)
   
-  // --- inter-chiplet fixed one-way latency (0 = disabled) ---
-  unsigned m_inter_hop_cycles = 0;                  // set in init() from config
-  struct delayed_pkt_t {
-    unsigned in, out, size;
-    void*    data;
-    uint64_t release;                               // cycle to deliver at
-  };
-  std::queue<delayed_pkt_t> m_inter_delay_q;        // release-ordered (release monotonic)
-
-  // Post-delay delivery = the original icnt_push body.
+  // C-4 (SMELL-11): the legacy fixed-latency inter-chiplet delay queue was
+  // removed -- inter-chiplet latency and bandwidth are modeled solely by the
+  // ring (-icnt_use_ring / -icnt_ring_hop_latency). init() aborts if the old
+  // -icnt_inter_hop_latency_ns option is set nonzero.
   void icnt_deliver(unsigned in, unsigned out, void* data, unsigned size);
-  // True if this push crosses a chiplet boundary (per mf direction).
-  bool is_inter_chiplet_xing(unsigned in, unsigned out, class mem_fetch* mf) const;
 
 };
 

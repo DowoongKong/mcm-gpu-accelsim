@@ -48,7 +48,6 @@ typedef void *yyscan_t;
 #include "../stream_manager.h"
 #include "cuda_device_runtime.h"
 #include "decuda_pred_table/decuda_pred_table.h"
-#include "../lasp/lasp_heuristic.h"
 #include "memory.h"
 #include "opcodes.h"
 #include "ptx-stats.h"
@@ -2272,16 +2271,10 @@ kernel_info_t *cuda_sim::gpgpu_opencl_ptx_sim_init_grid(
       new kernel_info_t(gridDim, blockDim, entry, gpu->getNameArrayMapping(),
                         gpu->getNameInfoMapping());
   
-  // LASP heuristic stamp -- OpenCL launch path ONLY (findings.ko.md SMELL-16).
-  // The CUDA/trace path stamps kernels from config in gpgpu_sim::launch() and
-  // deliberately leaves the heuristic unused; this path also hardcodes the
-  // chiplet count instead of reading -gpgpu_n_chiplets. Effectively dead for
-  // every current workload (none use OpenCL).
-  unsigned num_chiplets = 4;
-  lasp::kernel_lasp_config_t lasp_config =
-      lasp_heuristic::analyze_kernel(result, num_chiplets);
-  result->m_lasp_config = lasp_config;
-  
+  // OpenCL kernels keep the kernel_lasp_config_t ctor default (KERNEL_WIDE);
+  // CUDA/trace kernels are stamped from config in gpgpu_sim::launch(). The
+  // OpenCL-only heuristic stub that used to run here (hardcoded chiplet
+  // count, SMELL-16) was removed in the audit fix pass.
   unsigned argcount = args.size();
   unsigned argn = 1;
   for (gpgpu_ptx_sim_arg_list_t::iterator a = args.begin(); a != args.end();

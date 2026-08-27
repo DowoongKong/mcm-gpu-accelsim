@@ -49,7 +49,6 @@
 #include "gmmu.h"        // full definition needed: gmmu->cycle() is called below
 #include "par_serial_probe.h"
 #include "../lasp/lasp_simple.h"
-#include "../lasp/lasp_heuristic.h"
 
 #include <time.h>
 #include "addrdec.h"
@@ -141,7 +140,6 @@ static inline unsigned long long phase_now_ns() {
 #include "stats.h"
 #include "visualizer.h"
 #include "../lasp/lasp_simple.h"
-#include "../lasp/lasp_heuristic.h"
 
 #ifdef GPGPUSIM_POWER_MODEL
 #include "power_interface.h"
@@ -1108,7 +1106,7 @@ void gpgpu_sim::launch(kernel_info_t *kinfo) {
   // LASP (S40): stamp the config-selected policy on every launched kernel.
   // Policy 0 leaves the ctor default KERNEL_WIDE, so the issue path behaves
   // exactly as before S40. The locality type is supplied manually via config
-  // (oracle locality table); the heuristic stub is intentionally unused.
+  // (an oracle locality table stands in for the paper's compiler pass).
   {
     unsigned pol = m_config.get_lasp_policy();
     if (pol != 0) {
@@ -1529,7 +1527,6 @@ void gpgpu_sim::init() {
   // Each option below opens a write path crossing the chiplet or partition
   // boundary that those loops assume is private:
   //   -gpgpu_tlb_ideal 1          -> gpu_page_table, one table for the whole GPU (W3)
-  //   -icnt_inter_hop_latency_ns  -> m_inter_delay_q, one queue for the whole GPU (W4)
   //   simple_dram_model           -> simple_dram_model_cycle() was never audited
   //                                  for partition locality (T-DRAM covers dram_cycle only)
   // Compiled in only for a parallel build, so serial runs -- which legitimately
@@ -1569,8 +1566,6 @@ void gpgpu_sim::init() {
     const char *unsafe_opt = NULL;
     if (m_shader_config->gpgpu_tlb_ideal)
       unsafe_opt = "-gpgpu_tlb_ideal 1 (W3: GPU-wide gpu_page_table)";
-    else if (m_config.get_icnt_inter_hop_latency_ns())
-      unsafe_opt = "-icnt_inter_hop_latency_ns != 0 (W4: GPU-wide m_inter_delay_q)";
     else if (m_memory_config->simple_dram_model)
       unsafe_opt = "simple_dram_model (not audited for partition locality)";
     if (unsafe_opt) {
@@ -2924,7 +2919,6 @@ void gpgpu_sim::cycle() {
     const unsigned long long __pt2 = g_phase_timing_on ? phase_now_ns() : 0;
     g_icnt_now = gpu_sim_cycle + gpu_tot_sim_cycle;  // FUNNEL_ (temp): xbar arrival timestamp
     icnt_transfer();
-    m_gpu_module->advance_inter_chiplet(gpu_sim_cycle + gpu_tot_sim_cycle);
     if (g_phase_timing_on) {
       g_phase_timers.icnt_ns += phase_now_ns() - __pt2;
       g_phase_timers.icnt_calls++;
