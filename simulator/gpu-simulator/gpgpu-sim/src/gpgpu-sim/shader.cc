@@ -3512,20 +3512,6 @@ void ldst_unit::cycle_c() {
     unsigned w = pipe_reg.warp_id();
     m_xlat_parked[w].push_back(std::move(pipe_reg));  // cleared right below
     m_xlat_park_order.push_back(w);   // Option 3: serve in park order
-    // P-2 (speed-audit V7 fix): the replay-first path never removes entries
-    // from m_xlat_park_order, so on long runs it grows without bound (stale
-    // wids are skipped by the SAFETY NET's pop loop, but never freed).
-    // Compact when the queue is grossly larger than the live parked set:
-    // drop exactly the entries whose wid is no longer parked -- the entries
-    // the pop loop would skip anyway -- keeping every occurrence of live wids
-    // in order. Dispatch order is therefore bit-identical; only memory is
-    // bounded (O(parked) amortized instead of O(total parks)).
-    if (m_xlat_park_order.size() > 4 * (m_xlat_parked.size() + 64)) {
-      std::deque<unsigned> live;
-      for (unsigned w2 : m_xlat_park_order)
-        if (m_xlat_parked.count(w2)) live.push_back(w2);
-      m_xlat_park_order.swap(live);
-    }
     m_dispatch_reg->clear();
     m_dispatch_parked = false;
     // A fill/wakeup that landed while this warp was momentarily unparked was
