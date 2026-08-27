@@ -55,6 +55,10 @@ struct inct_config {
                              // (per-port BW = xbar_port_width * flit_size * icnt_freq).
 };
 
+// P-5: (temp) diagnostic-counter gate (defined in gpu-sim.cc); the inline
+// ring code below uses it to skip RINGLAT_/RINGLINK_/BUCKET_ accounting.
+extern const bool g_accelsim_diag;
+
 class xbar_router {
  public:
   xbar_router(unsigned router_id, enum Interconnect_type m_type,
@@ -212,23 +216,26 @@ class ring_net {
   // One cycle: (A) bandwidth on each link head, (B) wire-latency delivery.
   void advance() {
     ++m_cycle;
-    ++link_occ_samples;   // RINGLINK_ (temp)
+    if (g_accelsim_diag) ++link_occ_samples;   // RINGLINK_ (temp, P-5 gated)
     // Phase A: drain up to m_link_width flits per link per cycle, spanning packets
     // (so small packets can pass multiple-per-cycle -> high link bandwidth).
     // BW(per link/dir) = m_link_width * inter_flit_size * freq.
     for (unsigned c = 0; c < N; ++c)
       for (unsigned d = 0; d < 2; ++d) {
-        link_occ_sum[c][d] += link[c][d].size();   // RINGLINK_ (temp): queue occupancy
+        if (g_accelsim_diag)
+          link_occ_sum[c][d] += link[c][d].size();  // RINGLINK_ (temp, P-5 gated)
         unsigned budget = m_link_width;
         while (budget > 0 && !link[c][d].empty()) {
           RingPkt& p = link[c][d].front();
           unsigned take = (p.remaining < budget) ? p.remaining : budget;
-          link_flits[c][d] += take;   // RINGLINK_ (temp): flits transmitted on this link
+          if (g_accelsim_diag) link_flits[c][d] += take;  // RINGLINK_ (temp, P-5 gated)
           p.remaining -= take;
           budget      -= take;
           if (p.remaining == 0) {              // finished on this link -> wire (latency) stage
-            p.t_bw_sum += (m_cycle - p.enter_link);  /*BUCKET_*/ // time spent in link stage
-            p.enter_wire = m_cycle;                  /*BUCKET_*/
+            if (g_accelsim_diag) {                   /*BUCKET_ (P-5 gated)*/
+              p.t_bw_sum += (m_cycle - p.enter_link);
+              p.enter_wire = m_cycle;
+            }
             p.arrival = m_cycle + m_hop_latency;
             wire[c][d].push(p);
             link[c][d].pop();
@@ -245,25 +252,29 @@ class ring_net {
         while (!wire[c][d].empty() && wire[c][d].front().arrival <= m_cycle) {
           RingPkt p = wire[c][d].front();
           unsigned next = neighbor(c, d);
-          // BUCKET_ (temp): wait beyond the legit wire (hop) latency at this hop.
-          unsigned long long ejw = (m_cycle - p.enter_wire > m_hop_latency)
+          // BUCKET_ (temp, P-5 gated): wait beyond the legit hop latency here.
+          unsigned long long ejw = (g_accelsim_diag && m_cycle - p.enter_wire > m_hop_latency)
                                    ? (m_cycle - p.enter_wire - m_hop_latency) : 0;
           if (next == p.dst) {                          // arrived at destination chiplet
             if (eject_buf[next].size() >= m_buf) break; // eject full -> wait
-            unsigned long long rt = m_cycle - p.inject_cycle;  /*RINGLAT_*/
-            ringlat_sum += rt; ringlat_cnt++;                   /*RINGLAT_*/
-            if (rt > ringlat_max) ringlat_max = rt;             /*RINGLAT_*/
-            p.t_ej_sum += ejw;                                  /*BUCKET_*/
-            if (p.src < ringlat_src_sum.size()) {               /*RINGSRC_*/
-              ringlat_src_sum[p.src] += rt; ringlat_src_cnt[p.src]++;
-              bkt_bw_sum[p.src] += p.t_bw_sum;                  /*BUCKET_*/
-              bkt_ej_sum[p.src] += p.t_ej_sum;                  /*BUCKET_*/
+            if (g_accelsim_diag) {  /*RINGLAT_/RINGSRC_/BUCKET_ (P-5 gated)*/
+              unsigned long long rt = m_cycle - p.inject_cycle;
+              ringlat_sum += rt; ringlat_cnt++;
+              if (rt > ringlat_max) ringlat_max = rt;
+              p.t_ej_sum += ejw;
+              if (p.src < ringlat_src_sum.size()) {
+                ringlat_src_sum[p.src] += rt; ringlat_src_cnt[p.src]++;
+                bkt_bw_sum[p.src] += p.t_bw_sum;
+                bkt_ej_sum[p.src] += p.t_ej_sum;
+              }
             }
             eject_buf[next].push(p); wire[c][d].pop();
           } else {                                      // forward to next hop's link
             if (link[next][d].size() >= m_buf) break;   // downstream link full -> wait
-            p.t_ej_sum += ejw;                          /*BUCKET_*/
-            p.enter_link = m_cycle;                     /*BUCKET_*/
+            if (g_accelsim_diag) {                      /*BUCKET_ (P-5 gated)*/
+              p.t_ej_sum += ejw;
+              p.enter_link = m_cycle;
+            }
             p.remaining = p.flits;                      // re-transmit (bandwidth) on next link
             link[next][d].push(p); wire[c][d].pop();
           }

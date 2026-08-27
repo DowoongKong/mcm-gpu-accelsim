@@ -52,6 +52,9 @@
 #include "shader_trace.h"
 #include "stat-tool.h"
 #include "traffic_breakdown.h"
+
+// P-5: (temp) diagnostic-counter gate, defined in gpu-sim.cc.
+extern const bool g_accelsim_diag;
 #include "visualizer.h"
 #include <cstdlib>   // getenv (verification log gate)
 
@@ -3452,8 +3455,8 @@ void ldst_unit::cycle_c() {
   // replay a completed translation before processing (replay-first).
   // D-PROBE: a closed gate with parked warps is the state that silences both
   // wakeup paths. Count it before the branches so the dump can prove it.
-  if (!m_dispatch_reg->empty() && !m_xlat_parked.empty())
-    m_dprobe_gate_closed_cycles++;
+  if (g_accelsim_diag && !m_dispatch_reg->empty() && !m_xlat_parked.empty())
+    m_dprobe_gate_closed_cycles++;  // D-PROBE (temp, P-5 gated)
   if (m_dispatch_reg->empty() && !m_xlat_replay_q.empty()) {
     m_dprobe_replay_fires++;
     unsigned w = m_xlat_replay_q.front(); m_xlat_replay_q.pop_front();
@@ -5577,9 +5580,11 @@ void simt_core_cluster::icnt_cycle() {
   // clusters, so the repr-cluster row understates PTW gating (see the matching
   // note at the [POPGATE] print in gpu-sim.cc).
   // Counters are cumulative; printed per-kernel from gpgpu_sim::print_stats().
-  m_popgate_icnt_cycles++;
-  if (m_response_fifo.size() >= m_config->n_simt_ejection_buffer_size)
-    m_popgate_gated++;
+  if (g_accelsim_diag) {  // P-5 gated
+    m_popgate_icnt_cycles++;
+    if (m_response_fifo.size() >= m_config->n_simt_ejection_buffer_size)
+      m_popgate_gated++;
+  }
   if (!m_response_fifo.empty()) {
     mem_fetch *mf = m_response_fifo.front();
     unsigned cid = m_config->sid_to_cid(mf->get_sid());
@@ -5614,7 +5619,7 @@ void simt_core_cluster::icnt_cycle() {
                    m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
     // FUNNEL_ (temp): normal-reply xbar latency by source mem chiplet (same split as
     // PTW: transit = t1->dest arrival, lasthop = arrival->pop). Normal vs PTW compare.
-    {
+    if (g_accelsim_diag) {  // P-5 gated
       unsigned long long now = m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle;
       unsigned long long t1  = mf->get_return_timestamp();
       unsigned long long arr = mf->get_icnt_receive_time();

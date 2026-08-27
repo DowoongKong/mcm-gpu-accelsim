@@ -7,6 +7,9 @@
 #include "icnt_wrapper.h"  // icnt_has_buffer declaration
 #include "gpu_tlb.h"   // gpu_l2_tlb full definition for l2_tlb->fill()
 
+// P-5: (temp) diagnostic-counter gate, defined in gpu-sim.cc.
+extern const bool g_accelsim_diag;
+
 // Verification logging: per-walk event lines, OFF unless ACCELSIM_LOG_GMMU is set.
 // Runtime-gated so one binary serves production (no output, digest-neutral)
 // and verification runs (recompute walks / local-remote steps / occupancy
@@ -276,7 +279,7 @@ void gmmu::pt_walk(mem_fetch* parent_mf, int level, uint64_t table_pa,
 
   if (!icnt_has_buffer(src_dev, flit_size)) {
     // icnt input buffer full: retry this step next cycle.
-    m_funnel_req_full++;   // FUNNEL_ (temp): request blocked by repr_cluster input port
+    if (g_accelsim_diag) m_funnel_req_full++;  // FUNNEL_ (temp, P-5 gated)
     {  // XLATLAT: backpressure is not page-table access time -- keep it separate
        // so S7 is not inflated by interconnect congestion. The retry re-enters at
        // the SAME level, so no step is counted twice.
@@ -306,10 +309,11 @@ void gmmu::pt_walk(mem_fetch* parent_mf, int level, uint64_t table_pa,
   }
   // MEMLAT_ (temp): which memory sub-partition each PT-read step targets, split
   // local/remote. Detects a single-partition hotspot at the page-table owner.
-  m_memlat_subpart_hist[child_mf->get_sub_partition_id()] += 1;
-  if (is_remote) m_memlat_remote_subpart_hist[child_mf->get_sub_partition_id()] += 1;
-
-  m_funnel_req_ok++;   // FUNNEL_ (temp): request injected through repr_cluster input port
+  if (g_accelsim_diag) {  // P-5 gated (std::map inserts per walk step)
+    m_memlat_subpart_hist[child_mf->get_sub_partition_id()] += 1;
+    if (is_remote) m_memlat_remote_subpart_hist[child_mf->get_sub_partition_id()] += 1;
+    m_funnel_req_ok++;   // FUNNEL_ (temp)
+  }
   m_mod->icnt_push(src_dev, dst_dev, child_mf, flit_size);
   if (accelsim_log_gmmu()) {
   printf("[GMMU_PTW] chiplet=%u va=0x%llx level=%d entry_pa=0x%llx %s cyc=%llu\n",
@@ -336,7 +340,7 @@ void gmmu::done_tlb_req(mem_fetch* child_mf, uint64_t current_cycle) {
   // local (chiplet==owner) or all remote; per-chiplet averages separate them.
   //   seg_reqmem = issue -> mem pushed reply   (req icnt + mem service)
   //   seg_reply  = mem pushed reply -> arrival  (reply icnt back to this GMMU)
-  {
+  if (g_accelsim_diag) {  // P-5 gated
     unsigned long long t0 = child_mf->get_timestamp();          // issue
     unsigned long long t1 = child_mf->get_return_timestamp();   // mem reply out
     unsigned long long now = current_cycle;
@@ -564,8 +568,9 @@ void gmmu::print_stats(FILE* f) const {
   fprintf(f, "  local steps      : %llu\n", m_local_steps);
   fprintf(f, "  remote steps     : %llu\n", m_remote_steps);
   fprintf(f, "  PWC hits         : %llu\n", m_pwc_hits);
-  // MEMLAT_ (temp): target sub-partition distribution of PT-read DRAM steps.
-  // If remote steps concentrate on 1-2 sub-partitions -> single-partition hotspot.
+  // MEMLAT_/FUNNEL_ (temp) report -- P-5: only under ACCELSIM_DIAG (the
+  // counters are gated too; without the flag these rows would all be zero).
+  if (g_accelsim_diag) {
   fprintf(f, "  [MEMLAT] remote-step sub-partition dist:");
   for (auto &kv : m_memlat_remote_subpart_hist)
     fprintf(f, " sp%u=%llu", kv.first, kv.second);
@@ -600,6 +605,7 @@ void gmmu::print_stats(FILE* f) const {
             (double)m_memlat_seg_lasthop_sum / sc,
             m_memlat_seg_lasthop_max, m_memlat_seg_split_cnt);
   }
+  }  // g_accelsim_diag (P-5)
 }
 // XLATDBG: what this chiplet's GMMU is still waiting on. A walk that has been
 // active for far longer than a DRAM round trip is a lost reply, not a slow one.

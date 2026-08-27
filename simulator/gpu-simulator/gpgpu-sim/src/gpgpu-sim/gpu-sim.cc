@@ -86,6 +86,16 @@ unsigned long long g_memfull_total[8] = {0};
 // optional, unlike for a plain non-const global.
 extern const bool g_phase_timing_on = (getenv("ACCELSIM_PHASE_TIMING") != NULL);
 
+// P-5: runtime gate for the (temp) diagnostic counter families -- ACCEPT_,
+// POPGATE_, NORMREP/FUNNEL_, MEMLAT_, RINGLAT_/RINGSRC_/RINGINJ_/RINGLINK_/
+// BUCKET_, D-PROBE. None of their output lines are digest patterns
+// (scripts/xtract_amrs.py), so disabling them is digest-neutral. Default OFF;
+// set ACCELSIM_DIAG=1 to restore both the counters and their report lines
+// without rebuilding (same pattern as ACCELSIM_LOG_GMMU / PHASE_TIMING).
+// The XLATLAT/XLATSUM/GMMU_STAT/PWQ instrumentation is research data and part
+// of the digest -- it stays unconditional.
+extern const bool g_accelsim_diag = (getenv("ACCELSIM_DIAG") != NULL);
+
 // Verification logging: CTA placement lines, OFF unless ACCELSIM_LOG_CTA is
 // set. [CTA_ISSUE] pairs with [CTA_DONE] on (sm, hw_cta) in FIFO order, since
 // a hardware CTA slot is reused only after it has been released.
@@ -1779,6 +1789,8 @@ void gpgpu_sim::print_stats(unsigned long long streamID) {
       m_gpu_module->get_chiplet(c)->get_l2_tlb_64k()->print_stats(stdout);
       m_gpu_module->get_chiplet(c)->get_l2_tlb_2m()->print_stats(stdout);
     }
+    // (temp) diagnostics report -- P-5: only under ACCELSIM_DIAG.
+    if (g_accelsim_diag) {
     // ACCEPT_ (temp): per-chiplet mem-accept backpressure + DRAM utilization.
     // mem_full% high => convergence backpressure at accept path. If DRAM_util also
     // high => real DRAM saturation; if DRAM_util low => throttle upstream of DRAM
@@ -1839,6 +1851,7 @@ void gpgpu_sim::print_stats(unsigned long long streamID) {
         printf("\n");
       }
     }
+    }  // g_accelsim_diag (P-5): ACCEPT/POPGATE/NORMREP rows
     printf("----------------------------END-of-GMMU-STATS-"
            "----------------------------------\n");
   }
@@ -2871,8 +2884,8 @@ void gpgpu_sim::cycle() {
       // backed up) Note:This needs to be called in DRAM clock domain if there
       // is no L2 cache in the system In the worst case, we may need to push
       // SECTOR_CHUNCK_SIZE requests, so ensure you have enough buffer for them
-      // ACCEPT_ (temp): per-chiplet mem-accept backpressure accounting.
-      {
+      // ACCEPT_ (temp, P-5 gated): per-chiplet mem-accept backpressure.
+      if (g_accelsim_diag) {
         unsigned mch = m_gpu_module ? m_gpu_module->mem_sub_partition_to_chiplet(i) : 0;
         if (mch < 8) {
           g_memfull_total[mch]++;

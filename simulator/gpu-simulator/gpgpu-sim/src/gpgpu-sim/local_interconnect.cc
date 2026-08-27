@@ -635,7 +635,7 @@ void LocalInterconnect::handoff() {
 }
 
 void LocalInterconnect::handoff_ring() {
-  m_rinj_advances++;   // RINGINJ_ (temp)
+  if (g_accelsim_diag) m_rinj_advances++;   // RINGINJ_ (temp, P-5 gated)
   for (unsigned s = 0; s < n_subnets; ++s) {
     ring_net* ring = m_ring[s];
 
@@ -656,10 +656,10 @@ void LocalInterconnect::handoff_ring() {
         unsigned flits = mf->get_num_flits(s == REQ_NET, /*is_local=*/false);
         if (!ring->inject(ch, dch, final_dev, data, flits)) { stalled = true; break; }  // link full
         (void) src->Pop(egress);
-        m_rinj_ok[s][ch]++;                     // RINGINJ_ (temp)
+        if (g_accelsim_diag) m_rinj_ok[s][ch]++;  // RINGINJ_ (temp, P-5 gated)
       }
       // RINGINJ_ (temp): egress had work this cycle; stalled = blocked by ring-link-full.
-      if (had_pending) {
+      if (g_accelsim_diag && had_pending) {  // P-5 gated
         m_rinj_egress_busy[s][ch]++;
         if (stalled) m_rinj_stall[s][ch]++;
       }
@@ -728,8 +728,8 @@ void LocalInterconnect::DisplayStats() const {
     printf("%s_Network_out_buffer_avg_util = %12.4f\n", tag, (float)out_buffer_util/cyc/active_out);
     printf("\n");
   }
-  // RINGLAT_ (temp): per-subnet ring traversal time (inject->eject), inter-chiplet.
-  if (m_use_ring) {
+  // RING* (temp) report -- P-5: only under ACCELSIM_DIAG (counters gated too).
+  if (m_use_ring && g_accelsim_diag) {
     for (unsigned s = 0; s < m_ring.size(); ++s) {
       if (!m_ring[s]) continue;
       const char* tag = (s == REQ_NET) ? "Req" : "Reply";
