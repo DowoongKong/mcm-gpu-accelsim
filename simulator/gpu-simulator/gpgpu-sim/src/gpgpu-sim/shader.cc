@@ -2556,9 +2556,14 @@ bool ldst_unit::memory_cycle(warp_inst_t &inst,
         auto &tbl = xlat_table_for(pshift, wid);
         const uint64_t vpn = page_vpn(va, pshift);
         if (tbl.count(vpn)) continue;                  // already translated -> dedup skip
-        gpu_pte_t out_pte;
+        // V7b: zero-initialized so an access() path that returned HIT without
+        // writing the PTE trips the present() assert deterministically instead
+        // of recording stack garbage as a translation (the root cause of the
+        // post-V7a run-to-run nondeterminism).
+        gpu_pte_t out_pte{};
         gpu_l1_tlb::result_t r = tlb->access(va, wid, out_pte, cur_cycle);
         if (r == gpu_l1_tlb::HIT) {
+          assert(out_pte.present() && "L1 TLB HIT must deliver a present PTE");
           tbl[vpn] = out_pte;                           // record; keep scanning for more pages
           continue;
         }

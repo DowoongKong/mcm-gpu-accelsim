@@ -152,9 +152,17 @@ gpu_l1_tlb::result_t gpu_l1_tlb::access(uint64_t va, unsigned warp_id,
       return HIT;
     }
     // array miss: if the VPN is still in flight in the MSHR, keep waiting.
+    // V7b: this includes a stored HIT classification. Returning HIT here would
+    // hand the caller NO PTE (out_pte is never written on this path), and the
+    // caller records out_pte into its per-warp translation table -- an
+    // uninitialized-stack read that made PA bits (and thus L2 bank routing)
+    // vary run to run once V7a's replay order first exercised this
+    // evicted-while-refetching interleaving. The PTE this warp resolved to was
+    // evicted from the array, and the same VPN is being re-fetched by an
+    // in-flight MSHR entry, so wait on that fill like any shared-VPN requester.
     if (m_mshr.probe(vpn_val)) {
-      if (rit->second == MISS) rit->second = MSHR_HIT;  // shared VPN entered MSHR
-      return rit->second;
+      rit->second = MSHR_HIT;
+      return MSHR_HIT;
     }
     // array miss AND not in flight => the cached classification is STALE:
     // this (warp,vpn) was resolved (HIT/MSHR_HIT) and filled, but the page was
