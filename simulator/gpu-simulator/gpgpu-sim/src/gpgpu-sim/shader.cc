@@ -1070,7 +1070,10 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
       active_mask, warp_id, m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle,
       m_warp[warp_id]->get_dynamic_warp_id(), sch_id,
       m_warp[warp_id]->get_streamID());  // dynamic instruction information
-  m_stats->shader_cycle_distro[2 + (*pipe_reg)->active_count()]++;
+  {  // W5-class shared stat (BUG-7 fix): array shared by every SM's schedulers
+  #pragma omp atomic
+    m_stats->shader_cycle_distro[2 + (*pipe_reg)->active_count()]++;
+  }
   func_exec_inst(**pipe_reg);
 
   // Add LDGSTS instructions into a buffer
@@ -1293,7 +1296,10 @@ void scheduler_unit::cycle() {
   const unsigned char p4_pred_bucket = m_memo_bucket;
 #else
   if (m_memo_armed && m_memo_epoch == p4_epoch_now) {
-    m_stats->shader_cycle_distro[m_memo_bucket]++;
+    {  // W5-class shared stat (BUG-7 fix)
+    #pragma omp atomic
+      m_stats->shader_cycle_distro[m_memo_bucket]++;
+    }
     return;
   }
 #endif
@@ -1628,18 +1634,19 @@ void scheduler_unit::cycle() {
     }
   }
 
-  // issue stall statistics:
-  // RACE (findings.ko.md BUG-7): shader_cycle_distro[] is shared by every SM
-  // and these increments (plus the two other sites in this file) run inside
-  // the parallel CORE phase without an atomic -- the one W5-class counter
-  // group the atomic sweep missed. Stats-only impact; fix pending approval.
-  if (!valid_inst)
+  // issue stall statistics (W5-class shared array, BUG-7 fix: atomic -- the
+  // one counter group the original atomic sweep missed):
+  if (!valid_inst) {
+  #pragma omp atomic
     m_stats->shader_cycle_distro[0]++;  // idle or control hazard
-  else if (!ready_inst)
+  } else if (!ready_inst) {
+  #pragma omp atomic
     m_stats->shader_cycle_distro[1]++;  // waiting for RAW hazards (possibly due
                                         // to memory)
-  else if (!issued_inst)
+  } else if (!issued_inst) {
+  #pragma omp atomic
     m_stats->shader_cycle_distro[2]++;  // pipeline stalled
+  }
   // 44-8 (P4-1): arm the skip when nothing issued and every blocker seen this
   // scan is epoch-covered. The epoch cannot have moved during a no-issue scan
   // (all bump sites are outside this function or on the issue path), so the
@@ -2444,9 +2451,9 @@ bool ldst_unit::constant_cycle(warp_inst_t &inst, mem_stage_stall_type &rc_fail,
     rc_fail = fail;  // keep other fails if this didn't fail.
     fail_type = C_MEM;
     if (rc_fail == BK_CONF or rc_fail == COAL_STALL) {
-      // RACE (findings.ko.md BUG-8): shared scalar stat incremented from every
-      // SM in the parallel phase; missed by the W5 atomic sweep. Coal stalls
-      // aren't really a bank conflict, but this maintains previous behavior.
+      // W5-class shared stat (BUG-8 fix). Coal stalls aren't really a bank
+      // conflict, but this maintains previous behavior.
+    #pragma omp atomic
       m_stats->gpgpu_n_cmem_portconflict++;
     }
   }
