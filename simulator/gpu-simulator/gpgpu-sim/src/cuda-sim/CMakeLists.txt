@@ -29,7 +29,6 @@ add_library(ptxsim STATIC
             ptx-stats.cc
             decuda_pred_table/decuda_pred_table.cc
             ../lasp/lasp_heuristic.cc
-            ../lasp/lasp_scheduler.cc
             ${BISON_ptx_parser_OUTPUT_SOURCE} ${FLEX_ptx_lexer_OUTPUTS}
             ${BISON_ptxinfo_parser_OUTPUT_SOURCE} ${FLEX_ptxinfo_lexer_OUTPUTS})
 

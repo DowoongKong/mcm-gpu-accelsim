@@ -132,7 +132,6 @@ static inline unsigned long long phase_now_ns() {
 #include "visualizer.h"
 #include "../lasp/lasp_simple.h"
 #include "../lasp/lasp_heuristic.h"
-#include "../lasp/lasp_scheduler.h"
 
 #ifdef GPGPUSIM_POWER_MODEL
 #include "power_interface.h"

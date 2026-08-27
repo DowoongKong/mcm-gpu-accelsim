@@ -516,9 +516,6 @@ class gpu_module {
     return m_current_kernel_block_dim;
   }
 
-  // Allocate memory partitions to chiplets based on LASP policy
-  void allocate_memory_partitions_lasp();
-  
   // Get access statistics
   unsigned long long get_remote_access_count() const { return m_remote_access_count; }
   unsigned long long get_local_access_count() const { return m_local_access_count; }

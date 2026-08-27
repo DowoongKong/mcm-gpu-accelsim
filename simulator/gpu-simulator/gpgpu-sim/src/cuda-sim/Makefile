@@ -62,7 +62,7 @@ ifeq ($(GNUC_CPP0X),1)
 endif
 endif
 
-OBJS	:= $(OUTPUT_DIR)/ptx_parser.o $(OUTPUT_DIR)/ptx_loader.o $(OUTPUT_DIR)/cuda_device_printf.o $(OUTPUT_DIR)/instructions.o $(OUTPUT_DIR)/cuda-sim.o $(OUTPUT_DIR)/ptx_ir.o $(OUTPUT_DIR)/ptx_sim.o  $(OUTPUT_DIR)/memory.o $(OUTPUT_DIR)/ptx-stats.o $(OUTPUT_DIR)/decuda_pred_table/decuda_pred_table.o $(OUTPUT_DIR)/ptx.tab.o $(OUTPUT_DIR)/lex.ptx_.o $(OUTPUT_DIR)/ptxinfo.tab.o $(OUTPUT_DIR)/lex.ptxinfo_.o $(OUTPUT_DIR)/cuda_device_runtime.o $(OUTPUT_DIR)/lasp_heuristic.o $(OUTPUT_DIR)/lasp_scheduler.o
+OBJS	:= $(OUTPUT_DIR)/ptx_parser.o $(OUTPUT_DIR)/ptx_loader.o $(OUTPUT_DIR)/cuda_device_printf.o $(OUTPUT_DIR)/instructions.o $(OUTPUT_DIR)/cuda-sim.o $(OUTPUT_DIR)/ptx_ir.o $(OUTPUT_DIR)/ptx_sim.o  $(OUTPUT_DIR)/memory.o $(OUTPUT_DIR)/ptx-stats.o $(OUTPUT_DIR)/decuda_pred_table/decuda_pred_table.o $(OUTPUT_DIR)/ptx.tab.o $(OUTPUT_DIR)/lex.ptx_.o $(OUTPUT_DIR)/ptxinfo.tab.o $(OUTPUT_DIR)/lex.ptxinfo_.o $(OUTPUT_DIR)/cuda_device_runtime.o $(OUTPUT_DIR)/lasp_heuristic.o
 
 
 OPT += -DCUDART_VERSION=$(CUDART_VERSION)
@@ -76,7 +76,6 @@ depend:
 	-makedepend -f$(OUTPUT_DIR)/Makefile.makedepend -p$(OUTPUT_DIR)/ $(SRCS) 2> /dev/null
 	@echo "# LASP dependencies" >> $(OUTPUT_DIR)/Makefile.makedepend
 	@echo "$(OUTPUT_DIR)/lasp_heuristic.o: ../lasp/lasp_heuristic.cc ../lasp/lasp_heuristic.h ../abstract_hardware_model.h" >> $(OUTPUT_DIR)/Makefile.makedepend
-	@echo "$(OUTPUT_DIR)/lasp_scheduler.o: ../lasp/lasp_scheduler.cc ../lasp/lasp_scheduler.h ../abstract_hardware_model.h" >> $(OUTPUT_DIR)/Makefile.makedepend
 
 libgpgpu_ptx_sim.a: $(OBJS) 
 	ar rcs $(OUTPUT_DIR)/libgpgpu_ptx_sim.a $(OUTPUT_DIR)/ptx.tab.o $(OUTPUT_DIR)/lex.ptx_.o $(OUTPUT_DIR)/ptxinfo.tab.o $(OUTPUT_DIR)/lex.ptxinfo_.o $(OBJS)
@@ -154,7 +153,6 @@ $(OUTPUT_DIR)/cuda_device_runtime.o: $(OUTPUT_DIR)/ptx.tab.c
 $(OUTPUT_DIR)/lasp_heuristic.o: ../lasp/lasp_heuristic.cc ../lasp/lasp_heuristic.h ../abstract_hardware_model.h
 	$(CPP) -c $(CXX_OPT) -o $@ $<
 
-$(OUTPUT_DIR)/lasp_scheduler.o: ../lasp/lasp_scheduler.cc ../lasp/lasp_scheduler.h ../abstract_hardware_model.h
 	$(CPP) -c $(CXX_OPT) -o $@ $<
 
 include $(OUTPUT_DIR)/Makefile.makedepend

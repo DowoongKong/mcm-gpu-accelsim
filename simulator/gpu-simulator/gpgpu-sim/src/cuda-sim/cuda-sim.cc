@@ -49,7 +49,6 @@ typedef void *yyscan_t;
 #include "cuda_device_runtime.h"
 #include "decuda_pred_table/decuda_pred_table.h"
 #include "../lasp/lasp_heuristic.h"
-#include "../lasp/lasp_scheduler.h"
 #include "memory.h"
 #include "opcodes.h"
 #include "ptx-stats.h"

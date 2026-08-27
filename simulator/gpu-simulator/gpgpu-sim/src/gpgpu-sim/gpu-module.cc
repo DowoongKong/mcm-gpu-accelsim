@@ -663,20 +663,6 @@ void gpu_module::dump_partitioning(FILE* fout) const {
   fprintf(fout, "==========================================\n");
 }
 
-// DEAD-4 (findings.ko.md): declared and defined but never called; kept as a
-// no-op until the fix pass so the design note below survives.
-void gpu_module::allocate_memory_partitions_lasp() {
-  // No-op for baseline MCM-GPU (demand paging + First Touch + Round Robin CTA).
-  //
-  // m_mem_sub_partition_to_chiplet[] encodes the physical chiplet ownership
-  // (contiguous split_range() split, set in init() -- see SMELL-3).
-  // LASP is a CTA scheduling policy and must not alter this physical mapping.
-  //
-  // LASP-aware memory placement (e.g., co-locating CTA data with its chiplet)
-  // belongs in the page placement layer (page_placement_policy), not here.
-  return;
-}
-
 void gpu_module::dump_mapping_ranges(FILE* fout,
                               const char* tag,
                               const std::vector<unsigned>& chiplet_mapper) const {

@@ -871,11 +871,6 @@ class gpgpu_sim : public gpgpu_t {
   void visualizer_printstat();
   void print_shader_cycle_distro(FILE *fout) const;
 
-  // DEAD: declared but never defined or called (the module is built in the
-  // gpgpu_sim constructor instead). Kept only until the audit's fix pass;
-  // see docs/audit/findings.ko.md DEAD-1.
-  void init_gpu_module_phase1();
-
   void gpgpu_debug();
 
  protected:
