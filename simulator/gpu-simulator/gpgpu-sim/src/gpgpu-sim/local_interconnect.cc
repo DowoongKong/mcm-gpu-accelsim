@@ -181,12 +181,13 @@ bool xbar_router::Has_Buffer_In(unsigned input_deviceID, unsigned flits,
 bool xbar_router::Has_Buffer_Out(unsigned output_deviceID, unsigned flits) {
   assert(output_deviceID < total_nodes);
 
-  // NOTE (findings.ko.md BUG-9): occupancy is measured in REMAINING flits.
-  // The iSLIP path serves packets flit-by-flit in the in-buffer and pushes
-  // them here only once remaining_flits == 0, so under iSLIP this occupancy
-  // is always ~0 and out_buffer_limit exerts no backpressure (the RR path
-  // pushes full packets and is bounded as upstream was). Whether the
-  // unbounded egress queue is intended needs a design decision.
+  // Occupancy in flits. BUG-9 fix: the iSLIP/VOQ completion paths push
+  // packets with remaining_flits restored to orig_flits, so a queued egress
+  // packet occupies its full size and out_buffer_limit exerts real
+  // backpressure again (it was inert while completed packets carried 0).
+  // The grant loop still probes with `flits == 1` before picking an input,
+  // so the limit can be overshot by at most one packet -- same slack the
+  // packet-count check had upstream.
   unsigned occ = queue_flits(out_buffers[output_deviceID]);
 
   return (occ + flits <= out_buffer_limit);
@@ -381,7 +382,9 @@ void xbar_router::iSLIP_Advance() {
             if (_vp.remaining_flits == 0) {
               mem_fetch* _rmf = static_cast<mem_fetch*>(_vp.data);
               if (_rmf) _rmf->set_icnt_receive_time((unsigned)g_icnt_now);
-              out_buffers[i].push(_vp);
+              Packet _done = _vp;
+              _done.remaining_flits = _done.orig_flits;  // BUG-9 fix: egress
+              out_buffers[i].push(_done);                // occupancy = pkt size
               m_icp_voq[i].pop();
             }
             reqs++;
@@ -398,7 +401,9 @@ void xbar_router::iSLIP_Advance() {
                 if (_packet.remaining_flits == 0) {
                   mem_fetch* _rmf = static_cast<mem_fetch*>(_packet.data);
                   if (_rmf) _rmf->set_icnt_receive_time((unsigned)g_icnt_now);
-                  out_buffers[_packet.output_deviceID].push(_packet);
+                  Packet _done = _packet;
+                  _done.remaining_flits = _done.orig_flits;  // BUG-9 fix:
+                  out_buffers[_packet.output_deviceID].push(_done);  // full size
                   in_buffers[node_id].pop();
                 }
                 if (grant_cycles_count == 1)

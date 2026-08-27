@@ -114,11 +114,14 @@ class xbar_router {
       data = m_data;
       output_deviceID = m_output_deviceID;
       remaining_flits = m_flits;
+      orig_flits = m_flits;  // BUG-9 fix: kept so the egress push can restore
+                             // the packet's full size for out-buffer occupancy
     }
 
     void* data;
     unsigned output_deviceID;
     unsigned remaining_flits;
+    unsigned orig_flits;
   };
   // 44-1: FIFO with an O(1) running total of remaining_flits. queue_flits()
   // used to COPY the whole std::queue and walk it on every Has_Buffer_* call
