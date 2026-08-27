@@ -40,12 +40,6 @@ bool l1_tlb_mshr::probe(uint64_t vpn) const {
   return m_entries.count(vpn) != 0;
 }
 
-// bool l1_tlb_mshr::full(uint64_t vpn) const {
-//   if (m_entries.count(vpn))
-//     return false;  // VPN already tracked; additional warps just stall without re-queuing
-//   return m_entries.size() >= m_num_entries;  // new VPN: check table capacity
-// }
-
 void l1_tlb_mshr::add(uint64_t vpn, unsigned warp_id) {
   m_mutations++;  // 36a: enables merges for same-vpn waiters
   XLAT_HOT_ASSERT(!full(vpn));  // 44-2: one extra hash per add as a plain assert
@@ -104,7 +98,6 @@ gpu_l1_tlb::gpu_l1_tlb(unsigned num_sets, unsigned assoc,
       m_mshr(mshr_entries, mshr_max_merge),
       m_hits(0), m_misses(0), m_mshr_hits(0) {
   m_sets.resize(num_sets, std::vector<l1_tlb_entry_t>(assoc, {false, 0, {0}, 0}));
-  // m_lookup_pipe_4k.resize(m_lookup_latency, lookup_slot{false, 0, 0, 0});
   m_lookup_pipe_4k.assign(m_lookup_latency, {});
 }
 
@@ -122,54 +115,6 @@ int gpu_l1_tlb::lru_victim(unsigned sidx) const {
       victim = (int)w;
   return victim;
 }
-
-// gpu_l1_tlb::result_t gpu_l1_tlb::access(uint64_t va, gpu_pte_t &out_pte,
-//                                          uint64_t current_cycle) {
-//   uint64_t vpn_val = vpn(va);
-//   unsigned sidx    = set_idx(vpn_val);
-
-//   // (A) in-flight: vpn already in MSHR (L2 accepted). No gate, no re-count.
-//   if (m_mshr.probe(vpn_val)) {
-//     m_miss_pending.erase(vpn_val);          // left the lookup phase
-//     int way = find_way(sidx, vpn_val);
-//     if (way >= 0) {
-//       m_sets[sidx][way].lru_time = current_cycle;
-//       out_pte = m_sets[sidx][way].pte; m_hits++; return HIT;
-//     }
-//     if (!m_mshr.full(vpn_val)) m_mshr.add(vpn_val);
-//     m_mshr_hits++; return MSHR_HIT;
-//   }
-
-//   // (B) miss already determined, L2 request still pending: keep returning MISS
-//   //     (so the caller keeps driving L2) but do NOT re-gate or re-count.
-//   if (m_miss_pending.count(vpn_val)) {
-//     int way = find_way(sidx, vpn_val);
-//     if (way >= 0) {                          // got filled while pending
-//       m_miss_pending.erase(vpn_val);
-//       m_sets[sidx][way].lru_time = current_cycle;
-//       out_pte = m_sets[sidx][way].pte; m_hits++; return HIT;
-//     }
-//     return MISS;
-//   }
-
-//   // (C) new logical lookup: fixed array-probe latency gate.
-//   auto git = m_lookup_ready.find(vpn_val);
-//   if (git == m_lookup_ready.end()) {
-//     m_lookup_ready[vpn_val] = current_cycle + m_lookup_latency;
-//     return LOOKUP_PENDING;
-//   }
-//   if (current_cycle < git->second) return LOOKUP_PENDING;
-//   m_lookup_ready.erase(git);
-
-//   int way = find_way(sidx, vpn_val);
-//   if (way >= 0) {
-//     m_sets[sidx][way].lru_time = current_cycle;
-//     out_pte = m_sets[sidx][way].pte; m_hits++; return HIT;
-//   }
-//   m_misses++;                                // count the miss exactly once
-//   m_miss_pending.insert(vpn_val);            // suppress re-gate/re-count until L2 accepts
-//   return MISS;
-// }
 
 gpu_l1_tlb::result_t gpu_l1_tlb::access(uint64_t va, unsigned warp_id,
                                         gpu_pte_t &out_pte, uint64_t cur) {
@@ -233,8 +178,6 @@ gpu_l1_tlb::result_t gpu_l1_tlb::access(uint64_t va, unsigned warp_id,
     return PORT_BUSY;
   }
   // (3) New: inject at the pipe tail (head reached after lookup_latency cycles).
-  // m_inflight_lookup_4k.insert(rid);
-  // m_lookup_pipe_4k[m_lookup_latency - 1] = {true, rid, vpn_val, warp_id};  // tail stage
   m_inflight_lookup_4k.insert(rid);
   if (m_inflight_lookup_4k.size() > m_concurrent_max)
     m_concurrent_max = (unsigned)m_inflight_lookup_4k.size();
@@ -294,34 +237,6 @@ void gpu_l1_tlb::fill(uint64_t vpn, const gpu_pte_t &pte,
   // Mark MSHR entry as ready so tick() can drain pending retries
   m_mshr.mark_ready(vpn);
 }
-
-// // Advance the lookup pipe, resolve the head, then drain the MSHR ready list.
-// void gpu_l1_tlb::cycle(uint64_t cur) {
-//   // (a) resolve the head (stage 0)
-//   lookup_slot reinject = {false, 0, 0, 0};
-//   lookup_slot &head = m_lookup_pipe_4k[0];
-//   if (head.valid) {
-//     bool resolved = resolve_lookup(head, cur);
-//     if (resolved) {
-//       m_inflight_lookup_4k.erase(head.rid);
-//       auto it = m_resv_fail_start.find(head.rid);     // was this request ever blocked by an MSHR-full?
-//       if (it != m_resv_fail_start.end()) {
-//         m_resv_fail_cycles += (cur - it->second);     // accumulate the cycles it stayed blocked
-//         m_resv_fail_start.erase(it);
-//       }
-//     } else {                                          // table-full OR merge-full (both land here)
-//       reinject = head;
-//       m_resv_fail_start.emplace(head.rid, cur);       // record first blocked cycle (keep earliest if present)
-//     }
-//     head = {false, 0, 0, 0};
-//   }
-//   // (b) shift down: stage[i] <- stage[i+1]
-//   for (unsigned s = 0; s + 1 < m_lookup_latency; ++s) {
-//     m_lookup_pipe_4k[s]   = m_lookup_pipe_4k[s + 1];
-//     m_lookup_pipe_4k[s+1] = {false, 0, 0, 0};
-//   }
-//   if (reinject.valid) m_lookup_pipe_4k[m_lookup_latency - 1] = reinject;
-// }
 
 void gpu_l1_tlb::cycle(uint64_t cur) {
   // XLATLAT: sample N once per cycle. size() is O(1), so this costs three adds.
@@ -467,7 +382,9 @@ bool gpu_l1_tlb::resolve_lookup(const lookup_slot &s, uint64_t cur) {
   if (m_l2_req_queue_4k.size() > m_l2_req_q_max)
     m_l2_req_q_max = (unsigned)m_l2_req_queue_4k.size();
   m_misses++;
-  m_resolved[s.rid] = MSHR_HIT;     // later requests merge
+  // Subsequent polls of this same (warp,vpn) request return MSHR_HIT: its
+  // L2 request is in flight and the fill will complete it.
+  m_resolved[s.rid] = MSHR_HIT;
   return true;
 }
 
@@ -640,61 +557,6 @@ int gpu_l2_tlb::lru_victim(unsigned sidx) const {
   return victim;
 }
 
-// gpu_l2_tlb::result_t gpu_l2_tlb::access(uint64_t va, unsigned cluster_id,
-//                                           gpu_pte_t& out_pte,
-//                                           uint64_t current_cycle) {
-//   uint64_t vpn_val = vpn(va);
-//   unsigned sidx    = set_idx(vpn_val);
-
-//   // In-flight VPN: skip the lookup gate (latency already paid on first probe).
-//   auto mit = m_mshr.find(vpn_val);
-//   if (mit != m_mshr.end()) {
-//     int way = find_way(sidx, vpn_val);
-//     if (way >= 0) {                       // fill already landed in the array
-//       m_sets[sidx][way].lru_time = current_cycle;
-//       out_pte = m_sets[sidx][way].pte;
-//       m_hits++;
-//       return HIT;
-//     }
-//     if (mit->second.pending_clusters.size() >= m_mshr_max_merge) {
-//       m_mshr_full++;
-//       return MSHR_FULL;                   // merge cap reached -> stall & retry
-//     }
-//     mit->second.pending_clusters.push_back(cluster_id);
-//     m_mshr_hits++;
-//     return MSHR_HIT;
-//   }
-
-//   // New logical lookup: fixed array-probe latency (applies to ALL lookups).
-//   auto git = m_lookup_ready.find(vpn_val);
-//   if (git == m_lookup_ready.end()) {
-//     m_lookup_ready[vpn_val] = current_cycle + m_lookup_latency;
-//     return LOOKUP_PENDING;
-//   }
-//   if (current_cycle < git->second) return LOOKUP_PENDING;
-//   m_lookup_ready.erase(git);              // latency elapsed -> resolve now
-
-//   int way = find_way(sidx, vpn_val);
-//   if (way >= 0) {
-//     m_sets[sidx][way].lru_time = current_cycle;
-//     out_pte = m_sets[sidx][way].pte;
-//     m_hits++;
-//     return HIT;
-//   }
-//   // Miss: allocate a new MSHR entry (table capacity check).
-//   if (m_mshr.size() >= m_mshr_entries) {
-//     m_mshr_full++;
-//     m_misses++;
-//     return MSHR_FULL;
-//   }
-//   l2_mshr_entry_t& e = m_mshr[vpn_val];
-//   e.pending_clusters.push_back(cluster_id);
-//   e.pte_ready = false;
-//   e.pte.raw   = 0;
-//   m_misses++;
-//   return MISS;
-// }
-
 gpu_l2_tlb::result_t gpu_l2_tlb::access(uint64_t va, unsigned cluster_id,
                                         gpu_pte_t& out_pte, uint64_t cur,
                                         uint64_t* ready_out) {
@@ -818,7 +680,6 @@ gpu_l2_tlb::resolve(uint64_t vpn_val, unsigned sidx, unsigned cluster_id,
   }
   if (m_mshr.size() >= m_mshr_entries) {            // MSHR table full
     m_mshr_entries_full++;                          // table full
-    // m_misses++;
     m_last_full_merge = false;                      // 44-4: fail type for skip synthesis
     return MSHR_FULL;                               // re-poll (re-gates)
   }

@@ -571,10 +571,6 @@ bool gpu_module::l2_tlb_request(uint64_t va, unsigned cluster_id,
 }
 
 
-// void* gpu_module::icnt_pop(unsigned output_deviceID) {
-//   return ::icnt_pop(output_deviceID);
-// }
-
 void* gpu_module::icnt_pop(unsigned output_deviceID) {
   void* data = ::icnt_pop(output_deviceID);
   if (data) {

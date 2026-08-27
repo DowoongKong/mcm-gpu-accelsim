@@ -114,7 +114,9 @@ void gmmu::cycle(uint64_t current_cycle) {
     pwq_entry_t entry = m_pwq.front();
     m_pwq.pop();
 
-    // uint64_t queuing_delay = current_cycle - entry.enqueue_cycle;
+    // -1: enqueue happens in the same L2-domain tick that could not serve it;
+    // the first service opportunity is the NEXT tick, so a dequeue there is
+    // zero queueing delay, not one.
     uint64_t queuing_delay = (current_cycle > entry.enqueue_cycle)
                              ? current_cycle - entry.enqueue_cycle - 1 : 0;
     m_pwq_queuing_delay_sum += queuing_delay;
@@ -143,7 +145,7 @@ void gmmu::cycle(uint64_t current_cycle) {
       printf("[GMMU_START] chiplet=%u va=0x%llx cyc=%llu pwq_wait=%llu\n",
              m_chiplet_id, (unsigned long long)entry.va,
              (unsigned long long)m_total_cycles,
-             (unsigned long long)queuing_delay); // print_log
+             (unsigned long long)queuing_delay);
     // XLATLAT: t6. entry.enqueue_cycle is t5, carried from translate().
     xlat_walk_t &wr = m_walk_start_cycles[parent_mf];
     wr.t_pwq_enq    = entry.enqueue_cycle;
@@ -193,7 +195,7 @@ void gmmu::pt_walk(mem_fetch* parent_mf, int level, uint64_t table_pa,
       if (accelsim_log_gmmu()) {
       printf("[GMMU_PWC] chiplet=%u va=0x%llx level=%d -> HIT next_pa=0x%llx\n",
              m_chiplet_id, (unsigned long long)va, level,
-             (unsigned long long)cached_pa); // print_log
+             (unsigned long long)cached_pa);
       }
       return;
     }
@@ -287,7 +289,7 @@ void gmmu::pt_walk(mem_fetch* parent_mf, int level, uint64_t table_pa,
     m_pending_next_steps.push({parent_mf, level, table_pa});
     if (accelsim_log_gmmu()) {
     printf("[GMMU_STALL] chiplet=%u va=0x%llx level=%d icnt_full\n",
-           m_chiplet_id, (unsigned long long)va, level); // print_log
+           m_chiplet_id, (unsigned long long)va, level);
     }
     return;
   }
@@ -313,7 +315,7 @@ void gmmu::pt_walk(mem_fetch* parent_mf, int level, uint64_t table_pa,
   printf("[GMMU_PTW] chiplet=%u va=0x%llx level=%d entry_pa=0x%llx %s cyc=%llu\n",
          m_chiplet_id, (unsigned long long)va, level,
          (unsigned long long)entry_pa, is_remote ? "REMOTE" : "LOCAL",
-         (unsigned long long)m_total_cycles); // print_log
+         (unsigned long long)m_total_cycles);
   }
 }
 
@@ -372,7 +374,7 @@ void gmmu::done_tlb_req(mem_fetch* child_mf, uint64_t current_cycle) {
       printf("[GMMU_FAULT] chiplet=%u va=0x%llx level=%d->%d node absent,"
              " created on chiplet=%u pa=0x%llx\n",
              m_chiplet_id, (unsigned long long)va, level, level + 1,
-             chiplet_id, (unsigned long long)next_table_pa); // print_log
+             chiplet_id, (unsigned long long)next_table_pa);
       }
     }
     // Cache the next-level PA in PWC for future walks to the same VA prefix.
@@ -384,7 +386,7 @@ void gmmu::done_tlb_req(mem_fetch* child_mf, uint64_t current_cycle) {
     printf("[GMMU_DONE] chiplet=%u va=0x%llx level=%d -> level=%d"
            " next_pa=0x%llx queued\n",
            m_chiplet_id, (unsigned long long)va, level, level + 1,
-           (unsigned long long)next_table_pa); // print_log
+           (unsigned long long)next_table_pa);
     }
   } else {
     // Leaf level (3 = PT for 4KB, 2 = PD for 2MB): DRAM returned the leaf entry.
@@ -400,7 +402,7 @@ void gmmu::done_tlb_req(mem_fetch* child_mf, uint64_t current_cycle) {
       printf("[GMMU_FAULT] chiplet=%u va=0x%llx level=%d leaf absent,"
              " data page allocated on chiplet=%u\n",
              m_chiplet_id, (unsigned long long)va, leaf_level,
-             chiplet_id); // print_log
+             chiplet_id);
       }
     }
     // 44-2: duplicate of complete_walk()'s assert on the pte it actually
@@ -454,7 +456,7 @@ void gmmu::complete_walk(mem_fetch* parent_mf, uint64_t current_cycle) {
   printf("[GMMU_COMPLETE] chiplet=%u cluster=%u va=0x%llx -> pa=0x%llx cyc=%llu\n",
          m_chiplet_id, cluster_id,
          (unsigned long long)va, (unsigned long long)pa,
-         (unsigned long long)m_total_cycles); // print_log
+         (unsigned long long)m_total_cycles);
   }
 
   // Remove from active walk tracking and free phantom parent_mf.
@@ -527,8 +529,6 @@ void gmmu::print_stats(FILE* f) const {
   // (ACCELSIM_LOG_GMMU) can recompute occupancy = sum(walk durations)/cycles.
   fprintf(f, "  cycles counted   : %llu\n", m_total_cycles);
   fprintf(f, "  PTW active sum   : %llu\n", m_ptw_active_sum);
-  // fprintf(f, "  PWQ avg delay    : %.2f cycles\n",
-  //         (double)m_pwq_queuing_delay_sum / n_deq);
 
   unsigned long long n_done = m_ptw_complete_count > 0 ? m_ptw_complete_count : 1;
   double avg_queuing = (double)m_pwq_queuing_delay_sum / n_deq;

@@ -905,6 +905,12 @@ void shader_core_ctx::decode() {
     // decode 1 or 2 instructions and place them into ibuffer
     address_type pc = m_inst_fetch_buffer.m_pc;
     const warp_inst_t *pI1 = get_next_inst(m_inst_fetch_buffer.m_warp_id, pc);
+    // NULL guard (deliberate divergence from upstream, findings.ko.md NOTE-1):
+    // trace-driven get_next_inst() returns NULL once the trace is exhausted.
+    // Upstream filled the ibuffer and bumped inst_in_pipeline unconditionally;
+    // with NULL that increment is never paired with a decrement, and the
+    // trace-end completion path requires !inst_in_pipeline() -- the warp would
+    // never finish.
     if (pI1) {
       m_warp[m_inst_fetch_buffer.m_warp_id]->ibuffer_fill(0, pI1);
       m_p4_issue_epoch++;  // 44-8 (E2)
@@ -2239,10 +2245,6 @@ mem_stage_stall_type ldst_unit::process_memory_access_queue(cache_t *cache,
   return process_cache_access(cache, mf->get_addr(), inst, events, mf, status);
 }
 
-//mem_stage_stall_type ldst_unit::process_memory_access_queue_l1cache(
-//    l1_cache *cache, warp_inst_t &inst) {
-// mem_stage_stall_type ldst_unit::process_memory_access_queue_l1cache(
-//     l1_cache *cache, warp_inst_t &inst, bool tlb_done, new_addr_type translated_pa) {
 // Rebuilds a PA from the per-warp translation table. Every PA the ldst unit
 // produces goes through here, so the offset mask always matches the page size
 // that was used to translate the address.
@@ -2462,131 +2464,6 @@ bool ldst_unit::texture_cycle(warp_inst_t &inst, mem_stage_stall_type &rc_fail,
   }
   return inst.accessq_empty();  // done if empty.
 }
-
-// bool ldst_unit::memory_cycle(warp_inst_t &inst,
-//                              mem_stage_stall_type &stall_reason,
-//                              mem_stage_access_type &access_type) {
-//   if (inst.empty() || ((inst.space.get_type() != global_space) &&
-//                        (inst.space.get_type() != local_space) &&
-//                        (inst.space.get_type() != param_space_local)))
-//     return true;
-//   if (inst.active_count() == 0) return true;
-//   if (inst.accessq_empty()) return true;
-
-//   mem_stage_stall_type stall_cond = NO_RC_FAIL;
-//   const mem_access_t &access = inst.accessq_back();
-
-//   bool bypassL1D = false;
-//   if (CACHE_GLOBAL == inst.cache_op || (m_L1D == NULL)) {
-//     bypassL1D = true;
-//   } else if (inst.space.is_global()) {  // global memory access
-//     // skip L1 cache if the option is enabled
-//     if (m_core->get_config()->gmem_skip_L1D && (CACHE_L1 != inst.cache_op))
-//       bypassL1D = true;
-//   }
-
-//   // Phase 4: L1 TLB lookup before the bypass/cache split.
-//   // Both bypassL1D and L1D-cache paths need VA->PA translation.
-//   // TLB is checked here once; the actual memory access proceeds below.
-//   bool tlb_translated = false;
-//   uint64_t translated_pa = 0;
-//   uint64_t cur_cycle  = m_core->get_gpu()->gpu_sim_cycle
-//                         + m_core->get_gpu()->gpu_tot_sim_cycle;
-
-//   if (m_l1_tlb_4k && m_gpu && m_gpu->get_gpu_module()) {
-//     uint64_t va         = access.get_addr();
-//     gpu_pte_t out_pte;
-//     gpu_l1_tlb::result_t tlb_res = m_l1_tlb_4k->access(va, inst.warp_id(), out_pte, cur_cycle);
-
-//     if (tlb_res == gpu_l1_tlb::HIT) {
-//       // TLB hit: compute PA and let the normal path proceed
-//       translated_pa = (out_pte.pfn() << GPU_PAGE_SHIFT) | (va & (GPU_PAGE_SIZE - 1));
-//       tlb_translated = true;
-//       printf("[L1_TLB] cycle=%llu SM=%u HIT va=0x%llx -> pa=0x%llx\n",
-//             (unsigned long long)cur_cycle, m_sid,
-//             (unsigned long long)va, (unsigned long long)translated_pa); // print_log
-
-//     } else if (tlb_res == gpu_l1_tlb::MSHR_HIT ||
-//                tlb_res == gpu_l1_tlb::LOOKUP_PENDING) {
-//       // Translation in-flight; stall this warp until GMMU completes.
-//       // P5 park DISABLED (issue<->dispatch race deadlock); fall back to P4 re-poll.
-//       if (m_decouple_tlb) {   // park (non-blocking) -> cycle() sets aside
-//         m_dispatch_parked = true;
-//         return true;                        // intercepted by park block before completion
-//       }
-//       stall_cond = TLB_STALL;
-//     } else {
-//       // Miss/pending: the L1 TLB (resolve_lookup/cycle) owns MSHR allocation and
-//       // the L1->L2 request queue. Just stall and retry (P4 re-poll; P5 park off).
-//       if (m_decouple_tlb) {   // park (non-blocking) -> cycle() sets aside
-//         m_dispatch_parked = true;
-//         return true;
-//       }
-//       stall_cond = TLB_STALL;
-//     }
-
-//     if (stall_cond == TLB_STALL) {
-//       stall_reason = TLB_STALL;
-//       bool iswrite = inst.is_store();
-//       access_type  = inst.space.is_local()
-//                       ? (iswrite ? L_MEM_ST : L_MEM_LD)
-//                       : (iswrite ? G_MEM_ST : G_MEM_LD);
-//       return false;
-//     }
-
-//     if (bypassL1D) {
-//       // bypass L1 cache
-//       unsigned control_size =
-//           inst.is_store() ? WRITE_PACKET_SIZE : READ_PACKET_SIZE;
-//       unsigned size = access.get_size() + control_size;
-//       // printf("Interconnect:Addr: %x, size=%d\n",access.get_addr(),size);
-//       if (m_memory_config->SST_mode &&
-//           (static_cast<sst_memory_interface *>(m_icnt)->full(
-//               size, inst.is_store() || inst.isatomic(), access.get_type()))) {
-//         // SST need mf type here
-//         // Cast it to sst_memory_interface pointer first as this full() method
-//         // is not a virtual method in parent class
-//         stall_cond = ICNT_RC_FAIL;
-//       } else if (!m_memory_config->SST_mode &&
-//                 (m_icnt->full(size, inst.is_store() || inst.isatomic()))) {
-//         stall_cond = ICNT_RC_FAIL;
-//       } else {
-//         // After (Phase 4): translation already done by L1 TLB above
-//         if (stall_cond == NO_RC_FAIL) {
-//           mem_fetch *mf = m_mf_allocator->alloc(inst, access, cur_cycle);
-//           // Apply PA from L1 TLB translation result
-//           if (tlb_translated && !mf->is_translated()) {
-//             mf->set_pa(translated_pa);
-//           }
-//           m_icnt->push(mf);
-//           inst.accessq_pop_back();
-//           if (inst.is_load()) {
-//             for (unsigned r = 0; r < MAX_OUTPUT_VALUES; r++)
-//               if (inst.out[r] > 0)
-//                 assert(m_pending_writes[inst.warp_id()][inst.out[r]] > 0);
-//           } else if (inst.is_store())
-//             m_core->inc_store_req(inst.warp_id());
-//         }
-//       }
-//     } else {
-//       assert(CACHE_UNDEFINED != inst.cache_op);
-//       // stall_cond = process_memory_access_queue_l1cache(m_L1D, inst);
-//       stall_cond = process_memory_access_queue_l1cache(m_L1D, inst, tlb_translated, translated_pa);
-//     }
-
-//     if (!inst.accessq_empty() && stall_cond == NO_RC_FAIL)
-//       stall_cond = COAL_STALL;
-//     if (stall_cond != NO_RC_FAIL) {
-//       stall_reason = stall_cond;
-//       bool iswrite = inst.is_store();
-//       if (inst.space.is_local())
-//         access_type = (iswrite) ? L_MEM_ST : L_MEM_LD;
-//       else
-//         access_type = (iswrite) ? G_MEM_ST : G_MEM_LD;
-//     }
-//     return inst.accessq_empty();
-//   }
-// }
 
 bool ldst_unit::memory_cycle(warp_inst_t &inst,
                              mem_stage_stall_type &stall_reason,
@@ -3088,7 +2965,7 @@ ldst_unit::ldst_unit(mem_fetch_interface *icnt,
            m_sid, m_config->gpgpu_l1_tlb_4k_sets, m_config->gpgpu_l1_tlb_4k_assoc,
            m_config->gpgpu_l1_tlb_4k_mshr_entries,
            m_config->gpgpu_l1_tlb_4k_mshr_max_merge,
-           m_config->gpgpu_l1_tlb_4k_lookup_latency); // print_log
+           m_config->gpgpu_l1_tlb_4k_lookup_latency);
 
     // 64KB L1 TLB: same class as the 4k one, only page_shift differs.
     m_l1_tlb_64k = new gpu_l1_tlb(
@@ -3103,7 +2980,7 @@ ldst_unit::ldst_unit(mem_fetch_interface *icnt,
            m_sid, m_config->gpgpu_l1_tlb_64k_sets, m_config->gpgpu_l1_tlb_64k_assoc,
            m_config->gpgpu_l1_tlb_64k_mshr_entries,
            m_config->gpgpu_l1_tlb_64k_mshr_max_merge,
-           m_config->gpgpu_l1_tlb_64k_lookup_latency); // print_log
+           m_config->gpgpu_l1_tlb_64k_lookup_latency);
 
     // 2MB L1 TLB: same class as the 4k one, only page_shift differs.
     m_l1_tlb_2m = new gpu_l1_tlb(
@@ -3118,7 +2995,7 @@ ldst_unit::ldst_unit(mem_fetch_interface *icnt,
            m_sid, m_config->gpgpu_l1_tlb_2m_sets, m_config->gpgpu_l1_tlb_2m_assoc,
            m_config->gpgpu_l1_tlb_2m_mshr_entries,
            m_config->gpgpu_l1_tlb_2m_mshr_max_merge,
-           m_config->gpgpu_l1_tlb_2m_lookup_latency); // print_log
+           m_config->gpgpu_l1_tlb_2m_lookup_latency);
 
     l1_latency_queue.resize(m_config->m_L1D_config.l1_banks);
     m_l1_tlb_2m->set_ports(m_config->gpgpu_l1_tlb_ports);
@@ -3436,7 +3313,7 @@ void ldst_unit::cycle_b() {
           printf("[L1_TLB_%s] cycle=%llu SM=%u fill vpn=0x%llx pfn=0x%llx\n",
                 page_kind_tag(pairs[p].shift),
                 (unsigned long long)cur_cycle, m_sid,
-                (unsigned long long)vpn, (unsigned long long)pte.pfn()); // print_log
+                (unsigned long long)vpn, (unsigned long long)pte.pfn());
           #endif
         }
       }
@@ -3714,7 +3591,7 @@ void shader_core_ctx::register_cta_thread_exit(unsigned cta_num,
     shader_CTA_count_unlog(m_sid, 1);
     if (accelsim_log_cta())
       printf("[CTA_DONE] sm=%u hw_cta=%u cycle=%llu\n", m_sid, cta_num,
-             (unsigned long long)(m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle)); // print_log
+             (unsigned long long)(m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle));
 
     SHADER_DPRINTF(
         LIVENESS,

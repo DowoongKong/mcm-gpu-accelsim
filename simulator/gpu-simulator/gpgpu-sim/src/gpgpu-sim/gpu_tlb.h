@@ -7,9 +7,9 @@
 #include <unordered_set>
 #include <deque>
 
-//  L1 TLB MSHR 
+//  L1 TLB MSHR
 // Tracks in-flight GMMU translation requests, keyed by VPN.
-// Does NOT store mem_fetch* ? GPGPU-Sim retry mechanism handles wakeup.
+// Does NOT store mem_fetch* -- the park/replay mechanism handles wakeup.
 // Mirrors mshr_table (gpu-cache.h) API: probe/full/add/mark_ready.
 class l1_tlb_mshr {
  public:
@@ -102,8 +102,8 @@ class gpu_l1_tlb {
 
   // Lookup va in the TLB.
   // HIT   : out_pte filled, return HIT.
-  // MISS  : vpn not in TLB and not in MSHR �� caller must enqueue GMMU.
-  // MSHR_HIT: vpn already in-flight �� stall (no new GMMU request).
+  // MISS  : vpn not in TLB and not in MSHR -> caller must enqueue GMMU.
+  // MSHR_HIT: vpn already in-flight -> stall (no new GMMU request).
   // LOOKUP_PENDING: vpn is in the lookup queue but not yet ready.
   result_t access(uint64_t va, unsigned warp_id,
                   gpu_pte_t &out_pte, uint64_t current_cycle);
@@ -202,7 +202,9 @@ class gpu_l1_tlb {
   }
   unsigned ports() const { return m_n_ports; }
  private:
-  // std::vector<lookup_slot> m_lookup_pipe_4k;          // index = remaining latency stage (0..lat-1)
+  // NOTE on the _4k suffixes below (findings.ko.md SMELL-10): historical names.
+  // Every gpu_l1_tlb INSTANCE (4k, 64k and 2m alike) uses these members for its
+  // own page size; nothing here is 4KB-specific. Index = remaining latency stage.
   std::vector<std::vector<lookup_slot>> m_lookup_pipe_4k;
   // Lookup ports: cap on how many probes may sit in the pipe at once.
   // 0 = unlimited (pre-existing behaviour). m_inflight_lookup_4k IS the

@@ -1498,12 +1498,6 @@ class ldst_unit : public pipelined_simd_unit {
       enum cache_request_status status);
   mem_stage_stall_type process_memory_access_queue(cache_t *cache,
                                                    warp_inst_t &inst);
-  // mem_stage_stall_type process_memory_access_queue_l1cache(l1_cache *cache,
-  //                                                          warp_inst_t &inst);
-  // mem_stage_stall_type process_memory_access_queue_l1cache(l1_cache *cache,
-  //                                                         warp_inst_t &inst,
-  //                                                         bool tlb_done = false,
-  //                                                         new_addr_type translated_pa = 0);
   // Takes wid + tlb_on instead of one table: the page size, and therefore which
   // table to read, is resolved per access inside.
   mem_stage_stall_type process_memory_access_queue_l1cache(
