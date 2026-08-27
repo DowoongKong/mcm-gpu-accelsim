@@ -1545,12 +1545,14 @@ class ldst_unit : public pipelined_simd_unit {
  private:
   std::unordered_map<unsigned, std::deque<warp_inst_t>> m_xlat_parked;
   std::deque<unsigned> m_xlat_replay_q;                     // ready to replay
-  // Option 3: FIFO of parked warps, used by the SAFETY NET. Picking
-  // m_xlat_parked.begin() serves warps in unordered_map bucket order, which
-  // has no fairness -- a warp can be pushed back indefinitely. Measured park
-  // residency was avg 1,632 / max 12,614 cycles against a 10-cycle probe
-  // latency, i.e. the wait was queueing, not probing.
+  // SAFETY-NET order queue (Option 3 + V7a). FIFO of parked warp ids so the
+  // backstop serves the longest-parked warp first (unordered_map bucket order
+  // had no fairness; measured park residency avg 1,632 / max 12,614 cycles).
+  // V7a: at most one entry per currently-parked warp, deduped by the set
+  // below -- bounds memory by warp count (the pre-V7a queue grew per park
+  // event without bound, speed-audit V7).
   std::deque<unsigned> m_xlat_park_order;
+  std::unordered_set<unsigned> m_xlat_in_park_order;  // V7a dedup for the queue
 
   // D-PROBE (measurement only; never read by the model). The replay-first path
   // and the SAFETY NET share the same "m_dispatch_reg->empty()" gate, so a

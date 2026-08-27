@@ -3487,14 +3487,22 @@ void ldst_unit::cycle_c() {
     while (!m_xlat_park_order.empty()) {
       const unsigned cand = m_xlat_park_order.front();
       m_xlat_park_order.pop_front();
+      m_xlat_in_park_order.erase(cand);   // V7a: entry consumed (stale or served)
       it = m_xlat_parked.find(cand);
       if (it != m_xlat_parked.end() && !it->second.empty()) break;
       it = m_xlat_parked.end();
     }
     if (it != m_xlat_parked.end()) {
+      const unsigned wsrv = it->first;
       *m_dispatch_reg = std::move(it->second.front());
       it->second.pop_front();
-      if (it->second.empty()) m_xlat_parked.erase(it);
+      if (it->second.empty()) {
+        m_xlat_parked.erase(it);
+      } else if (m_xlat_in_park_order.insert(wsrv).second) {
+        // V7a: still holds parked instructions -> re-queue at the back so the
+        // backstop can reach them even if every edge-triggered wakeup is lost.
+        m_xlat_park_order.push_back(wsrv);
+      }
     }
   }
 
@@ -3511,7 +3519,14 @@ void ldst_unit::cycle_c() {
   if (m_dispatch_parked) {                 // set-aside, free the dispatch reg
     unsigned w = pipe_reg.warp_id();
     m_xlat_parked[w].push_back(std::move(pipe_reg));  // cleared right below
-    m_xlat_park_order.push_back(w);   // Option 3: serve in park order
+    // V7a (model revision, user-approved): the backstop queue holds at most ONE
+    // entry per currently-parked warp (set-deduped). This bounds the queue by
+    // the warp count instead of the total park count (the old queue grew
+    // without bound and let a re-parked warp inherit a stale front position --
+    // see the refuted first attempt in the fix log). Every parked instruction
+    // stays backstop-reachable: the safety net re-queues a served warp below
+    // while it still holds parked instructions.
+    if (m_xlat_in_park_order.insert(w).second) m_xlat_park_order.push_back(w);
     m_dispatch_reg->clear();
     m_dispatch_parked = false;
     // A fill/wakeup that landed while this warp was momentarily unparked was
