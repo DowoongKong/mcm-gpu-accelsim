@@ -822,6 +822,10 @@ kernel_info_t::kernel_info_t(
   m_next_tid = m_next_cta;
   m_num_cores_running = 0;
   m_uid = (entry->gpgpu_ctx->kernel_info_m_next_uid)++;
+  // BUG-1 fix: this ctor (texture-snapshot launch path) never received a
+  // stream id and left m_streamID uninitialized -- heap-dependent statistics
+  // keys. -1 marks "no stream", matching what callers without a stream pass.
+  m_streamID = (unsigned long long)-1;
   m_param_mem = new memory_space_impl<8192>("param", 64 * 1024);
 
   // Jin: parent and child kernel management for CDP

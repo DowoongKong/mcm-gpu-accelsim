@@ -93,6 +93,10 @@ dram_t::dram_t(unsigned int partition_id, const memory_config *config,
   rwq_limit = 0;
   write_to_read_ratio_blp_rw_average = 0;
   bkgrp_parallsim_rw = 0;
+  // BUG-2 fix: these two were never initialized (no memset covers them), so
+  // the bank-level-parallelism report depended on heap contents.
+  banks_time_rw = 0;
+  banks_access_rw_total = 0;
 
   rw = READ;  // read mode is default
 
