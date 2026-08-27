@@ -2625,8 +2625,12 @@ void shader_core_ctx::issue_block2core(kernel_info_t &kernel) {
     dim3 g = kernel.get_grid_dim();
     dim3 xyz;
     xyz.x = ctaid % g.x; xyz.y = (ctaid / g.x) % g.y; xyz.z = ctaid / (g.x * g.y);
-    unsigned n_chip = m_gpu->get_gpu_module() ? m_gpu->get_gpu_module()->get_num_chiplets() : 1;
-    unsigned chiplet = m_tpc / (m_config->n_simt_clusters / n_chip);
+    // SMELL-6 fix: use the authoritative owner map instead of re-deriving the
+    // chiplet by integer division (wrong whenever split_range() hands the
+    // remainder clusters to the lower chiplets).
+    unsigned chiplet = m_gpu->get_gpu_module()
+                           ? m_gpu->get_gpu_module()->cluster_to_chiplet(m_tpc)
+                           : 0;
     printf("[CTA_ISSUE] kernel=%u cta=%u xyz=(%u,%u,%u) sm=%u cluster=%u chiplet=%u hw_cta=%u cycle=%llu\n",
            kernel.get_uid(), ctaid, xyz.x, xyz.y, xyz.z, m_sid, m_tpc, chiplet,
            free_cta_hw_id,
