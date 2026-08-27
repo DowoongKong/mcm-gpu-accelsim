@@ -118,9 +118,8 @@ void xbar_router::Push(unsigned input_deviceID, unsigned output_deviceID,
   assert(input_deviceID < total_nodes);
 
   mem_fetch* mf = static_cast<mem_fetch*>(data);
-  // Exhaustive over today's six mf_type values; a NEW type would leave `flits`
-  // uninitialized (findings.ko.md SMELL-13 -- flits_of() falls back to 1 instead).
-  unsigned flits;
+  unsigned flits = 1;  // SMELL-13 fix: fallback matches flits_of(); the two
+                       // branches below cover every current mf_type.
   // P3: when inter traffic is carried by the ring, the local xbar uses LOCAL flit
   // size for everything (no remote inflation). Ring owns inter bandwidth.
   bool is_local = m_inter_via_ring ? true : mf->is_local_access();

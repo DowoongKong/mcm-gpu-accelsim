@@ -42,6 +42,8 @@ chiplet::chiplet(gpgpu_sim* top, unsigned chiplet_id)
       m_n_clusters_per_chiplet(0),
       m_mem_global_begin(0),
       m_n_mem_per_chiplet(0),
+      m_mem_sub_partition_global_begin(0),
+      m_n_mem_sub_partition_per_chiplet(0),
       m_global_clusters(NULL),
       m_global_mem(NULL) {}
 
