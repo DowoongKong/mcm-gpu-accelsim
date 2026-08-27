@@ -2273,11 +2273,13 @@ kernel_info_t *cuda_sim::gpgpu_opencl_ptx_sim_init_grid(
       new kernel_info_t(gridDim, blockDim, entry, gpu->getNameArrayMapping(),
                         gpu->getNameInfoMapping());
   
-  // ========================================================================
-  // LASP: Apply heuristic scheduling policy at kernel launch time
-  // ========================================================================
-  unsigned num_chiplets = 4;  // MCM-GPU has 4 chiplets
-  lasp::kernel_lasp_config_t lasp_config = 
+  // LASP heuristic stamp -- OpenCL launch path ONLY (findings.ko.md SMELL-16).
+  // The CUDA/trace path stamps kernels from config in gpgpu_sim::launch() and
+  // deliberately leaves the heuristic unused; this path also hardcodes the
+  // chiplet count instead of reading -gpgpu_n_chiplets. Effectively dead for
+  // every current workload (none use OpenCL).
+  unsigned num_chiplets = 4;
+  lasp::kernel_lasp_config_t lasp_config =
       lasp_heuristic::analyze_kernel(result, num_chiplets);
   result->m_lasp_config = lasp_config;
   
