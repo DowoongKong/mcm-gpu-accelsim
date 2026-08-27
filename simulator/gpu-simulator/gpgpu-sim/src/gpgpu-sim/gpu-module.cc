@@ -57,11 +57,12 @@ void chiplet::bind_cluster_range(unsigned global_begin, unsigned count) {
   m_n_clusters_per_chiplet = count;
 }
 
-void chiplet::bind_mem_range(unsigned global_begin, unsigned count) {
+void chiplet::bind_mem_range(unsigned global_begin, unsigned count,
+                             unsigned sub_per_mem) {
   m_mem_global_begin = global_begin;
   m_n_mem_per_chiplet = count;
-  m_mem_sub_partition_global_begin = global_begin * 2; // Assume 2 sub-parts per mem part
-  m_n_mem_sub_partition_per_chiplet = count * 2; // Assume 2 sub-parts per mem part
+  m_mem_sub_partition_global_begin = global_begin * sub_per_mem;
+  m_n_mem_sub_partition_per_chiplet = count * sub_per_mem;
 }
 
 void chiplet::bind_global_arrays(simt_core_cluster** global_clusters,
@@ -135,6 +136,9 @@ void gpu_module::init() {
   m_mem_sub_partition_to_chiplet.assign(m_n_mem_sub_partition, 0);
 
   // Partition clusters and memory partitions with the same policy (contiguous split).
+  const unsigned spm =
+      m_top->getMemoryConfig()->m_n_sub_partition_per_memory_channel;
+  assert(m_n_mem_sub_partition == m_n_mem * spm);
   for (unsigned cid = 0; cid < m_n_chiplets; ++cid) {
     unsigned cb = 0, cc = 0;
     unsigned mb = 0, mc = 0;
@@ -143,7 +147,7 @@ void gpu_module::init() {
     split_range(m_n_mem, m_n_chiplets, cid, &mb, &mc);
 
     m_chiplets[cid]->bind_cluster_range(cb, cc);
-    m_chiplets[cid]->bind_mem_range(mb, mc);
+    m_chiplets[cid]->bind_mem_range(mb, mc, spm);
 
     for (unsigned i = 0; i < cc; ++i) {
       const unsigned g = cb + i;
@@ -154,12 +158,8 @@ void gpu_module::init() {
       const unsigned g = mb + i;
       assert(g < m_n_mem);
       m_mem_to_chiplet[g] = cid;
-      // CONSTRAINT: hardcodes 2 sub-partitions per memory channel instead of
-      // reading m_n_sub_partition_per_memory_channel (same assumption in
-      // chiplet::bind_mem_range). Wrong owner maps if a config ever changes
-      // -gpgpu_n_sub_partition_per_mchannel. findings.ko.md SMELL-2.
-      m_mem_sub_partition_to_chiplet[2*g] = cid;
-      m_mem_sub_partition_to_chiplet[2*g+1] = cid;
+      for (unsigned sp = 0; sp < spm; sp++)   // SMELL-2 fix: config value, not 2
+        m_mem_sub_partition_to_chiplet[g * spm + sp] = cid;
     }
   }
 
@@ -190,6 +190,36 @@ void gpu_module::init() {
   for (unsigned c = 0; c < m_n_chiplets; c++)
     distributed += m_chiplets[c]->free_page_count();
   assert(distributed == total_pages && "PMM page distribution mismatch");
+
+  // One-time cross-check (SMELL-3 fix; makes the A.1 verification permanent):
+  // the linear PMM split must agree with the config's addrdec chip bits for
+  // EVERY frame. Both express "which chiplet owns this PA"; if they disagree
+  // (D-bit position, indexing policy, mem size, or chiplet count changed),
+  // page ownership and every local/remote classification silently rot -- so
+  // fail loudly at init instead. Silent on success (digest-neutral).
+  {
+    const linear_to_raw_address_translation& am =
+        m_top->getMemoryConfig()->m_address_mapping;
+    for (uint64_t pfn = 0; pfn < total_pages; ++pfn) {
+      addrdec_t tlx;
+      am.addrdec_tlx(pfn << GPU_PAGE_SHIFT, &tlx);
+      const unsigned via_addrdec =
+          m_mem_sub_partition_to_chiplet[tlx.sub_partition];
+      const unsigned via_linear =
+          pfn_to_chiplet_via_addrdec(pfn << GPU_PAGE_SHIFT);
+      if (via_addrdec != via_linear) {
+        fprintf(stderr,
+                "\nFATAL: PMM linear split disagrees with the addrdec chip "
+                "mapping at pfn 0x%llx\n       (linear -> chiplet %u, addrdec "
+                "-> chiplet %u). Page ownership and local/remote\n       "
+                "accounting would be wrong; fix -gpgpu_mem_addr_mapping or "
+                "-gpgpu_n_chiplets.\n",
+                (unsigned long long)pfn, via_linear, via_addrdec);
+        fflush(stderr);
+        abort();
+      }
+    }
+  }
 
   for (unsigned c = 0; c < m_n_chiplets; c++)
     printf("[PMM] init: chiplet=%u pages=%zu (%.1f%%)\n",

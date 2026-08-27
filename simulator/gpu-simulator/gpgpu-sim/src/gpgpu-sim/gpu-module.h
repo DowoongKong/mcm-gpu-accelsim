@@ -351,8 +351,11 @@ class chiplet {
   // Bind contiguous range for clusters (global IDs)
   void bind_cluster_range(unsigned global_begin, unsigned count);
 
-  // Bind contiguous range for memory partitions (global IDs)
-  void bind_mem_range(unsigned global_begin, unsigned count);
+  // Bind contiguous range for memory partitions (global IDs).
+  // sub_per_mem = m_n_sub_partition_per_memory_channel (SMELL-2 fix: was a
+  // hardcoded 2).
+  void bind_mem_range(unsigned global_begin, unsigned count,
+                      unsigned sub_per_mem);
 
   // After gpgpu_sim allocates global arrays, chiplet stores the pointers here.
   void bind_global_arrays(simt_core_cluster** global_clusters,
