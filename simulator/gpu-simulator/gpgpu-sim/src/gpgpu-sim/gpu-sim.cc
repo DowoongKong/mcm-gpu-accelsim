@@ -1,0 +1,3943 @@
+// Copyright (c) 2009-2021, Tor M. Aamodt, Wilson W.L. Fung, George L. Yuan,
+// Ali Bakhoda, Andrew Turner, Ivan Sham, Vijay Kandiah, Nikos Hardavellas,
+// Mahmoud Khairy, Junrui Pan, Timothy G. Rogers
+// The University of British Columbia, Northwestern University, Purdue
+// University All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are met:
+//
+// 1. Redistributions of source code must retain the above copyright notice,
+// this
+//    list of conditions and the following disclaimer;
+// 2. Redistributions in binary form must reproduce the above copyright notice,
+//    this list of conditions and the following disclaimer in the documentation
+//    and/or other materials provided with the distribution;
+// 3. Neither the names of The University of British Columbia, Northwestern
+//    University nor the names of their contributors may be used to
+//    endorse or promote products derived from this software without specific
+//    prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+// POSSIBILITY OF SUCH DAMAGE.
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+#include "gpu-sim.h"
+
+#include <math.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include "zlib.h"
+
+#include "dram.h"
+#include "mem_fetch.h"
+#include "shader.h"
+#include "shader_trace.h"
+#include "gpu-module.h"  // MCM chiplet topology wrapper
+#include "gmmu.h"        // full definition needed: gmmu->cycle() is called below
+#include "par_serial_probe.h"
+#include "../lasp/lasp_simple.h"
+
+#include <time.h>
+#include "addrdec.h"
+#include "delayqueue.h"
+#include "dram.h"
+#include "gpu-cache.h"
+#include "gpu-misc.h"
+#include "icnt_wrapper.h"
+#include "l2cache.h"
+
+#include <chrono>  // PHASE_TIMING: wall-clock phase-boundary instrumentation
+
+// FUNNEL_ (temp): defined in local_interconnect.cc; set each ICNT cycle below.
+extern unsigned long long g_icnt_now;
+
+// ACCEPT_ (temp): per-chiplet mem-accept backpressure. g_memfull_stall = cycles a
+// sub-partition rejected an icnt request because it was full; g_memfull_total =
+// total sub-partition service opportunities. High chiplet0 ratio => accept path is
+// the convergence bottleneck (then DRAM bwutil tells if it's DRAM or upstream L2/queue).
+unsigned long long g_memfull_stall[8] = {0};
+unsigned long long g_memfull_total[8] = {0};
+
+// PHASE_TIMING (perf audit, docs/parallelization_overview.ko.md step 0): wall-clock
+// share of each cycle()-domain block, to find where the remaining sequential time
+// actually goes (L2/GMMU loop and ICNT are currently unparallelized -- this measures
+// whether that's worth fixing before doing it). Diagnostic only: gated off by default,
+// touches no simulation state, and prints to stderr on a separate line so it can never
+// leak into a digest comparison (mirrors the STATEHASH / ACCELSIM_SERIAL_PHASE pattern).
+// perf(1) is not available in this container (confirmed 2026-08-15) -- this is the
+// documented fallback from docs/xlat_perf_audit_plan.ko.md Sec 3-2, not a fresh guess.
+// §25 needs g_phase_timing_on readable from local_interconnect.cc
+// (LocalInterconnect::Advance(), a different translation unit). `const`
+// globals have internal linkage by default in C++ -- `extern` here is not
+// optional, unlike for a plain non-const global.
+extern const bool g_phase_timing_on = (getenv("ACCELSIM_PHASE_TIMING") != NULL);
+
+// P-5: runtime gate for the (temp) diagnostic counter families -- ACCEPT_,
+// POPGATE_, NORMREP/FUNNEL_, MEMLAT_, RINGLAT_/RINGSRC_/RINGINJ_/RINGLINK_/
+// BUCKET_, D-PROBE. None of their output lines are digest patterns
+// (scripts/xtract_amrs.py), so disabling them is digest-neutral. Default OFF;
+// set ACCELSIM_DIAG=1 to restore both the counters and their report lines
+// without rebuilding (same pattern as ACCELSIM_LOG_GMMU / PHASE_TIMING).
+// The XLATLAT/XLATSUM/GMMU_STAT/PWQ instrumentation is research data and part
+// of the digest -- it stays unconditional.
+extern const bool g_accelsim_diag = (getenv("ACCELSIM_DIAG") != NULL);
+
+// Verification logging: CTA placement lines, OFF unless ACCELSIM_LOG_CTA is
+// set. [CTA_ISSUE] pairs with [CTA_DONE] on (sm, hw_cta) in FIFO order, since
+// a hardware CTA slot is reused only after it has been released.
+static bool accelsim_log_cta() {
+  static const bool on = (getenv("ACCELSIM_LOG_CTA") != NULL);
+  return on;
+}
+struct phase_timers_t {
+  unsigned long long dram_ns = 0, l2gmmu_ns = 0, icnt_ns = 0;
+  unsigned long long cycle_ns = 0, cluster_icnt_ns = 0, tail_ns = 0;
+  unsigned long long tail_issue_ns = 0, tail_occ_ns = 0;
+  unsigned long long phase_a_ns = 0, phase_b_ns = 0, phase_c_ns = 0;
+  unsigned long long dram_calls = 0, l2gmmu_calls = 0, icnt_calls = 0;
+  unsigned long long phase_a_calls = 0, phase_b_calls = 0, phase_c_calls = 0;
+  // D1 (pressure_speedup_implog Sec 5): phase B wall time per chiplet group and
+  // which OMP thread ran each group (checks the dynamic schedule). Written
+  // inside the parallel loop, one group per iteration, so no two threads ever
+  // touch the same index at the same time. Measurement only, PHASE_TIMING-gated.
+  unsigned long long phase_b_chip_ns[8] = {0};
+  unsigned long long phase_b_chip_thread[8][16] = {{0}};
+  // D1b: this cycle's body time per group (written in the loop, read by the
+  // master after the region joins), the sum over cycles of the per-cycle
+  // maximum (the region's critical path if scheduling were free), which group
+  // was the maximum, and log2(us) histograms of the per-cycle maximum and of
+  // every group body.
+  unsigned long long phase_b_chip_cur_ns[8] = {0};
+  unsigned long long phase_b_cyclemax_ns = 0;
+  unsigned long long phase_b_argmax_cnt[8] = {0};
+  unsigned long long phase_b_max_hist[24] = {0};
+  unsigned long long phase_b_body_hist[24] = {0};
+};
+static inline unsigned phase_log2us_bucket(unsigned long long ns) {  // D1b
+  unsigned long long us = ns / 1000ull;
+  unsigned b = 0;
+  while (us > 1 && b < 23) { us >>= 1; b++; }
+  return b;
+}
+static phase_timers_t g_phase_timers;
+// §25 pre-measurement: split icnt_ns into the part that will become
+// chiplet-parallel (local xbar Advance()) vs the part that must stay
+// sequential (handoff/handoff_ring, real chiplet-to-chiplet exchange).
+// Free-standing (not struct members) so local_interconnect.cc can extern
+// them without needing phase_timers_t's definition.
+unsigned long long g_icnt_local_ns = 0, g_icnt_handoff_ns = 0;
+unsigned long long g_icnt_local_calls = 0, g_icnt_handoff_calls = 0;
+// H3 measurement: the icnt phase timer covers TWO blocks -- the memory-controller
+// -> interconnect pop loop (this counter) and icnt_transfer()'s xbar Advance
+// (g_icnt_local_ns + g_icnt_handoff_ns). icnt_calls is exactly 2x local_calls
+// because of that, which made the phase look like it had unexplained overhead.
+// Split it out so the two are attributable separately.
+unsigned long long g_icnt_pop_ns = 0, g_icnt_pop_calls = 0;
+static inline unsigned long long phase_now_ns() {
+  using namespace std::chrono;
+  return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
+}
+#include "shader.h"
+#include "stat-tool.h"
+
+#include "../../libcuda/gpgpu_context.h"
+#include "../abstract_hardware_model.h"
+#include "../cuda-sim/cuda-sim.h"
+#include "../cuda-sim/cuda_device_runtime.h"
+#include "../cuda-sim/ptx-stats.h"
+#include "../cuda-sim/ptx_ir.h"
+#include "../debug.h"
+#include "../gpgpusim_entrypoint.h"
+#include "../statwrapper.h"
+#include "../trace.h"
+#include "mem_latency_stat.h"
+#include "power_stat.h"
+#include "stats.h"
+#include "visualizer.h"
+#include "../lasp/lasp_simple.h"
+
+#ifdef GPGPUSIM_POWER_MODEL
+#include "power_interface.h"
+#else
+class gpgpu_sim_wrapper {};
+#endif
+
+#include <stdio.h>
+#include <string.h>
+#include <iostream>
+#include <sstream>
+#include <string>
+
+// #define MAX(a, b) (((a) > (b)) ? (a) : (b)) //redefined
+
+bool g_interactive_debugger_enabled = false;
+
+tr1_hash_map<new_addr_type, unsigned> address_random_interleaving;
+
+/* Clock Domains */
+
+#define CORE 0x01
+#define L2 0x02
+#define DRAM 0x04
+#define ICNT 0x08
+
+#define MEM_LATENCY_STAT_IMPL
+
+#include "mem_latency_stat.h"
+
+void power_config::reg_options(class OptionParser *opp) {
+  option_parser_register(opp, "-accelwattch_xml_file", OPT_CSTR,
+                         &g_power_config_name, "AccelWattch XML file",
+                         "accelwattch_sass_sim.xml");
+
+  option_parser_register(opp, "-power_simulation_enabled", OPT_BOOL,
+                         &g_power_simulation_enabled,
+                         "Turn on power simulator (1=On, 0=Off)", "0");
+
+  option_parser_register(opp, "-power_per_cycle_dump", OPT_BOOL,
+                         &g_power_per_cycle_dump,
+                         "Dump detailed power output each cycle", "0");
+
+  option_parser_register(opp, "-hw_perf_file_name", OPT_CSTR,
+                         &g_hw_perf_file_name,
+                         "Hardware Performance Statistics file", "hw_perf.csv");
+
+  option_parser_register(
+      opp, "-hw_perf_bench_name", OPT_CSTR, &g_hw_perf_bench_name,
+      "Kernel Name in Hardware Performance Statistics file", "");
+
+  option_parser_register(opp, "-power_simulation_mode", OPT_INT32,
+                         &g_power_simulation_mode,
+                         "Switch performance counter input for power "
+                         "simulation (0=Sim, 1=HW, 2=HW-Sim Hybrid)",
+                         "0");
+
+  option_parser_register(opp, "-dvfs_enabled", OPT_BOOL, &g_dvfs_enabled,
+                         "Turn on DVFS for power model", "0");
+  option_parser_register(opp, "-aggregate_power_stats", OPT_BOOL,
+                         &g_aggregate_power_stats,
+                         "Accumulate power across all kernels", "0");
+
+  // Accelwattch Hyrbid Configuration
+
+  option_parser_register(
+      opp, "-accelwattch_hybrid_perfsim_L1_RH", OPT_BOOL,
+      &accelwattch_hybrid_configuration[HW_L1_RH],
+      "Get L1 Read Hits for Accelwattch-Hybrid from Accel-Sim", "0");
+  option_parser_register(
+      opp, "-accelwattch_hybrid_perfsim_L1_RM", OPT_BOOL,
+      &accelwattch_hybrid_configuration[HW_L1_RM],
+      "Get L1 Read Misses for Accelwattch-Hybrid from Accel-Sim", "0");
+  option_parser_register(
+      opp, "-accelwattch_hybrid_perfsim_L1_WH", OPT_BOOL,
+      &accelwattch_hybrid_configuration[HW_L1_WH],
+      "Get L1 Write Hits for Accelwattch-Hybrid from Accel-Sim", "0");
+  option_parser_register(
+      opp, "-accelwattch_hybrid_perfsim_L1_WM", OPT_BOOL,
+      &accelwattch_hybrid_configuration[HW_L1_WM],
+      "Get L1 Write Misses for Accelwattch-Hybrid from Accel-Sim", "0");
+
+  option_parser_register(
+      opp, "-accelwattch_hybrid_perfsim_L2_RH", OPT_BOOL,
+      &accelwattch_hybrid_configuration[HW_L2_RH],
+      "Get L2 Read Hits for Accelwattch-Hybrid from Accel-Sim", "0");
+  option_parser_register(
+      opp, "-accelwattch_hybrid_perfsim_L2_RM", OPT_BOOL,
+      &accelwattch_hybrid_configuration[HW_L2_RM],
+      "Get L2 Read Misses for Accelwattch-Hybrid from Accel-Sim", "0");
+  option_parser_register(
+      opp, "-accelwattch_hybrid_perfsim_L2_WH", OPT_BOOL,
+      &accelwattch_hybrid_configuration[HW_L2_WH],
+      "Get L2 Write Hits for Accelwattch-Hybrid from Accel-Sim", "0");
+  option_parser_register(
+      opp, "-accelwattch_hybrid_perfsim_L2_WM", OPT_BOOL,
+      &accelwattch_hybrid_configuration[HW_L2_WM],
+      "Get L2 Write Misses for Accelwattch-Hybrid from Accel-Sim", "0");
+
+  option_parser_register(
+      opp, "-accelwattch_hybrid_perfsim_CC_ACC", OPT_BOOL,
+      &accelwattch_hybrid_configuration[HW_CC_ACC],
+      "Get Constant Cache Acesses for Accelwattch-Hybrid from Accel-Sim", "0");
+
+  option_parser_register(
+      opp, "-accelwattch_hybrid_perfsim_SHARED_ACC", OPT_BOOL,
+      &accelwattch_hybrid_configuration[HW_SHRD_ACC],
+      "Get Shared Memory Acesses for Accelwattch-Hybrid from Accel-Sim", "0");
+
+  option_parser_register(opp, "-accelwattch_hybrid_perfsim_DRAM_RD", OPT_BOOL,
+                         &accelwattch_hybrid_configuration[HW_DRAM_RD],
+                         "Get DRAM Reads for Accelwattch-Hybrid from Accel-Sim",
+                         "0");
+  option_parser_register(
+      opp, "-accelwattch_hybrid_perfsim_DRAM_WR", OPT_BOOL,
+      &accelwattch_hybrid_configuration[HW_DRAM_WR],
+      "Get DRAM Writes for Accelwattch-Hybrid from Accel-Sim", "0");
+
+  option_parser_register(
+      opp, "-accelwattch_hybrid_perfsim_NOC", OPT_BOOL,
+      &accelwattch_hybrid_configuration[HW_NOC],
+      "Get Interconnect Acesses for Accelwattch-Hybrid from Accel-Sim", "0");
+
+  option_parser_register(
+      opp, "-accelwattch_hybrid_perfsim_PIPE_DUTY", OPT_BOOL,
+      &accelwattch_hybrid_configuration[HW_PIPE_DUTY],
+      "Get Pipeline Duty Cycle Acesses for Accelwattch-Hybrid from Accel-Sim",
+      "0");
+
+  option_parser_register(
+      opp, "-accelwattch_hybrid_perfsim_NUM_SM_IDLE", OPT_BOOL,
+      &accelwattch_hybrid_configuration[HW_NUM_SM_IDLE],
+      "Get Number of Idle SMs for Accelwattch-Hybrid from Accel-Sim", "0");
+
+  option_parser_register(
+      opp, "-accelwattch_hybrid_perfsim_CYCLES", OPT_BOOL,
+      &accelwattch_hybrid_configuration[HW_CYCLES],
+      "Get Executed Cycles for Accelwattch-Hybrid from Accel-Sim", "0");
+
+  option_parser_register(
+      opp, "-accelwattch_hybrid_perfsim_VOLTAGE", OPT_BOOL,
+      &accelwattch_hybrid_configuration[HW_VOLTAGE],
+      "Get Chip Voltage for Accelwattch-Hybrid from Accel-Sim", "0");
+
+  // Output Data Formats
+  option_parser_register(
+      opp, "-power_trace_enabled", OPT_BOOL, &g_power_trace_enabled,
+      "produce a file for the power trace (1=On, 0=Off)", "0");
+
+  option_parser_register(
+      opp, "-power_trace_zlevel", OPT_INT32, &g_power_trace_zlevel,
+      "Compression level of the power trace output log (0=no comp, 9=highest)",
+      "6");
+
+  option_parser_register(
+      opp, "-steady_power_levels_enabled", OPT_BOOL,
+      &g_steady_power_levels_enabled,
+      "produce a file for the steady power levels (1=On, 0=Off)", "0");
+
+  option_parser_register(opp, "-steady_state_definition", OPT_CSTR,
+                         &gpu_steady_state_definition,
+                         "allowed deviation:number of samples", "8:4");
+}
+
+void memory_config::reg_options(class OptionParser *opp) {
+  option_parser_register(opp, "-gpgpu_perf_sim_memcpy", OPT_BOOL,
+                         &m_perf_sim_memcpy, "Fill the L2 cache on memcpy",
+                         "1");
+  option_parser_register(opp, "-gpgpu_simple_dram_model", OPT_BOOL,
+                         &simple_dram_model,
+                         "simple_dram_model with fixed latency and BW", "0");
+  option_parser_register(opp, "-gpgpu_dram_scheduler", OPT_INT32,
+                         &scheduler_type, "0 = fifo, 1 = FR-FCFS (defaul)",
+                         "1");
+  option_parser_register(opp, "-gpgpu_dram_partition_queues", OPT_CSTR,
+                         &gpgpu_L2_queue_config, "i2$:$2d:d2$:$2i", "8:8:8:8");
+
+  option_parser_register(opp, "-l2_ideal", OPT_BOOL, &l2_ideal,
+                         "Use a ideal L2 cache that always hit", "0");
+  option_parser_register(opp, "-gpgpu_cache:dl2", OPT_CSTR,
+                         &m_L2_config.m_config_string,
+                         "unified banked L2 data cache config "
+                         " {<nsets>:<bsize>:<assoc>,<rep>:<wr>:<alloc>:<wr_"
+                         "alloc>,<mshr>:<N>:<merge>,<mq>}",
+                         "64:128:8,L:B:m:N,A:16:4,4");
+  option_parser_register(opp, "-gpgpu_cache:dl2_texture_only", OPT_BOOL,
+                         &m_L2_texure_only, "L2 cache used for texture only",
+                         "1");
+  option_parser_register(
+      opp, "-gpgpu_n_mem", OPT_UINT32, &m_n_mem,
+      "number of memory modules (e.g. memory controllers) in gpu", "8");
+  option_parser_register(opp, "-gpgpu_n_sub_partition_per_mchannel", OPT_UINT32,
+                         &m_n_sub_partition_per_memory_channel,
+                         "number of memory subpartition in each memory module",
+                         "1");
+  option_parser_register(opp, "-gpgpu_n_mem_per_ctrlr", OPT_UINT32,
+                         &gpu_n_mem_per_ctrlr,
+                         "number of memory chips per memory controller", "1");
+  option_parser_register(opp, "-gpgpu_memlatency_stat", OPT_INT32,
+                         &gpgpu_memlatency_stat,
+                         "track and display latency statistics 0x2 enables MC, "
+                         "0x4 enables queue logs",
+                         "0");
+  option_parser_register(opp, "-gpgpu_frfcfs_dram_sched_queue_size", OPT_INT32,
+                         &gpgpu_frfcfs_dram_sched_queue_size,
+                         "0 = unlimited (default); # entries per chip", "0");
+  option_parser_register(opp, "-gpgpu_dram_return_queue_size", OPT_INT32,
+                         &gpgpu_dram_return_queue_size,
+                         "0 = unlimited (default); # entries per chip", "0");
+  option_parser_register(opp, "-gpgpu_dram_buswidth", OPT_UINT32, &busW,
+                         "default = 4 bytes (8 bytes per cycle at DDR)", "4");
+  option_parser_register(
+      opp, "-gpgpu_dram_burst_length", OPT_UINT32, &BL,
+      "Burst length of each DRAM request (default = 4 data bus cycle)", "4");
+  option_parser_register(opp, "-dram_data_command_freq_ratio", OPT_UINT32,
+                         &data_command_freq_ratio,
+                         "Frequency ratio between DRAM data bus and command "
+                         "bus (default = 2 times, i.e. DDR)",
+                         "2");
+  option_parser_register(
+      opp, "-gpgpu_dram_timing_opt", OPT_CSTR, &gpgpu_dram_timing_opt,
+      "DRAM timing parameters = "
+      "{nbk:tCCD:tRRD:tRCD:tRAS:tRP:tRC:CL:WL:tCDLR:tWR:nbkgrp:tCCDL:tRTPL}",
+      "4:2:8:12:21:13:34:9:4:5:13:1:0:0");
+  option_parser_register(opp, "-gpgpu_l2_rop_latency", OPT_UINT32, &rop_latency,
+                         "ROP queue latency (default 85)", "85");
+  option_parser_register(opp, "-dram_latency", OPT_UINT32, &dram_latency,
+                         "DRAM latency (default 30)", "30");
+  option_parser_register(opp, "-dram_dual_bus_interface", OPT_UINT32,
+                         &dual_bus_interface,
+                         "dual_bus_interface (default = 0) ", "0");
+  option_parser_register(opp, "-dram_bnk_indexing_policy", OPT_UINT32,
+                         &dram_bnk_indexing_policy,
+                         "dram_bnk_indexing_policy (0 = normal indexing, 1 = "
+                         "Xoring with the higher bits) (Default = 0)",
+                         "0");
+  option_parser_register(opp, "-dram_bnkgrp_indexing_policy", OPT_UINT32,
+                         &dram_bnkgrp_indexing_policy,
+                         "dram_bnkgrp_indexing_policy (0 = take higher bits, 1 "
+                         "= take lower bits) (Default = 0)",
+                         "0");
+  option_parser_register(opp, "-dram_seperate_write_queue_enable", OPT_BOOL,
+                         &seperate_write_queue_enabled,
+                         "Seperate_Write_Queue_Enable", "0");
+  option_parser_register(opp, "-dram_write_queue_size", OPT_CSTR,
+                         &write_queue_size_opt, "Write_Queue_Size", "32:28:16");
+  option_parser_register(
+      opp, "-dram_elimnate_rw_turnaround", OPT_BOOL, &elimnate_rw_turnaround,
+      "elimnate_rw_turnaround i.e set tWTR and tRTW = 0", "0");
+  option_parser_register(opp, "-icnt_flit_size", OPT_UINT32, &icnt_flit_size,
+                         "icnt_flit_size", "32");
+  option_parser_register(opp, "-icnt_inter_flit_size", OPT_UINT32, &icnt_inter_flit_size,
+                         "icnt_inter_flit_size", "8");
+  // SST mode activate
+  option_parser_register(opp, "-SST_mode", OPT_BOOL, &SST_mode, "SST mode",
+                         "0");
+  m_address_mapping.addrdec_setoption(opp);
+}
+
+void shader_core_config::reg_options(class OptionParser *opp) {
+  option_parser_register(opp, "-gpgpu_simd_model", OPT_INT32, &model,
+                         "1 = post-dominator", "1");
+  option_parser_register(
+      opp, "-gpgpu_shader_core_pipeline", OPT_CSTR,
+      &gpgpu_shader_core_pipeline_opt,
+      "shader core pipeline config, i.e., {<nthread>:<warpsize>}", "1024:32");
+  option_parser_register(opp, "-gpgpu_tex_cache:l1", OPT_CSTR,
+                         &m_L1T_config.m_config_string,
+                         "per-shader L1 texture cache  (READ-ONLY) config "
+                         " {<nsets>:<bsize>:<assoc>,<rep>:<wr>:<alloc>:<wr_"
+                         "alloc>,<mshr>:<N>:<merge>,<mq>:<rf>}",
+                         "8:128:5,L:R:m:N,F:128:4,128:2");
+  option_parser_register(
+      opp, "-gpgpu_const_cache:l1", OPT_CSTR, &m_L1C_config.m_config_string,
+      "per-shader L1 constant memory cache  (READ-ONLY) config "
+      " {<nsets>:<bsize>:<assoc>,<rep>:<wr>:<alloc>:<wr_alloc>,<mshr>:<N>:<"
+      "merge>,<mq>} ",
+      "64:64:2,L:R:f:N,A:2:32,4");
+  option_parser_register(opp, "-gpgpu_cache:il1", OPT_CSTR,
+                         &m_L1I_config.m_config_string,
+                         "shader L1 instruction cache config "
+                         " {<nsets>:<bsize>:<assoc>,<rep>:<wr>:<alloc>:<wr_"
+                         "alloc>,<mshr>:<N>:<merge>,<mq>} ",
+                         "4:256:4,L:R:f:N,A:2:32,4");
+  option_parser_register(opp, "-gpgpu_cache:dl1", OPT_CSTR,
+                         &m_L1D_config.m_config_string,
+                         "per-shader L1 data cache config "
+                         " {<nsets>:<bsize>:<assoc>,<rep>:<wr>:<alloc>:<wr_"
+                         "alloc>,<mshr>:<N>:<merge>,<mq> | none}",
+                         "none");
+  option_parser_register(opp, "-gpgpu_l1_cache_write_ratio", OPT_UINT32,
+                         &m_L1D_config.m_wr_percent, "L1D write ratio", "0");
+  option_parser_register(opp, "-gpgpu_l1_banks", OPT_UINT32,
+                         &m_L1D_config.l1_banks, "The number of L1 cache banks",
+                         "1");
+  option_parser_register(opp, "-gpgpu_l1_banks_byte_interleaving", OPT_UINT32,
+                         &m_L1D_config.l1_banks_byte_interleaving,
+                         "l1 banks byte interleaving granularity", "32");
+  option_parser_register(opp, "-gpgpu_l1_banks_hashing_function", OPT_UINT32,
+                         &m_L1D_config.l1_banks_hashing_function,
+                         "l1 banks hashing function", "0");
+  option_parser_register(opp, "-gpgpu_l1_latency", OPT_UINT32,
+                         &m_L1D_config.l1_latency, "L1 Hit Latency", "1");
+  // L1 TLB configuration options 
+  option_parser_register(opp, "-gpgpu_l1_tlb_4k_sets", OPT_UINT32,
+                         &gpgpu_l1_tlb_4k_sets,
+                         "L1 TLB (4KB) sets: 1 = fully-associative", "1");
+  option_parser_register(opp, "-gpgpu_l1_tlb_4k_assoc", OPT_UINT32,
+                         &gpgpu_l1_tlb_4k_assoc,
+                         "L1 TLB (4KB) ways (entries when fully-associative)", "32");
+  option_parser_register(opp, "-gpgpu_l1_tlb_4k_mshr_entries", OPT_UINT32,
+                         &gpgpu_l1_tlb_4k_mshr_entries,
+                         "L1 TLB (4KB) MSHR in-flight VPN capacity", "16");
+  option_parser_register(opp, "-gpgpu_l1_tlb_4k_mshr_max_merge", OPT_UINT32,
+                         &gpgpu_l1_tlb_4k_mshr_max_merge,
+                         "L1 TLB (4KB) max merged requests per in-flight VPN", "192");
+  option_parser_register(opp, "-gpgpu_l1_tlb_4k_lookup_latency", OPT_UINT32,
+                         &gpgpu_l1_tlb_4k_lookup_latency,
+                         "L1 TLB (4KB) lookup latency in core cycles", "10");
+  // L1 TLB (64KB) configuration options. Defaults keep the 64KB TLB idle unless
+  // -gpgpu_page_size_policy selects 64KB pages. Sizes follow the MCM-GPU reference
+  // config (32/16/8 entries for 4KB/64KB/2MB); MSHR matches the 4KB TLB's so page
+  // size stays the only variable.
+  option_parser_register(opp, "-gpgpu_l1_tlb_64k_sets", OPT_UINT32,
+                         &gpgpu_l1_tlb_64k_sets,
+                         "L1 TLB (64KB) sets: 1 = fully-associative", "1");
+  option_parser_register(opp, "-gpgpu_l1_tlb_64k_assoc", OPT_UINT32,
+                         &gpgpu_l1_tlb_64k_assoc,
+                         "L1 TLB (64KB) ways (entries when fully-associative)", "16");
+  option_parser_register(opp, "-gpgpu_l1_tlb_64k_mshr_entries", OPT_UINT32,
+                         &gpgpu_l1_tlb_64k_mshr_entries,
+                         "L1 TLB (64KB) MSHR in-flight VPN capacity", "16");
+  option_parser_register(opp, "-gpgpu_l1_tlb_64k_mshr_max_merge", OPT_UINT32,
+                         &gpgpu_l1_tlb_64k_mshr_max_merge,
+                         "L1 TLB (64KB) max merged requests per in-flight VPN", "192");
+  option_parser_register(opp, "-gpgpu_l1_tlb_64k_lookup_latency", OPT_UINT32,
+                         &gpgpu_l1_tlb_64k_lookup_latency,
+                         "L1 TLB (64KB) lookup latency in core cycles", "10");
+  // L1 TLB (2MB) configuration options. Defaults keep the 2MB TLB idle unless
+  // -gpgpu_page_size_policy selects 2MB pages.
+  // Sizes follow the MCM-GPU reference config: L1 TLB is per-SM, fully
+  // associative, 10-cycle, 32/16/8 entries for 4KB/64KB/2MB.
+  // MSHR sizes are not part of that config, so they are kept equal to the 4KB
+  // TLB's: page size stays the only variable between the two TLBs.
+  option_parser_register(opp, "-gpgpu_l1_tlb_2m_sets", OPT_UINT32,
+                         &gpgpu_l1_tlb_2m_sets,
+                         "L1 TLB (2MB) sets: 1 = fully-associative", "1");
+  option_parser_register(opp, "-gpgpu_l1_tlb_2m_assoc", OPT_UINT32,
+                         &gpgpu_l1_tlb_2m_assoc,
+                         "L1 TLB (2MB) ways (entries when fully-associative)", "8");
+  option_parser_register(opp, "-gpgpu_l1_tlb_2m_mshr_entries", OPT_UINT32,
+                         &gpgpu_l1_tlb_2m_mshr_entries,
+                         "L1 TLB (2MB) MSHR in-flight VPN capacity", "16");
+  option_parser_register(opp, "-gpgpu_l1_tlb_2m_mshr_max_merge", OPT_UINT32,
+                         &gpgpu_l1_tlb_2m_mshr_max_merge,
+                         "L1 TLB (2MB) max merged requests per in-flight VPN", "192");
+  option_parser_register(opp, "-gpgpu_l1_tlb_2m_lookup_latency", OPT_UINT32,
+                         &gpgpu_l1_tlb_2m_lookup_latency,
+                         "L1 TLB (2MB) lookup latency in core cycles", "10");
+  option_parser_register(opp, "-gpgpu_page_size_policy", OPT_UINT32,
+                         &gpgpu_page_size_policy,
+                         "page size policy. fixed (every alloc same size): "
+                         "0 = all 4KB (baseline), 1 = all 64KB, 2 = all 2MB. "
+                         "automatic (largest page with alloc size >= page size): "
+                         "3 = 4KB/64KB/2MB, 4 = 4KB/2MB, 5 = 4KB/64KB", "0");
+  option_parser_register(opp, "-gpgpu_l2_tlb_issue_width", OPT_UINT32,
+                         &gpgpu_l2_tlb_issue_width,
+                         "L1->L2 TLB requests one SM may issue per cycle. Issue is "
+                         "decoupled from completion, so this is the interface width, "
+                         "not the number of outstanding lookups (that is the MSHR).",
+                         "2");
+  option_parser_register(opp, "-gpgpu_l1_tlb_ports", OPT_UINT32,
+                         &gpgpu_l1_tlb_ports,
+                         "concurrent array probes the per-SM L1 TLB can run "
+                         "(0 = unlimited, the pre-existing behaviour)",
+                         "0");  // 35: occupancy ports inflate cycles ~34% (33); default off
+  option_parser_register(opp, "-gpgpu_l2_tlb_ports", OPT_UINT32,
+                         &gpgpu_l2_tlb_ports,
+                         "concurrent array probes the per-chiplet L2 TLB can run "
+                         "(0 = unlimited, the pre-existing behaviour)",
+                         "0");  // 35: see above -- the L2 gate was the larger distorter
+  option_parser_register(opp, "-gpgpu_tlb_decouple", OPT_BOOL,
+                         &gpgpu_tlb_decouple,
+                         "non-blocking L1 TLB via ldst park/replay "
+                         "(1 = non-blocking, default)", "1");
+  option_parser_register(opp, "-gpgpu_tlb_ideal", OPT_BOOL,
+                         &gpgpu_tlb_ideal,
+                         "ideal TLB: instant (0-cycle) translation via functional "
+                         "page-table fill; baseline to measure translation overhead", "0");
+  option_parser_register(opp, "-gpgpu_smem_latency", OPT_UINT32, &smem_latency,
+                         "smem Latency", "3");
+  option_parser_register(opp, "-gpgpu_cache:dl1PrefL1", OPT_CSTR,
+                         &m_L1D_config.m_config_stringPrefL1,
+                         "per-shader L1 data cache config "
+                         " {<nsets>:<bsize>:<assoc>,<rep>:<wr>:<alloc>:<wr_"
+                         "alloc>,<mshr>:<N>:<merge>,<mq> | none}",
+                         "none");
+  option_parser_register(opp, "-gpgpu_cache:dl1PrefShared", OPT_CSTR,
+                         &m_L1D_config.m_config_stringPrefShared,
+                         "per-shader L1 data cache config "
+                         " {<nsets>:<bsize>:<assoc>,<rep>:<wr>:<alloc>:<wr_"
+                         "alloc>,<mshr>:<N>:<merge>,<mq> | none}",
+                         "none");
+  option_parser_register(opp, "-gpgpu_gmem_skip_L1D", OPT_BOOL, &gmem_skip_L1D,
+                         "global memory access skip L1D cache (implements "
+                         "-Xptxas -dlcm=cg, default=no skip)",
+                         "0");
+
+  option_parser_register(opp, "-gpgpu_perfect_mem", OPT_BOOL,
+                         &gpgpu_perfect_mem,
+                         "enable perfect memory mode (no cache miss)", "0");
+  option_parser_register(
+      opp, "-n_regfile_gating_group", OPT_UINT32, &n_regfile_gating_group,
+      "group of lanes that should be read/written together)", "4");
+  option_parser_register(
+      opp, "-gpgpu_clock_gated_reg_file", OPT_BOOL, &gpgpu_clock_gated_reg_file,
+      "enable clock gated reg file for power calculations", "0");
+  option_parser_register(
+      opp, "-gpgpu_clock_gated_lanes", OPT_BOOL, &gpgpu_clock_gated_lanes,
+      "enable clock gated lanes for power calculations", "0");
+  option_parser_register(opp, "-gpgpu_shader_registers", OPT_UINT32,
+                         &gpgpu_shader_registers,
+                         "Number of registers per shader core. Limits number "
+                         "of concurrent CTAs. (default 8192)",
+                         "8192");
+  option_parser_register(
+      opp, "-gpgpu_registers_per_block", OPT_UINT32, &gpgpu_registers_per_block,
+      "Maximum number of registers per CTA. (default 8192)", "8192");
+  option_parser_register(opp, "-gpgpu_ignore_resources_limitation", OPT_BOOL,
+                         &gpgpu_ignore_resources_limitation,
+                         "gpgpu_ignore_resources_limitation (default 0)", "0");
+  option_parser_register(
+      opp, "-gpgpu_shader_cta", OPT_UINT32, &max_cta_per_core,
+      "Maximum number of concurrent CTAs in shader (default 32)", "32");
+  option_parser_register(
+      opp, "-gpgpu_num_cta_barriers", OPT_UINT32, &max_barriers_per_cta,
+      "Maximum number of named barriers per CTA (default 16)", "16");
+  option_parser_register(opp, "-gpgpu_n_clusters", OPT_UINT32, &n_simt_clusters,
+                         "number of processing clusters", "10");
+  option_parser_register(opp, "-gpgpu_n_cores_per_cluster", OPT_UINT32,
+                         &n_simt_cores_per_cluster,
+                         "number of simd cores per cluster", "3");
+  option_parser_register(opp, "-gpgpu_n_cluster_ejection_buffer_size",
+                         OPT_UINT32, &n_simt_ejection_buffer_size,
+                         "number of packets in ejection buffer", "8");
+  option_parser_register(
+      opp, "-gpgpu_n_ldst_response_buffer_size", OPT_UINT32,
+      &ldst_unit_response_queue_size,
+      "number of response packets in ld/st unit ejection buffer", "2");
+  option_parser_register(
+      opp, "-gpgpu_shmem_per_block", OPT_UINT32, &gpgpu_shmem_per_block,
+      "Size of shared memory per thread block or CTA (default 48kB)", "49152");
+  option_parser_register(
+      opp, "-gpgpu_shmem_size", OPT_UINT32, &gpgpu_shmem_size,
+      "Size of shared memory per shader core (default 16kB)", "16384");
+  option_parser_register(opp, "-gpgpu_shmem_option", OPT_CSTR,
+                         &gpgpu_shmem_option,
+                         "Option list of shared memory sizes", "0");
+  option_parser_register(
+      opp, "-gpgpu_unified_l1d_size", OPT_UINT32,
+      &m_L1D_config.m_unified_cache_size,
+      "Size of unified data cache(L1D + shared memory) in KB", "0");
+  option_parser_register(opp, "-gpgpu_adaptive_cache_config", OPT_BOOL,
+                         &adaptive_cache_config, "adaptive_cache_config", "0");
+  option_parser_register(
+      opp, "-gpgpu_shmem_sizeDefault", OPT_UINT32, &gpgpu_shmem_sizeDefault,
+      "Size of shared memory per shader core (default 16kB)", "16384");
+  option_parser_register(
+      opp, "-gpgpu_shmem_size_PrefL1", OPT_UINT32, &gpgpu_shmem_sizePrefL1,
+      "Size of shared memory per shader core (default 16kB)", "16384");
+  option_parser_register(opp, "-gpgpu_shmem_size_PrefShared", OPT_UINT32,
+                         &gpgpu_shmem_sizePrefShared,
+                         "Size of shared memory per shader core (default 16kB)",
+                         "16384");
+  option_parser_register(
+      opp, "-gpgpu_shmem_num_banks", OPT_UINT32, &num_shmem_bank,
+      "Number of banks in the shared memory in each shader core (default 16)",
+      "16");
+  option_parser_register(
+      opp, "-gpgpu_shmem_limited_broadcast", OPT_BOOL, &shmem_limited_broadcast,
+      "Limit shared memory to do one broadcast per cycle (default on)", "1");
+  option_parser_register(opp, "-gpgpu_shmem_warp_parts", OPT_INT32,
+                         &mem_warp_parts,
+                         "Number of portions a warp is divided into for shared "
+                         "memory bank conflict check ",
+                         "2");
+  option_parser_register(
+      opp, "-gpgpu_mem_unit_ports", OPT_INT32, &mem_unit_ports,
+      "The number of memory transactions allowed per core cycle", "1");
+  option_parser_register(opp, "-gpgpu_shmem_warp_parts", OPT_INT32,
+                         &mem_warp_parts,
+                         "Number of portions a warp is divided into for shared "
+                         "memory bank conflict check ",
+                         "2");
+  option_parser_register(
+      opp, "-gpgpu_warpdistro_shader", OPT_INT32, &gpgpu_warpdistro_shader,
+      "Specify which shader core to collect the warp size distribution from",
+      "-1");
+  option_parser_register(
+      opp, "-gpgpu_warp_issue_shader", OPT_INT32, &gpgpu_warp_issue_shader,
+      "Specify which shader core to collect the warp issue distribution from",
+      "0");
+  option_parser_register(opp, "-gpgpu_local_mem_map", OPT_BOOL,
+                         &gpgpu_local_mem_map,
+                         "Mapping from local memory space address to simulated "
+                         "GPU physical address space (default = enabled)",
+                         "1");
+  option_parser_register(opp, "-gpgpu_num_reg_banks", OPT_INT32,
+                         &gpgpu_num_reg_banks,
+                         "Number of register banks (default = 8)", "8");
+  option_parser_register(
+      opp, "-gpgpu_reg_bank_use_warp_id", OPT_BOOL, &gpgpu_reg_bank_use_warp_id,
+      "Use warp ID in mapping registers to banks (default = off)", "0");
+  option_parser_register(opp, "-gpgpu_sub_core_model", OPT_BOOL,
+                         &sub_core_model,
+                         "Sub Core Volta/Pascal model (default = off)", "0");
+  option_parser_register(opp, "-gpgpu_enable_specialized_operand_collector",
+                         OPT_BOOL, &enable_specialized_operand_collector,
+                         "enable_specialized_operand_collector", "1");
+  option_parser_register(opp, "-gpgpu_operand_collector_num_units_sp",
+                         OPT_INT32, &gpgpu_operand_collector_num_units_sp,
+                         "number of collector units (default = 4)", "4");
+  option_parser_register(opp, "-gpgpu_operand_collector_num_units_dp",
+                         OPT_INT32, &gpgpu_operand_collector_num_units_dp,
+                         "number of collector units (default = 0)", "0");
+  option_parser_register(opp, "-gpgpu_operand_collector_num_units_sfu",
+                         OPT_INT32, &gpgpu_operand_collector_num_units_sfu,
+                         "number of collector units (default = 4)", "4");
+  option_parser_register(opp, "-gpgpu_operand_collector_num_units_int",
+                         OPT_INT32, &gpgpu_operand_collector_num_units_int,
+                         "number of collector units (default = 0)", "0");
+  option_parser_register(opp, "-gpgpu_operand_collector_num_units_tensor_core",
+                         OPT_INT32,
+                         &gpgpu_operand_collector_num_units_tensor_core,
+                         "number of collector units (default = 4)", "4");
+  option_parser_register(opp, "-gpgpu_operand_collector_num_units_mem",
+                         OPT_INT32, &gpgpu_operand_collector_num_units_mem,
+                         "number of collector units (default = 2)", "2");
+  option_parser_register(opp, "-gpgpu_operand_collector_num_units_gen",
+                         OPT_INT32, &gpgpu_operand_collector_num_units_gen,
+                         "number of collector units (default = 0)", "0");
+  option_parser_register(opp, "-gpgpu_operand_collector_num_in_ports_sp",
+                         OPT_INT32, &gpgpu_operand_collector_num_in_ports_sp,
+                         "number of collector unit in ports (default = 1)",
+                         "1");
+  option_parser_register(opp, "-gpgpu_operand_collector_num_in_ports_dp",
+                         OPT_INT32, &gpgpu_operand_collector_num_in_ports_dp,
+                         "number of collector unit in ports (default = 0)",
+                         "0");
+  option_parser_register(opp, "-gpgpu_operand_collector_num_in_ports_sfu",
+                         OPT_INT32, &gpgpu_operand_collector_num_in_ports_sfu,
+                         "number of collector unit in ports (default = 1)",
+                         "1");
+  option_parser_register(opp, "-gpgpu_operand_collector_num_in_ports_int",
+                         OPT_INT32, &gpgpu_operand_collector_num_in_ports_int,
+                         "number of collector unit in ports (default = 0)",
+                         "0");
+  option_parser_register(
+      opp, "-gpgpu_operand_collector_num_in_ports_tensor_core", OPT_INT32,
+      &gpgpu_operand_collector_num_in_ports_tensor_core,
+      "number of collector unit in ports (default = 1)", "1");
+  option_parser_register(opp, "-gpgpu_operand_collector_num_in_ports_mem",
+                         OPT_INT32, &gpgpu_operand_collector_num_in_ports_mem,
+                         "number of collector unit in ports (default = 1)",
+                         "1");
+  option_parser_register(opp, "-gpgpu_operand_collector_num_in_ports_gen",
+                         OPT_INT32, &gpgpu_operand_collector_num_in_ports_gen,
+                         "number of collector unit in ports (default = 0)",
+                         "0");
+  option_parser_register(opp, "-gpgpu_operand_collector_num_out_ports_sp",
+                         OPT_INT32, &gpgpu_operand_collector_num_out_ports_sp,
+                         "number of collector unit in ports (default = 1)",
+                         "1");
+  option_parser_register(opp, "-gpgpu_operand_collector_num_out_ports_dp",
+                         OPT_INT32, &gpgpu_operand_collector_num_out_ports_dp,
+                         "number of collector unit in ports (default = 0)",
+                         "0");
+  option_parser_register(opp, "-gpgpu_operand_collector_num_out_ports_sfu",
+                         OPT_INT32, &gpgpu_operand_collector_num_out_ports_sfu,
+                         "number of collector unit in ports (default = 1)",
+                         "1");
+  option_parser_register(opp, "-gpgpu_operand_collector_num_out_ports_int",
+                         OPT_INT32, &gpgpu_operand_collector_num_out_ports_int,
+                         "number of collector unit in ports (default = 0)",
+                         "0");
+  option_parser_register(
+      opp, "-gpgpu_operand_collector_num_out_ports_tensor_core", OPT_INT32,
+      &gpgpu_operand_collector_num_out_ports_tensor_core,
+      "number of collector unit in ports (default = 1)", "1");
+  option_parser_register(opp, "-gpgpu_operand_collector_num_out_ports_mem",
+                         OPT_INT32, &gpgpu_operand_collector_num_out_ports_mem,
+                         "number of collector unit in ports (default = 1)",
+                         "1");
+  option_parser_register(opp, "-gpgpu_operand_collector_num_out_ports_gen",
+                         OPT_INT32, &gpgpu_operand_collector_num_out_ports_gen,
+                         "number of collector unit in ports (default = 0)",
+                         "0");
+  option_parser_register(opp, "-gpgpu_coalesce_arch", OPT_INT32,
+                         &gpgpu_coalesce_arch,
+                         "Coalescing arch (GT200 = 13, Fermi = 20)", "13");
+  option_parser_register(opp, "-gpgpu_num_sched_per_core", OPT_INT32,
+                         &gpgpu_num_sched_per_core,
+                         "Number of warp schedulers per core", "1");
+  option_parser_register(opp, "-gpgpu_max_insn_issue_per_warp", OPT_INT32,
+                         &gpgpu_max_insn_issue_per_warp,
+                         "Max number of instructions that can be issued per "
+                         "warp in one cycle by scheduler (either 1 or 2)",
+                         "2");
+  option_parser_register(opp, "-gpgpu_dual_issue_diff_exec_units", OPT_BOOL,
+                         &gpgpu_dual_issue_diff_exec_units,
+                         "should dual issue use two different execution unit "
+                         "resources (Default = 1)",
+                         "1");
+  option_parser_register(opp, "-gpgpu_simt_core_sim_order", OPT_INT32,
+                         &simt_core_sim_order,
+                         "Select the simulation order of cores in a cluster "
+                         "(0=Fix, 1=Round-Robin)",
+                         "1");
+  option_parser_register(
+      opp, "-gpgpu_pipeline_widths", OPT_CSTR, &pipeline_widths_string,
+      "Pipeline widths "
+      "ID_OC_SP,ID_OC_DP,ID_OC_INT,ID_OC_SFU,ID_OC_MEM,OC_EX_SP,OC_EX_DP,OC_EX_"
+      "INT,OC_EX_SFU,OC_EX_MEM,EX_WB,ID_OC_TENSOR_CORE,OC_EX_TENSOR_CORE",
+      "1,1,1,1,1,1,1,1,1,1,1,1,1");
+  option_parser_register(opp, "-gpgpu_tensor_core_avail", OPT_UINT32,
+                         &gpgpu_tensor_core_avail,
+                         "Tensor Core Available (default=0)", "0");
+  option_parser_register(opp, "-gpgpu_num_sp_units", OPT_UINT32,
+                         &gpgpu_num_sp_units, "Number of SP units (default=1)",
+                         "1");
+  option_parser_register(opp, "-gpgpu_num_dp_units", OPT_UINT32,
+                         &gpgpu_num_dp_units, "Number of DP units (default=0)",
+                         "0");
+  option_parser_register(opp, "-gpgpu_num_int_units", OPT_UINT32,
+                         &gpgpu_num_int_units,
+                         "Number of INT units (default=0)", "0");
+  option_parser_register(opp, "-gpgpu_num_sfu_units", OPT_UINT32,
+                         &gpgpu_num_sfu_units, "Number of SF units (default=1)",
+                         "1");
+  option_parser_register(opp, "-gpgpu_num_tensor_core_units", OPT_UINT32,
+                         &gpgpu_num_tensor_core_units,
+                         "Number of tensor_core units (default=1)", "0");
+  option_parser_register(
+      opp, "-gpgpu_num_mem_units", OPT_UINT32, &gpgpu_num_mem_units,
+      "Number if ldst units (default=1) WARNING: not hooked up to anything",
+      "1");
+  option_parser_register(
+      opp, "-gpgpu_scheduler", OPT_CSTR, &gpgpu_scheduler_string,
+      "Scheduler configuration: < lrr | gto | two_level_active > "
+      "If "
+      "two_level_active:<num_active_warps>:<inner_prioritization>:<outer_"
+      "prioritization>"
+      "For complete list of prioritization values see shader.h enum "
+      "scheduler_prioritization_type"
+      "Default: gto",
+      "gto");
+
+  option_parser_register(
+      opp, "-gpgpu_concurrent_kernel_sm", OPT_BOOL, &gpgpu_concurrent_kernel_sm,
+      "Support concurrent kernels on a SM (default = disabled)", "0");
+  option_parser_register(opp, "-gpgpu_perfect_inst_const_cache", OPT_BOOL,
+                         &perfect_inst_const_cache,
+                         "perfect inst and const cache mode, so all inst and "
+                         "const hits in the cache(default = disabled)",
+                         "0");
+  option_parser_register(
+      opp, "-gpgpu_inst_fetch_throughput", OPT_INT32, &inst_fetch_throughput,
+      "the number of fetched intruction per warp each cycle", "1");
+  option_parser_register(opp, "-gpgpu_reg_file_port_throughput", OPT_INT32,
+                         &reg_file_port_throughput,
+                         "the number ports of the register file", "1");
+
+  for (unsigned j = 0; j < SPECIALIZED_UNIT_NUM; ++j) {
+    std::stringstream ss;
+    ss << "-specialized_unit_" << j + 1;
+    option_parser_register(opp, ss.str().c_str(), OPT_CSTR,
+                           &specialized_unit_string[j],
+                           "specialized unit config"
+                           " {<enabled>,<num_units>:<latency>:<initiation>,<ID_"
+                           "OC_SPEC>:<OC_EX_SPEC>,<NAME>}",
+                           "0,4,4,4,4,BRA");
+  }
+}
+
+void gpgpu_sim_config::reg_options(option_parser_t opp) {
+  gpgpu_functional_sim_config::reg_options(opp);
+  m_shader_config.reg_options(opp);
+  m_memory_config.reg_options(opp);
+  power_config::reg_options(opp);
+  option_parser_register(opp, "-gpgpu_max_cycle", OPT_INT64, &gpu_max_cycle_opt,
+                         "terminates gpu simulation early (0 = no limit)", "0");
+  option_parser_register(opp, "-gpgpu_max_insn", OPT_INT64, &gpu_max_insn_opt,
+                         "terminates gpu simulation early (0 = no limit)", "0");
+  option_parser_register(opp, "-gpgpu_max_cta", OPT_INT32, &gpu_max_cta_opt,
+                         "terminates gpu simulation early (0 = no limit)", "0");
+  option_parser_register(opp, "-gpgpu_max_completed_cta", OPT_INT32,
+                         &gpu_max_completed_cta_opt,
+                         "terminates gpu simulation early (0 = no limit)", "0");
+  option_parser_register(
+      opp, "-gpgpu_runtime_stat", OPT_CSTR, &gpgpu_runtime_stat,
+      "display runtime statistics such as dram utilization {<freq>:<flag>}",
+      "10000:0");
+  option_parser_register(opp, "-liveness_message_freq", OPT_INT64,
+                         &liveness_message_freq,
+                         "Minimum number of seconds between simulation "
+                         "liveness messages (0 = always print)",
+                         "1");
+  option_parser_register(opp, "-gpgpu_compute_capability_major", OPT_UINT32,
+                         &gpgpu_compute_capability_major,
+                         "Major compute capability version number", "7");
+  option_parser_register(opp, "-gpgpu_compute_capability_minor", OPT_UINT32,
+                         &gpgpu_compute_capability_minor,
+                         "Minor compute capability version number", "0");
+  option_parser_register(opp, "-gpgpu_flush_l1_cache", OPT_BOOL,
+                         &gpgpu_flush_l1_cache,
+                         "Flush L1 cache at the end of each kernel call", "0");
+  option_parser_register(opp, "-gpgpu_flush_l2_cache", OPT_BOOL,
+                         &gpgpu_flush_l2_cache,
+                         "Flush L2 cache at the end of each kernel call", "0");
+  option_parser_register(
+      opp, "-gpgpu_deadlock_detect", OPT_BOOL, &gpu_deadlock_detect,
+      "Stop the simulation at deadlock (1=on (default), 0=off)", "1");
+  option_parser_register(
+      opp, "-gpgpu_ptx_instruction_classification", OPT_INT32,
+      &(gpgpu_ctx->func_sim->gpgpu_ptx_instruction_classification),
+      "if enabled will classify ptx instruction types per kernel (Max 255 "
+      "kernels now)",
+      "0");
+  option_parser_register(
+      opp, "-gpgpu_ptx_sim_mode", OPT_INT32,
+      &(gpgpu_ctx->func_sim->g_ptx_sim_mode),
+      "Select between Performance (default) or Functional simulation (1)", "0");
+  option_parser_register(opp, "-gpgpu_clock_domains", OPT_CSTR,
+                         &gpgpu_clock_domains,
+                         "Clock Domain Frequencies in MhZ {<Core Clock>:<ICNT "
+                         "Clock>:<L2 Clock>:<DRAM Clock>}",
+                         "500.0:2000.0:2000.0:2000.0");
+  option_parser_register(opp, "-icnt_inter_hop_latency_ns", OPT_UINT32,
+                         &icnt_inter_hop_latency_ns,
+                         "inter-chiplet one-way link latency in ns (0 = disabled)", "0");
+  option_parser_register(
+      opp, "-gpgpu_max_concurrent_kernel", OPT_INT32, &max_concurrent_kernel,
+      "maximum kernels that can run concurrently on GPU, set this value "
+      "according to max resident grids for your compute capability",
+      "32");
+  option_parser_register(
+      opp, "-gpgpu_cflog_interval", OPT_INT32, &gpgpu_cflog_interval,
+      "Interval between each snapshot in control flow logger", "0");
+  option_parser_register(opp, "-visualizer_enabled", OPT_BOOL,
+                         &g_visualizer_enabled,
+                         "Turn on visualizer output (1=On, 0=Off)", "1");
+  option_parser_register(opp, "-visualizer_outputfile", OPT_CSTR,
+                         &g_visualizer_filename,
+                         "Specifies the output log file for visualizer", NULL);
+  option_parser_register(
+      opp, "-visualizer_zlevel", OPT_INT32, &g_visualizer_zlevel,
+      "Compression level of the visualizer output log (0=no comp, 9=highest)",
+      "6");
+  option_parser_register(opp, "-gpgpu_stack_size_limit", OPT_INT32,
+                         &stack_size_limit, "GPU thread stack size", "1024");
+  option_parser_register(opp, "-gpgpu_heap_size_limit", OPT_INT32,
+                         &heap_size_limit, "GPU malloc heap size ", "8388608");
+  option_parser_register(opp, "-gpgpu_runtime_sync_depth_limit", OPT_INT32,
+                         &runtime_sync_depth_limit,
+                         "GPU device runtime synchronize depth", "2");
+  option_parser_register(opp, "-gpgpu_runtime_pending_launch_count_limit",
+                         OPT_INT32, &runtime_pending_launch_count_limit,
+                         "GPU device runtime pending launch count", "2048");
+  option_parser_register(opp, "-trace_enabled", OPT_BOOL, &Trace::enabled,
+                         "Turn on traces", "0");
+  option_parser_register(opp, "-trace_components", OPT_CSTR, &Trace::config_str,
+                         "comma seperated list of traces to enable. "
+                         "Complete list found in trace_streams.tup. "
+                         "Default none",
+                         "none");
+  option_parser_register(
+      opp, "-trace_sampling_core", OPT_INT32, &Trace::sampling_core,
+      "The core which is printed using CORE_DPRINTF. Default 0", "0");
+  option_parser_register(opp, "-trace_sampling_memory_partition", OPT_INT32,
+                         &Trace::sampling_memory_partition,
+                         "The memory partition which is printed using "
+                         "MEMPART_DPRINTF. Default -1 (i.e. all)",
+                         "-1");
+  gpgpu_ctx->stats->ptx_file_line_stats_options(opp);
+
+  // Jin: kernel launch latency
+  option_parser_register(opp, "-gpgpu_kernel_launch_latency", OPT_INT32,
+                         &(gpgpu_ctx->device_runtime->g_kernel_launch_latency),
+                         "Kernel launch latency in cycles. Default: 0", "0");
+  option_parser_register(opp, "-gpgpu_cdp_enabled", OPT_BOOL,
+                         &(gpgpu_ctx->device_runtime->g_cdp_enabled),
+                         "Turn on CDP", "0");
+
+  option_parser_register(opp, "-gpgpu_TB_launch_latency", OPT_INT32,
+                         &(gpgpu_ctx->device_runtime->g_TB_launch_latency),
+                         "thread block launch latency in cycles. Default: 0",
+                         "0");
+  
+  // MCM-GPU topology. 1 chiplet == monolithic baseline; SMs and memory
+  // partitions are split into n contiguous groups by gpu_module.
+  option_parser_register(opp, "-gpgpu_n_chiplets", OPT_UINT32, &m_n_chiplets,
+                       "number of chiplets in MCM GPU (Phase 1 scaffolding)",
+                       "1");
+  // Sizes the PMM physical-page pool that first-touch placement draws from.
+  option_parser_register(opp, "-gpu_mem_size_mb", OPT_UINT32,
+                        &gpu_mem_size_mb,
+                        "total device memory size in MB", "4096");
+  option_parser_register(opp, "-gmmu_n_ptw", OPT_UINT32,
+                        &gmmu_n_ptw,
+                        "number of parallel page table walkers per chiplet GMMU",
+                        "16");
+  option_parser_register(opp, "-gmmu_pwq_depth", OPT_UINT32,
+                        &gmmu_pwq_depth,
+                        "max PWQ depth per chiplet GMMU",
+                        "256");
+  option_parser_register(opp, "-gmmu_pwc_entries", OPT_UINT32,
+                        &gmmu_pwc_entries,
+                        "page walk cache entries per intermediate level per chiplet GMMU",
+                        "128");
+  // Placement snapshot: freeze first-touch placement so it becomes a controlled
+  // variable across configs. Empty = disabled (first-touch behaves as before).
+  option_parser_register(opp, "-gmmu_placement_dump", OPT_CSTR,
+                        &gmmu_placement_dump,
+                        "write the first-touch placement map to this file at exit "
+                        "(empty = disabled)",
+                        "");
+  option_parser_register(opp, "-gmmu_placement_load", OPT_CSTR,
+                        &gmmu_placement_load,
+                        "pre-map every page from this placement map before the first "
+                        "kernel, so the measured region takes zero faults (empty = disabled)",
+                        "");
+  option_parser_register(opp, "-gmmu_placement_exact", OPT_BOOL,
+                        &gmmu_placement_exact,
+                        "with -gmmu_placement_load: place every data page, page-table node and the "
+                        "root at the PFN recorded in the (v3) map, not only on the recorded owner "
+                        "chiplet. 0 = replay owners only and re-derive PFNs (pre-existing behaviour)",
+                        "0");
+  option_parser_register(opp, "-gmmu_local_ptw", OPT_BOOL,
+                        &gmmu_local_ptw,
+                        "replicate the page table on every chiplet (own root/CR3 and own "
+                        "node pages) so a page walk never leaves the chiplet; data pages "
+                        "are not replicated. 0 = baseline single page table",
+                        "0");
+  // L2 TLB configuration options
+  option_parser_register(opp, "-gpgpu_l2_tlb_sets", OPT_UINT32,
+                        &m_l2_tlb_sets,
+                        "L2 TLB sets per chiplet (default 128)", "128");
+  option_parser_register(opp, "-gpgpu_l2_tlb_assoc", OPT_UINT32,
+                        &m_l2_tlb_assoc,
+                        "L2 TLB associativity per chiplet (default 8)", "8");
+  option_parser_register(opp, "-gpgpu_l2_tlb_set_hash", OPT_UINT32,
+                        &m_l2_tlb_set_hash,
+                        "L2 TLB set index (all page sizes): 0 = VPN mod sets (pre-existing), "
+                        "1 = XOR-fold of the VPN in log2(sets)-bit chunks, i.e. set bit k = XOR of VPN "
+                        "bits k, k+b, k+2b, ... -- the structure of the XOR set hashes reverse-engineered "
+                        "on NVIDIA Pascal/Ampere L2/L3 TLBs (Nayak'21 XOR-7, NDSS'26) and confirmed on "
+                        "RTX 3090 (regular_exp/docs/tlb_set_hashing.ko.md). Requires power-of-two sets.",
+                        "0");
+  option_parser_register(opp, "-gpgpu_l2_tlb_mshr_entries", OPT_UINT32,
+                        &m_l2_tlb_mshr_entries,
+                        "L2 TLB MSHR unique VPN capacity per chiplet (default 128)", "128");
+  option_parser_register(opp, "-gpgpu_l2_tlb_mshr_max_merge", OPT_UINT32,
+                        &m_l2_tlb_mshr_max_merge,
+                        "L2 TLB max merged clusters per in-flight VPN", "46");
+  option_parser_register(opp, "-gpgpu_l2_tlb_lookup_latency", OPT_UINT32,
+                        &m_l2_tlb_lookup_latency,
+                        "L2 TLB lookup latency in core cycles", "80");
+  // L2 TLB (64KB) configuration options. 512 entries = 64 sets x 8-way.
+  option_parser_register(opp, "-gpgpu_l2_tlb_64k_sets", OPT_UINT32,
+                        &m_l2_tlb_64k_sets,
+                        "L2 TLB (64KB) sets per chiplet (64 x 8-way = 512 entries)", "64");
+  option_parser_register(opp, "-gpgpu_l2_tlb_64k_assoc", OPT_UINT32,
+                        &m_l2_tlb_64k_assoc,
+                        "L2 TLB (64KB) associativity per chiplet", "8");
+  option_parser_register(opp, "-gpgpu_l2_tlb_64k_mshr_entries", OPT_UINT32,
+                        &m_l2_tlb_64k_mshr_entries,
+                        "L2 TLB (64KB) MSHR unique VPN capacity per chiplet", "128");
+  option_parser_register(opp, "-gpgpu_l2_tlb_64k_mshr_max_merge", OPT_UINT32,
+                        &m_l2_tlb_64k_mshr_max_merge,
+                        "L2 TLB (64KB) max merged clusters per in-flight VPN", "46");
+  option_parser_register(opp, "-gpgpu_l2_tlb_64k_lookup_latency", OPT_UINT32,
+                        &m_l2_tlb_64k_lookup_latency,
+                        "L2 TLB (64KB) lookup latency in core cycles", "80");
+  // L2 TLB (2MB) configuration options. The unsuffixed -gpgpu_l2_tlb_* options
+  // above stay 4KB-only, so existing config files keep working unchanged.
+  // Sizes follow the MCM-GPU reference config: L2 TLB is chiplet-private, 8-way,
+  // 80-cycle, 1024/512/256 entries for 4KB/64KB/2MB. 256 entries = 32 sets x 8.
+  // MSHR sizes are not in that config, so they match the 4KB TLB's (see L1 above).
+  option_parser_register(opp, "-gpgpu_l2_tlb_2m_sets", OPT_UINT32,
+                        &m_l2_tlb_2m_sets,
+                        "L2 TLB (2MB) sets per chiplet (32 x 8-way = 256 entries)", "32");
+  option_parser_register(opp, "-gpgpu_l2_tlb_2m_assoc", OPT_UINT32,
+                        &m_l2_tlb_2m_assoc,
+                        "L2 TLB (2MB) associativity per chiplet", "8");
+  option_parser_register(opp, "-gpgpu_l2_tlb_2m_mshr_entries", OPT_UINT32,
+                        &m_l2_tlb_2m_mshr_entries,
+                        "L2 TLB (2MB) MSHR unique VPN capacity per chiplet", "128");
+  option_parser_register(opp, "-gpgpu_l2_tlb_2m_mshr_max_merge", OPT_UINT32,
+                        &m_l2_tlb_2m_mshr_max_merge,
+                        "L2 TLB (2MB) max merged clusters per in-flight VPN", "46");
+  option_parser_register(opp, "-gpgpu_l2_tlb_2m_lookup_latency", OPT_UINT32,
+                        &m_l2_tlb_2m_lookup_latency,
+                        "L2 TLB (2MB) lookup latency in core cycles", "80");
+
+  option_parser_register(opp, "-gpgpu_cta_scheduling_policy", OPT_UINT32,
+                        &m_cta_sched_policy,
+                        "CTA-to-cluster assignment policy: 0=SEQUENTIAL (default), "
+                        "1=ROUND_ROBIN_CHIPLET (interleave across chiplets per CTA), "
+                        "2=STATIC_BINDING (home chiplet = cta_id %% n_chiplets, "
+                        "timing-independent; required for the local-PTW A/B)",
+                        "0");
+
+  option_parser_register(opp, "-gpgpu_lasp_policy", OPT_UINT32, &m_lasp_policy,
+                        "LASP CTA scheduling policy (LADM MICRO'20): 0=off "
+                        "(keep -gpgpu_cta_scheduling_policy behavior), "
+                        "1=ROW_BINDING (grid row -> chiplet, contiguous row "
+                        "blocks), 2=COL_BINDING (grid column -> chiplet), "
+                        "3=CHUNK_BINDING (chunk_size consecutive CTAs "
+                        "round-robin across chiplets), 4=KERNEL_PARTITION "
+                        "(MCM-GPU ISCA'17 distributed CTA scheduler: the "
+                        "kernel's CTAs are split into n_chiplets contiguous "
+                        "ranges of ceil(#CTAs/n_chiplets); chunk computed per "
+                        "kernel at launch, -gpgpu_lasp_chunk_size ignored). "
+                        "Takes precedence over -gpgpu_cta_scheduling_policy "
+                        "when nonzero",
+                        "0");
+  option_parser_register(opp, "-gpgpu_lasp_chunk_size", OPT_UINT32,
+                        &m_lasp_chunk_size,
+                        "CTAs per batch for -gpgpu_lasp_policy 3; align-aware "
+                        "batch = page_size / datablock_size, kernel-wide "
+                        "partitioning = ceil(#CTAs / n_chiplets)",
+                        "1");
+  option_parser_register(opp, "-gpgpu_cta_chiplet_cursor", OPT_UINT32,
+                        &m_cta_chiplet_cursor,
+                        "1 = per-chiplet CTA cursors (PCC): a CTA is issued as "
+                        "soon as its home chiplet has a free slot, independent "
+                        "of the other chiplets' progress (CTA->chiplet map "
+                        "unchanged; needs STATIC_BINDING or a LASP policy); "
+                        "0 = single sequential cursor (legacy)",
+                        "0");
+  option_parser_register(opp, "-gpgpu_kernel_rebind", OPT_UINT32,
+                        &m_kernel_rebind,
+                        "what an SM core bound to a finished kernel does when the "
+                        "next kernel arrives. 0 = v7b hand-over (default): the core "
+                        "continues with the next kernel created by the trace "
+                        "framework, busy or not -- bit-identical to every v7b result, "
+                        "which got this behaviour from allocator address reuse; "
+                        "1 = the core drops the finished kernel and rebinds through "
+                        "select_kernel() once it is idle (the upstream comment's "
+                        "intent). Both are deterministic",
+                        "0");
+}
+
+/////////////////////////////////////////////////////////////////////////////
+
+void increment_x_then_y_then_z(dim3 &i, const dim3 &bound) {
+  i.x++;
+  if (i.x >= bound.x) {
+    i.x = 0;
+    i.y++;
+    if (i.y >= bound.y) {
+      i.y = 0;
+      if (i.z < bound.z) i.z++;
+    }
+  }
+}
+
+void gpgpu_sim::launch(kernel_info_t *kinfo) {
+  note_issue_event();  // 39: new kernel changes the issue-scan verdict
+  unsigned kernelID = kinfo->get_uid();
+  unsigned long long streamID = kinfo->get_streamID();
+
+  kernel_time_t kernel_time = {gpu_tot_sim_cycle + gpu_sim_cycle, 0};
+  if (gpu_kernel_time.find(streamID) == gpu_kernel_time.end()) {
+    std::map<unsigned, kernel_time_t> new_val;
+    new_val.insert(std::pair<unsigned, kernel_time_t>(kernelID, kernel_time));
+    gpu_kernel_time.insert(
+        std::pair<unsigned long long, std::map<unsigned, kernel_time_t>>(
+            streamID, new_val));
+  } else {
+    gpu_kernel_time.at(streamID).insert(
+        std::pair<unsigned, kernel_time_t>(kernelID, kernel_time));
+    ////////// assume same kernel ID do not appear more than once
+  }
+
+  unsigned cta_size = kinfo->threads_per_cta();
+  if (cta_size > m_shader_config->n_thread_per_shader) {
+    printf(
+        "Execution error: Shader kernel CTA (block) size is too large for "
+        "microarch config.\n");
+    printf("                 CTA size (x*y*z) = %u, max supported = %u\n",
+           cta_size, m_shader_config->n_thread_per_shader);
+    printf(
+        "                 => either change -gpgpu_shader argument in "
+        "gpgpusim.config file or\n");
+    printf(
+        "                 modify the CUDA source to decrease the kernel block "
+        "size.\n");
+    abort();
+  }
+
+  // LASP (S40): stamp the config-selected policy on every launched kernel.
+  // Policy 0 leaves the ctor default KERNEL_WIDE, so the issue path behaves
+  // exactly as before S40. The locality type is supplied manually via config
+  // (an oracle locality table stands in for the paper's compiler pass).
+  {
+    unsigned pol = m_config.get_lasp_policy();
+    if (pol != 0) {
+      kinfo->m_lasp_config.policy =
+          (pol == 1) ? lasp::ROW_BINDING
+                     : (pol == 2) ? lasp::COL_BINDING : lasp::CHUNK_BINDING;
+      unsigned cs = m_config.get_lasp_chunk_size();
+      if (pol == 4) {
+        // KERNEL_PARTITION (MCM-GPU ISCA'17 Sec. 5.2: "divide the total
+        // number of CTAs in a kernel equally among the number of GPMs, and
+        // assign a group of contiguous CTAs to a GPM"). Expressed as
+        // CHUNK_BINDING with a per-kernel chunk of ceil(#CTAs / n_chiplets):
+        // (lin / chunk) then ranges over 0..n_chiplets-1, so the trailing
+        // "% n_chiplets" in the issue path and pcc_home() is the identity and
+        // every downstream consumer stays unchanged. Still a pure function of
+        // the CTA id (timing-independent), like the other bindings.
+        unsigned n_chiplets = m_gpu_module ? m_gpu_module->get_num_chiplets()
+                                           : m_config.get_num_chiplets();
+        if (n_chiplets == 0) n_chiplets = 1;
+        unsigned n_ctas = (unsigned)kinfo->num_blocks();
+        cs = (n_ctas + n_chiplets - 1) / n_chiplets;
+      }
+      kinfo->m_lasp_config.chunk_size = cs ? cs : 1;
+      printf("[LASP] kernel uid=%u '%s' policy=%s chunk_size=%u%s\n",
+             kinfo->get_uid(), kinfo->name().c_str(),
+             lasp::policy_to_string(kinfo->m_lasp_config.policy),
+             kinfo->m_lasp_config.chunk_size,
+             (pol == 4) ? " (KERNEL_PARTITION)" : "");
+    }
+  }
+
+  // PCC: per-chiplet CTA cursors (docs/cta_chiplet_cursor.ko.md). Only the
+  // issue ORDER changes; the CTA->chiplet map is the same pure function.
+  if (m_config.get_cta_chiplet_cursor()) {
+    const bool static_bind =
+        (m_config.get_cta_sched_policy() == CTA_SCHED_STATIC_BINDING);
+    const bool bound =
+        (kinfo->m_lasp_config.policy != lasp::KERNEL_WIDE) || static_bind;
+    if (bound && m_gpu_module) {
+      kinfo->pcc_init(m_gpu_module->get_num_chiplets(), static_bind);
+      printf("[PCC] kernel uid=%u '%s' per-chiplet cursors on: n_chiplets=%u "
+             "ctas=%u rule=%s\n",
+             kinfo->get_uid(), kinfo->name().c_str(), kinfo->pcc_n(),
+             (unsigned)kinfo->num_blocks(),
+             (kinfo->m_lasp_config.policy != lasp::KERNEL_WIDE)
+                 ? lasp::policy_to_string(kinfo->m_lasp_config.policy)
+                 : "STATIC_BINDING");
+    } else {
+      printf("[PCC] kernel uid=%u option set but no chiplet binding active "
+             "(or gpu_module not wired) -- ignored\n", kinfo->get_uid());
+    }
+  }
+
+  unsigned n = 0;
+  for (n = 0; n < m_running_kernels.size(); n++) {
+    if ((NULL == m_running_kernels[n]) || m_running_kernels[n]->done()) {
+      m_running_kernels[n] = kinfo;
+      break;
+    }
+  }
+  assert(n < m_running_kernels.size());
+}
+
+bool gpgpu_sim::can_start_kernel() {
+  for (unsigned n = 0; n < m_running_kernels.size(); n++) {
+    if ((NULL == m_running_kernels[n]) || m_running_kernels[n]->done())
+      return true;
+  }
+  return false;
+}
+
+bool gpgpu_sim::hit_max_cta_count() const {
+  if (m_config.gpu_max_cta_opt != 0) {
+    if ((gpu_tot_issued_cta + m_total_cta_launched) >= m_config.gpu_max_cta_opt)
+      return true;
+  }
+  return false;
+}
+
+bool gpgpu_sim::kernel_more_cta_left(kernel_info_t *kernel) const {
+  if (hit_max_cta_count()) return false;
+
+  // PCC: a core may still hold the pointer of a kernel that finished and was
+  // deleted, so do not dereference it unless it is still in m_running_kernels.
+  // (The original note called the legacy freed-object read harmless; it was not --
+  // it followed allocator address reuse into the next kernel. See
+  // gpgpu_sim::on_kernel_deleted().)
+  // KERNEL HAND-OVER (2026-09-13): this guard used to run only with the cursor on.
+  // It now runs always, as the second line of defence behind on_kernel_deleted()/
+  // on_kernel_created(), which already keep every core off freed kernels: a kernel
+  // that is not in m_running_kernels is never dereferenced here.
+  if (kernel) {
+    bool running = false;
+    for (unsigned n = 0; n < m_running_kernels.size(); n++)
+      if (m_running_kernels[n] == kernel) { running = true; break; }
+    if (!running) return false;
+  }
+
+  if (kernel && !kernel->no_more_ctas_to_run()) return true;
+
+  return false;
+}
+
+// KERNEL HAND-OVER (2026-09-13).
+// accel_sim_framework::cleanup() deletes a finished kernel while SM cores still
+// hold its pointer (shader_core_ctx::m_kernel), and issue_block2core() then
+// evaluated kernel_more_cta_left() on it: a heap use-after-free (AddressSanitizer:
+// kernel_info_t::no_more_ctas_to_run; the same code is in upstream Accel-Sim
+// v2.0.0). What that read returned was decided by the allocator. With glibc
+// tcache the next kernel is allocated at the very address just freed, so the
+// stale pointer silently became the next kernel and busy cores carried straight
+// on with it. Every v7b result was produced that way: the unmodified audit binary
+// changes its nw8M result under glibc.malloc.tcache_count=0.
+// kernel_info_t growing the PCC fields broke that address reuse, and two defects
+// surfaced in the PCC trees:
+//  (a) the stale read itself -- cursor-off runs crashed or disagreed; and
+//  (b) thread-order dependence -- when a kernel's last CTAs retire on several SMs
+//      in the same parallel pass, only the SM entering the kernel_teardown
+//      critical section last NULLs its own m_kernel. The binding issue path treats
+//      NULL ("use the selected kernel") differently from a finished pointer, so the
+//      winner of the critical section leaked into the model (even cursor-on
+//      ref_contig on nw8M gave a different result on every rerun).
+// Both are fixed here by deciding the hand-over explicitly, in serial context:
+//  -gpgpu_kernel_rebind 0 (default): remember the deleted pointer (value only,
+//      never dereferenced) and, when the framework creates the next kernel, move
+//      every core still pointing at it onto that kernel -- exactly the v7b
+//      behaviour, now defined and deterministic (LIFO, as tcache reuse was).
+//      Verified bit-identical to the v7b runs of nw8M base/lptw/ptwhop0/ref_batch4
+//      (+dumped map), gc48M base, gups4M all arms; 8t==1t.
+//  -gpgpu_kernel_rebind 1: clear those pointers now; each core rebinds through
+//      select_kernel() once it is idle.
+// Assumes the trace flow creates the next kernel before any further cycle, as
+// accel_sim_framework does (window of 1). The unconditional running-kernel guard
+// in kernel_more_cta_left() stays as a second line of defence.
+void gpgpu_sim::on_kernel_deleted(const kernel_info_t *k) {
+  if (!k) return;
+  if (m_config.get_kernel_rebind() == 0) {
+    m_retired_kernels.push_back(k);   // pointer value only; never dereferenced
+    return;
+  }
+  for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++)
+    m_cluster[i]->forget_kernel(k);
+}
+
+void gpgpu_sim::on_kernel_created(kernel_info_t *nk) {
+  if (m_retired_kernels.empty()) return;
+  const kernel_info_t *old = m_retired_kernels.back();
+  m_retired_kernels.pop_back();
+  for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++)
+    m_cluster[i]->retarget_kernel(old, nk);
+}
+
+bool gpgpu_sim::get_more_cta_left() const {
+  if (hit_max_cta_count()) return false;
+
+  for (unsigned n = 0; n < m_running_kernels.size(); n++) {
+    if (m_running_kernels[n] && !m_running_kernels[n]->no_more_ctas_to_run())
+      return true;
+  }
+  return false;
+}
+
+void gpgpu_sim::decrement_kernel_latency() {
+  for (unsigned n = 0; n < m_running_kernels.size(); n++) {
+    if (m_running_kernels[n] && m_running_kernels[n]->m_kernel_TB_latency) {
+      m_running_kernels[n]->m_kernel_TB_latency--;
+      // 39: latency gate opening is a time-driven verdict change (the one
+      // event no queue mutation would signal) -- bump the epoch here.
+      if (!m_running_kernels[n]->m_kernel_TB_latency) note_issue_event();
+    }
+  }
+}
+
+kernel_info_t *gpgpu_sim::select_kernel() {
+  if (m_running_kernels[m_last_issued_kernel] &&
+      !m_running_kernels[m_last_issued_kernel]->no_more_ctas_to_run() &&
+      !m_running_kernels[m_last_issued_kernel]->m_kernel_TB_latency) {
+    unsigned launch_uid = m_running_kernels[m_last_issued_kernel]->get_uid();
+    if (std::find(m_executed_kernel_uids.begin(), m_executed_kernel_uids.end(),
+                  launch_uid) == m_executed_kernel_uids.end()) {
+      m_running_kernels[m_last_issued_kernel]->start_cycle =
+          gpu_sim_cycle + gpu_tot_sim_cycle;
+      m_executed_kernel_uids.push_back(launch_uid);
+      m_executed_kernel_names.push_back(
+          m_running_kernels[m_last_issued_kernel]->name());
+    }
+    return m_running_kernels[m_last_issued_kernel];
+  }
+
+  for (unsigned n = 0; n < m_running_kernels.size(); n++) {
+    unsigned idx =
+        (n + m_last_issued_kernel + 1) % m_config.max_concurrent_kernel;
+    if (kernel_more_cta_left(m_running_kernels[idx]) &&
+        !m_running_kernels[idx]->m_kernel_TB_latency) {
+      m_last_issued_kernel = idx;
+      m_running_kernels[idx]->start_cycle = gpu_sim_cycle + gpu_tot_sim_cycle;
+      // record this kernel for stat print if it is the first time this kernel
+      // is selected for execution
+      unsigned launch_uid = m_running_kernels[idx]->get_uid();
+      assert(std::find(m_executed_kernel_uids.begin(),
+                       m_executed_kernel_uids.end(),
+                       launch_uid) == m_executed_kernel_uids.end());
+      m_executed_kernel_uids.push_back(launch_uid);
+      m_executed_kernel_names.push_back(m_running_kernels[idx]->name());
+
+      return m_running_kernels[idx];
+    }
+  }
+  return NULL;
+}
+
+unsigned gpgpu_sim::finished_kernel() {
+  if (m_finished_kernel.empty()) {
+    last_streamID = -1;
+    return 0;
+  }
+  unsigned result = m_finished_kernel.front();
+  m_finished_kernel.pop_front();
+  return result;
+}
+
+void gpgpu_sim::set_kernel_done(kernel_info_t *kernel) {
+  if (kernel->pcc_on()) {   // PCC: per-chiplet issue summary (G1/G3 evidence)
+    for (unsigned c = 0; c < kernel->pcc_n(); c++)
+      printf("[PCC] kernel uid=%u chiplet=%u issued=%u last_issue_cycle=%llu\n",
+             kernel->get_uid(), c, kernel->pcc_issued(c),
+             kernel->pcc_last_issue(c));
+  }
+  unsigned uid = kernel->get_uid();
+  last_uid = uid;
+  unsigned long long streamID = kernel->get_streamID();
+  last_streamID = streamID;
+  gpu_kernel_time.at(streamID).at(uid).end_cycle =
+      gpu_tot_sim_cycle + gpu_sim_cycle;
+  m_finished_kernel.push_back(uid);
+  std::vector<kernel_info_t *>::iterator k;
+  for (k = m_running_kernels.begin(); k != m_running_kernels.end(); k++) {
+    if (*k == kernel) {
+      kernel->end_cycle = gpu_sim_cycle + gpu_tot_sim_cycle;
+      *k = NULL;
+      break;
+    }
+  }
+  assert(k != m_running_kernels.end());
+}
+
+void gpgpu_sim::stop_all_running_kernels() {
+  std::vector<kernel_info_t *>::iterator k;
+  for (k = m_running_kernels.begin(); k != m_running_kernels.end(); ++k) {
+    if (*k != NULL) {       // If a kernel is active
+      set_kernel_done(*k);  // Stop the kernel
+      assert(*k == NULL);
+    }
+  }
+}
+
+void exec_gpgpu_sim::createSIMTCluster() {
+  m_cluster = new simt_core_cluster *[m_shader_config->n_simt_clusters];
+  for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++)
+    m_cluster[i] =
+        new exec_simt_core_cluster(this, m_gpu_module, i, m_shader_config, m_memory_config,
+                                   m_shader_stats, m_memory_stats);
+}
+
+// SST get its own simt_cluster
+void sst_gpgpu_sim::createSIMTCluster() {
+  m_cluster = new simt_core_cluster *[m_shader_config->n_simt_clusters];
+  for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++)
+    m_cluster[i] =
+        new sst_simt_core_cluster(this, m_gpu_module, i, m_shader_config, m_memory_config,
+                                  m_shader_stats, m_memory_stats);
+  SST_gpgpu_reply_buffer.resize(m_shader_config->n_simt_clusters);
+}
+
+gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
+    : gpgpu_t(config, ctx), m_config(config) {
+  gpgpu_ctx = ctx;
+  m_shader_config = &m_config.m_shader_config;
+  m_memory_config = &m_config.m_memory_config;
+  ctx->ptx_parser->set_ptx_warp_size(m_shader_config);
+  ptx_file_line_stats_create_exposed_latency_tracker(m_config.num_shader());
+
+#ifdef GPGPUSIM_POWER_MODEL
+  m_gpgpusim_wrapper = new gpgpu_sim_wrapper(
+      config.g_power_simulation_enabled, config.g_power_config_name,
+      config.g_power_simulation_mode, config.g_dvfs_enabled);
+#endif
+
+  m_shader_stats = new shader_core_stats(m_shader_config);
+  m_memory_stats = new memory_stats_t(m_config.num_shader(), m_shader_config,
+                                      m_memory_config, this);
+  average_pipeline_duty_cycle = (float *)malloc(sizeof(float));
+  active_sms = (float *)malloc(sizeof(float));
+  m_power_stats =
+      new power_stat_t(m_shader_config, average_pipeline_duty_cycle, active_sms,
+                       m_shader_stats, m_memory_config, m_memory_stats);
+
+  gpu_sim_insn = 0;
+  gpu_tot_sim_insn = 0;
+  gpu_tot_issued_cta = 0;
+  gpu_completed_cta = 0;
+  m_total_cta_launched = 0;
+  gpu_deadlock = false;
+
+  gpu_stall_dramfull = 0;
+  gpu_stall_icnt2sh = 0;
+  partiton_reqs_in_parallel = 0;
+  partiton_reqs_in_parallel_total = 0;
+  partiton_reqs_in_parallel_util = 0;
+  partiton_reqs_in_parallel_util_total = 0;
+  gpu_sim_cycle_parition_util = 0;
+  gpu_tot_sim_cycle_parition_util = 0;
+  partiton_replys_in_parallel = 0;
+  partiton_replys_in_parallel_total = 0;
+  last_streamID = -1;
+
+  gpu_kernel_time.clear();
+
+  // MCM: build the chiplet topology wrapper before the memory system below, so
+  // icnt_configure_chiplets() can read its owner maps. Note bind_global_arrays()
+  // cannot run here: m_cluster is only created by createSIMTCluster() in the
+  // exec/sst/trace subclass constructor, which is where the bind happens.
+  m_gpu_module = NULL;
+
+  m_n_chiplets = m_config.get_num_chiplets();
+  assert(m_n_chiplets >= 1);
+
+  if (!m_gpu_module) {
+    const unsigned n_clusters = m_shader_config->n_simt_clusters;
+    const unsigned n_mem = m_memory_config->m_n_mem;
+    const unsigned n_mem_parts = m_memory_config->m_n_mem_sub_partition;
+    m_gpu_module = new gpu_module(this, m_n_chiplets, n_clusters, n_mem, n_mem_parts);
+
+    m_gpu_module->init();
+    m_gpu_module->set_stats_file(stdout);
+
+    // Prints the SM/partition-to-chiplet split; doubles as the visual check
+    // that num_chiplets==1 reproduces the monolithic layout.
+    m_gpu_module->dump_partitioning();
+  }
+
+  // TODO: somehow move this logic to the sst_gpgpu_sim constructor?
+  if (!m_config.is_SST_mode()) {
+    // Init memory if not in SST mode
+    m_memory_partition_unit =
+        new memory_partition_unit *[m_memory_config->m_n_mem];
+    m_memory_sub_partition =
+        new memory_sub_partition *[m_memory_config->m_n_mem_sub_partition];
+    for (unsigned i = 0; i < m_memory_config->m_n_mem; i++) {
+      m_memory_partition_unit[i] =
+          new memory_partition_unit(i, m_memory_config, m_memory_stats, this);
+      for (unsigned p = 0;
+           p < m_memory_config->m_n_sub_partition_per_memory_channel; p++) {
+        unsigned submpid =
+            i * m_memory_config->m_n_sub_partition_per_memory_channel + p;
+        m_memory_sub_partition[submpid] =
+            m_memory_partition_unit[i]->get_sub_partition(p);
+      }
+    }
+
+    icnt_wrapper_init();
+    // Phase 1: split the local crossbar per chiplet — inject owner maps first.
+    icnt_configure_chiplets(m_n_chiplets,
+                            m_gpu_module->get_cluster_to_chiplet_vec(),       // size n_simt_clusters
+                            m_gpu_module->get_mem_sub_partition_to_chiplet_vec()); // size n_mem_sub_partition
+    icnt_create(m_shader_config->n_simt_clusters,
+                m_memory_config->m_n_mem_sub_partition);
+  }
+  time_vector_create(NUM_MEM_REQ_STAT);
+  fprintf(stdout,
+          "GPGPU-Sim uArch: performance model initialization complete.\n");
+
+  m_running_kernels.resize(config.max_concurrent_kernel, NULL);
+  m_last_issued_kernel = 0;
+  m_last_cluster_issue = m_shader_config->n_simt_clusters -
+                         1;  // this causes first launch to use simt cluster 0
+  // Create scheduler from config.  SEQUENTIAL (0) reproduces original behavior;
+  // ROUND_ROBIN_CHIPLET (1) distributes consecutive CTAs across chiplets so
+  // first-touch page placement benefits each chiplet equally. (P3-5)
+  m_cta_scheduler = cta_scheduler_t::create(
+      static_cast<cta_scheduling_policy_t>(m_config.m_cta_sched_policy));
+  printf("[CTA_SCHED] policy=%s\n", m_cta_scheduler->policy_name());
+
+  *average_pipeline_duty_cycle = 0;
+  *active_sms = 0;
+
+  last_liveness_message_time = 0;
+
+  // Jin: functional simulation for CDP
+  m_functional_sim = false;
+  m_functional_sim_kernel = NULL;
+}
+
+void sst_gpgpu_sim::SST_receive_mem_reply(unsigned core_id, void *mem_req) {
+  assert(core_id < m_shader_config->n_simt_clusters);
+  mem_fetch *mf = (mem_fetch *)mem_req;
+
+  (SST_gpgpu_reply_buffer[core_id]).push_back(mf);
+}
+
+mem_fetch *sst_gpgpu_sim::SST_pop_mem_reply(unsigned core_id) {
+  if (SST_gpgpu_reply_buffer[core_id].size() > 0) {
+    mem_fetch *temp = SST_gpgpu_reply_buffer[core_id].front();
+    SST_gpgpu_reply_buffer[core_id].pop_front();
+    return temp;
+  } else
+    return NULL;
+}
+
+int gpgpu_sim::shared_mem_size() const {
+  return m_shader_config->gpgpu_shmem_size;
+}
+
+int gpgpu_sim::shared_mem_per_block() const {
+  return m_shader_config->gpgpu_shmem_per_block;
+}
+
+int gpgpu_sim::num_registers_per_core() const {
+  return m_shader_config->gpgpu_shader_registers;
+}
+
+int gpgpu_sim::num_registers_per_block() const {
+  return m_shader_config->gpgpu_registers_per_block;
+}
+
+int gpgpu_sim::wrp_size() const { return m_shader_config->warp_size; }
+
+int gpgpu_sim::shader_clock() const { return m_config.core_freq / 1000; }
+
+int gpgpu_sim::max_cta_per_core() const {
+  return m_shader_config->max_cta_per_core;
+}
+
+int gpgpu_sim::get_max_cta(const kernel_info_t &k) const {
+  return m_shader_config->max_cta(k);
+}
+
+void gpgpu_sim::set_prop(cudaDeviceProp *prop) { m_cuda_properties = prop; }
+
+int gpgpu_sim::compute_capability_major() const {
+  return m_config.gpgpu_compute_capability_major;
+}
+
+int gpgpu_sim::compute_capability_minor() const {
+  return m_config.gpgpu_compute_capability_minor;
+}
+
+const struct cudaDeviceProp *gpgpu_sim::get_prop() const {
+  return m_cuda_properties;
+}
+
+enum divergence_support_t gpgpu_sim::simd_model() const {
+  return m_shader_config->model;
+}
+
+void gpgpu_sim_config::init_clock_domains(void) {
+  sscanf(gpgpu_clock_domains, "%lf:%lf:%lf:%lf", &core_freq, &icnt_freq,
+         &l2_freq, &dram_freq);
+  core_freq = core_freq MhZ;
+  icnt_freq = icnt_freq MhZ;
+  l2_freq = l2_freq MhZ;
+  dram_freq = dram_freq MhZ;
+  core_period = 1 / core_freq;
+  icnt_period = 1 / icnt_freq;
+  dram_period = 1 / dram_freq;
+  l2_period = 1 / l2_freq;
+  printf("GPGPU-Sim uArch: clock freqs: %lf:%lf:%lf:%lf\n", core_freq,
+         icnt_freq, l2_freq, dram_freq);
+  printf("GPGPU-Sim uArch: clock periods: %.20lf:%.20lf:%.20lf:%.20lf\n",
+         core_period, icnt_period, l2_period, dram_period);
+}
+
+void gpgpu_sim::reinit_clock_domains(void) {
+  core_time = 0;
+  dram_time = 0;
+  icnt_time = 0;
+  l2_time = 0;
+}
+
+bool gpgpu_sim::active() {
+  if (m_config.gpu_max_cycle_opt &&
+      (gpu_tot_sim_cycle + gpu_sim_cycle) >= m_config.gpu_max_cycle_opt)
+    return false;
+  if (m_config.gpu_max_insn_opt &&
+      (gpu_tot_sim_insn + gpu_sim_insn) >= m_config.gpu_max_insn_opt)
+    return false;
+  if (m_config.gpu_max_cta_opt &&
+      (gpu_tot_issued_cta >= m_config.gpu_max_cta_opt))
+    return false;
+  if (m_config.gpu_max_completed_cta_opt &&
+      (gpu_completed_cta >= m_config.gpu_max_completed_cta_opt))
+    return false;
+  if (m_config.gpu_deadlock_detect && gpu_deadlock) return false;
+  for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++)
+    if (m_cluster[i]->get_not_completed() > 0) return true;
+  ;
+  for (unsigned i = 0; i < m_memory_config->m_n_mem; i++)
+    if (m_memory_partition_unit[i]->busy() > 0) return true;
+  ;
+  if (icnt_busy()) return true;
+  if (get_more_cta_left()) return true;
+  return false;
+}
+
+bool sst_gpgpu_sim::active() {
+  if (m_config.gpu_max_cycle_opt &&
+      (gpu_tot_sim_cycle + gpu_sim_cycle) >= m_config.gpu_max_cycle_opt)
+    return false;
+  if (m_config.gpu_max_insn_opt &&
+      (gpu_tot_sim_insn + gpu_sim_insn) >= m_config.gpu_max_insn_opt)
+    return false;
+  if (m_config.gpu_max_cta_opt &&
+      (gpu_tot_issued_cta >= m_config.gpu_max_cta_opt))
+    return false;
+  if (m_config.gpu_max_completed_cta_opt &&
+      (gpu_completed_cta >= m_config.gpu_max_completed_cta_opt))
+    return false;
+  if (m_config.gpu_deadlock_detect && gpu_deadlock) return false;
+  for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++)
+    if (m_cluster[i]->get_not_completed() > 0) return true;
+  if (get_more_cta_left()) return true;
+  return false;
+}
+
+void gpgpu_sim::init() {
+  // P3: reject configurations that break the parallel CORE / DRAM phases.
+  // Each option below opens a write path crossing the chiplet or partition
+  // boundary that those loops assume is private:
+  //   -gpgpu_tlb_ideal 1          -> gpu_page_table, one table for the whole GPU (W3)
+  //   simple_dram_model           -> simple_dram_model_cycle() was never audited
+  //                                  for partition locality (T-DRAM covers dram_cycle only)
+  // Compiled in only for a parallel build, so serial runs -- which legitimately
+  // use -gpgpu_tlb_ideal for the translation-cost baseline -- are unaffected.
+  // abort() rather than assert(): a future -DNDEBUG must not silently drop it.
+#ifdef _OPENMP
+  {
+    // Empirical thread ceiling, raised to 16 after G6. The race behind the
+    // 8/16-thread divergences was the non-atomic warp_inst uid counter
+    // (warp_inst_sm_next_uid; a stale increment could roll it backwards, so a
+    // core's later instruction could get a SMALLER uid than one in flight, and
+    // register_set::get_ready() picked a different "oldest"). With G6 in
+    // (atomic capture, abstract_hardware_model.cc), 1/2/4/8/16 threads all
+    // reproduce the sequential digest exactly: 2dconv 16t 13/13 across two
+    // harnesses and three load regimes, and BFS synth_32M (5 kernel teardowns,
+    // frozen placement) 8t/16t MATCH. Implementation log section 19-20.
+    // Above 16 remains unverified -- not "unsafe", just never run -- so keep
+    // refusing rather than warning: a silently wrong result is the exact
+    // failure mode this effort exists to prevent. Set
+    // ACCELSIM_ALLOW_UNVERIFIED_THREADS to override when investigating.
+    const int omp_max = omp_get_max_threads();
+    if (omp_max > 16 && getenv("ACCELSIM_ALLOW_UNVERIFIED_THREADS") == NULL) {
+      fprintf(stderr,
+              "\nFATAL: OMP_NUM_THREADS=%d exceeds the verified ceiling of 16.\n"
+              "       Thread counts 1/2/4/8/16 reproduce the sequential result "
+              "exactly (G6);\n"
+              "       higher counts have never been validated, and this class "
+              "of failure is\n"
+              "       silent (exit 0, wrong statistics).\n"
+              "       Use OMP_NUM_THREADS<=16, or set "
+              "ACCELSIM_ALLOW_UNVERIFIED_THREADS=1 to validate a higher "
+              "count.\n",
+              omp_max);
+      fflush(stderr);
+      abort();
+    }
+    const char *unsafe_opt = NULL;
+    if (m_shader_config->gpgpu_tlb_ideal)
+      unsafe_opt = "-gpgpu_tlb_ideal 1 (W3: GPU-wide gpu_page_table)";
+    else if (m_memory_config->simple_dram_model)
+      unsafe_opt = "simple_dram_model (not audited for partition locality)";
+    if (unsafe_opt) {
+      fprintf(stderr,
+              "\nFATAL: this binary was built with OpenMP (parallel CORE/DRAM "
+              "loops) but the\n       configuration uses %s.\n"
+              "       That path writes state shared across chiplets or memory "
+              "partitions and\n       is not safe under the parallel loops. "
+              "Rebuild without -fopenmp, or\n       drop the option.\n",
+              unsafe_opt);
+      fflush(stderr);
+      abort();
+    }
+  }
+#endif
+
+  // A1/A2 (design doc sections 21-22): any run that DECIDES placement itself
+  // -- i.e. does not load a frozen map -- defers the first-touch owner
+  // inserts out of the parallel CORE phase and commits them at a canonical
+  // sequential point each cycle (gpu-module.h). That covers both reference
+  // runs (placement dump, no load -- stage 1) and ordinary uncontrolled cold
+  // runs (neither dump nor load -- stage 2): both fire record_first_touch
+  // from a real first touch, and both need the insert kept out of the
+  // parallel phase. A loaded/frozen run never inserts (record_first_touch's
+  // find() always succeeds), so leaving it off the deferred path is harmless
+  // and keeps that path's behavior untouched by construction.
+  // Gated by RUN MODE, never by thread count -- the resulting map/statistics
+  // must not be a function of OMP_NUM_THREADS. Not OpenMP-conditional either:
+  // a serial run uses the same deferred semantics so every thread count
+  // produces the same result (verified stage 1: A2/A3; stage 2: B3/B4).
+  {
+    const char *pl = m_config.get_gmmu_placement_load();
+    // PCC: a loaded map was produced under the legacy CTA->SM placement.
+    // Local-memory VAs are a function of the hardware thread slot
+    // (translate_local_memaddr: m_sid/tid), so a different placement touches
+    // pages the map never saw. The legacy load path inserts those immediately
+    // from the parallel pass B and trips the mutation guard (FATAL). With the
+    // per-chiplet cursor on, route them through the same deferred first-touch
+    // commit the reference run uses (serial point after pass C; the walker
+    // sees the owner next cycle). Pages already in the map are unaffected:
+    // record_first_touch() finds them and inserts nothing.
+    const bool deferrable_mode =
+        !(pl && pl[0] != '\0') || (m_config.get_cta_chiplet_cursor() != 0);
+    if (deferrable_mode && m_gpu_module && m_gpu_module->get_page_table() &&
+        !m_gpu_module->get_page_table()->deferred_first_touch_enabled())
+      m_gpu_module->get_page_table()->enable_deferred_first_touch(
+          m_gpu_module->get_num_chiplets());
+  }
+
+  // run a CUDA grid on the GPU microarchitecture simulator
+  gpu_sim_cycle = 0;
+  gpu_sim_insn = 0;
+  last_gpu_sim_insn = 0;
+  m_total_cta_launched = 0;
+  gpu_completed_cta = 0;
+  partiton_reqs_in_parallel = 0;
+  partiton_replys_in_parallel = 0;
+  partiton_reqs_in_parallel_util = 0;
+  gpu_sim_cycle_parition_util = 0;
+
+// McPAT initialization function. Called on first launch of GPU
+#ifdef GPGPUSIM_POWER_MODEL
+  if (m_config.g_power_simulation_enabled) {
+    init_mcpat(m_config, m_gpgpusim_wrapper, m_config.gpu_stat_sample_freq,
+               gpu_tot_sim_insn, gpu_sim_insn);
+  }
+#endif
+
+  reinit_clock_domains();
+  gpgpu_ctx->func_sim->set_param_gpgpu_num_shaders(m_config.num_shader());
+  for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++)
+    m_cluster[i]->reinit();
+  m_shader_stats->new_grid();
+  // initialize the control-flow, memory access, memory latency logger
+  if (m_config.g_visualizer_enabled) {
+    create_thread_CFlogger(gpgpu_ctx, m_config.num_shader(),
+                           m_shader_config->n_thread_per_shader, 0,
+                           m_config.gpgpu_cflog_interval);
+  }
+  shader_CTA_count_create(m_config.num_shader(), m_config.gpgpu_cflog_interval);
+  if (m_config.gpgpu_cflog_interval != 0) {
+    insn_warp_occ_create(m_config.num_shader(), m_shader_config->warp_size);
+    shader_warp_occ_create(m_config.num_shader(), m_shader_config->warp_size,
+                           m_config.gpgpu_cflog_interval);
+    shader_mem_acc_create(m_config.num_shader(), m_memory_config->m_n_mem, 4,
+                          m_config.gpgpu_cflog_interval);
+    shader_mem_lat_create(m_config.num_shader(), m_config.gpgpu_cflog_interval);
+    shader_cache_access_create(m_config.num_shader(), 3,
+                               m_config.gpgpu_cflog_interval);
+    set_spill_interval(m_config.gpgpu_cflog_interval * 40);
+  }
+
+  if (g_network_mode) icnt_init();
+}
+
+void gpgpu_sim::update_stats() {
+  m_memory_stats->memlatstat_lat_pw();
+  gpu_tot_sim_cycle += gpu_sim_cycle;
+  gpu_tot_sim_insn += gpu_sim_insn;
+  gpu_tot_issued_cta += m_total_cta_launched;
+  partiton_reqs_in_parallel_total += partiton_reqs_in_parallel;
+  partiton_replys_in_parallel_total += partiton_replys_in_parallel;
+  partiton_reqs_in_parallel_util_total += partiton_reqs_in_parallel_util;
+  gpu_tot_sim_cycle_parition_util += gpu_sim_cycle_parition_util;
+  gpu_tot_occupancy += gpu_occupancy;
+
+  gpu_sim_cycle = 0;
+  partiton_reqs_in_parallel = 0;
+  partiton_replys_in_parallel = 0;
+  partiton_reqs_in_parallel_util = 0;
+  gpu_sim_cycle_parition_util = 0;
+  gpu_sim_insn = 0;
+  m_total_cta_launched = 0;
+  gpu_completed_cta = 0;
+  gpu_occupancy = occupancy_stats();
+}
+
+PowerscalingCoefficients *gpgpu_sim::get_scaling_coeffs() {
+  return m_gpgpusim_wrapper->get_scaling_coeffs();
+}
+
+void gpgpu_sim::print_stats(unsigned long long streamID) {
+  gpgpu_ctx->stats->ptx_file_line_stats_write_file();
+  gpu_print_stat(streamID);
+
+  if (g_network_mode) {
+    printf(
+        "----------------------------Interconnect-DETAILS----------------------"
+        "----------\n");
+    icnt_display_stats();
+    icnt_display_overall_stats();
+    printf(
+        "----------------------------END-of-Interconnect-DETAILS---------------"
+        "----------\n");
+  }
+  
+  // Print per-chiplet GMMU statistics: PTW counts, PWQ delay, local/remote
+  // steps, and PWC hit rate. These are the primary MCM-GPU evaluation metrics.
+  if (m_gpu_module) {
+    printf("----------------------------GMMU-STATS-"
+           "---------------------------------------\n");
+    // Which of the three experiment runs this is. Every field is read back from
+    // what the run actually DID, never from a config label, so a mis-specified
+    // config reports the wrong mode instead of a mislabelled right one.
+    //
+    // `pinned` is the decisive one. A -gmmu_placement_load whose file is missing
+    // only warns and falls back to first touch, which would silently turn a
+    // measurement run into an uncontrolled one while still emitting plausible
+    // stats. Reading placement_frozen() back makes that land as
+    // INVALID_map_not_loaded.
+    {
+      const char* pd = m_config.get_gmmu_placement_dump();
+      const char* pl = m_config.get_gmmu_placement_load();
+      const bool dumping = pd && pd[0] != '\0';
+      const bool loading = pl && pl[0] != '\0';
+      const bool lptw = m_gpu_module->local_ptw_enabled();
+      const bool pinned = m_gpu_module->get_page_table() &&
+                          m_gpu_module->get_page_table()->placement_frozen();
+      const char* mode;
+      if (dumping && loading)
+        mode = "INVALID_dump+load";  // the map would be read and overwritten
+      else if (dumping)
+        mode = pinned ? "INVALID_ref_pinned"  // a reference must place by first touch
+                      : "REFERENCE";          // builds the map, stats discarded
+      else if (loading)
+        mode = !pinned ? "INVALID_map_not_loaded"
+                       : (lptw ? "LOCAL_PTW" : "BASELINE");
+      else
+        mode = "INVALID_no_placement";  // uncontrolled: neither dumped nor pinned
+      printf("[RUN_MODE] mode=%s  local_ptw=%d  pinned=%d  page_shift=%u  "
+             "placement=%s%s  cta_sched=%s\n",
+             mode, lptw ? 1 : 0, pinned ? 1 : 0,
+             m_gpu_module->uniform_page_shift(),
+             dumping ? "dump:" : (loading ? "load:" : "none"),
+             dumping ? pd : (loading ? pl : ""),
+             m_cta_scheduler ? m_cta_scheduler->policy_name() : "?");
+    }
+    // Page-table footprint: baseline holds one copy, a replicated (local-PTW)
+    // page table holds one per chiplet.
+    if (m_gpu_module->get_page_table()) {
+      size_t nodes = m_gpu_module->get_page_table()->pt_node_count();
+      size_t pages = m_gpu_module->get_page_table()->pt_page_count();
+      printf("[PAGE_TABLE] pt_nodes=%zu  pt_pages=%zu  pt_footprint=%.3f MB  local_ptw=%d\n",
+             nodes, pages, (double)(pages * GPU_PAGE_SIZE) / (1024.0 * 1024.0),
+             m_gpu_module->local_ptw_enabled() ? 1 : 0);
+    }
+    // P5-2: cumulative count of page-table mutations (owner-map inserts, node
+    // creation, leaf installs), INCLUDING those made while building or
+    // premapping the table before any kernel ran -- so it is non-zero in a
+    // pinned run as well (577,356 on BC 77zf). What must be zero is the delta
+    // across each parallel CORE phase; gpgpu_sim::cycle() enforces that with an
+    // abort, so a run that reaches this line had none.
+    printf("[PAGE_TABLE] mutations=%llu  (cumulative incl. build/premap; "
+           "parallel-phase delta guarded to 0)\n",
+           m_gpu_module->get_page_table()->mutation_count());
+    // A1: deferred first-touch bookkeeping. Enabled in reference mode AND in
+    // PCC (+load) runs, where local-memory pages the map never saw must get a
+    // deterministic owner (see deferrable_mode). dedup counts buffered entries
+    // that inserted nothing at commit; new_pages = commits - dedup is the number
+    // of pages this run placed itself. In a pinned run it is 0, so
+    // commits == dedup there is expected, not a defect.
+    if (m_gpu_module->get_page_table()->deferred_first_touch_enabled()) {
+      const unsigned long long c = m_gpu_module->get_page_table()->deferred_ft_commits();
+      const unsigned long long d = m_gpu_module->get_page_table()->deferred_ft_dedups();
+      printf("[REF_DEFER] commits=%llu dedup=%llu new_pages=%llu max_batch=%llu\n",
+             c, d, c - d, m_gpu_module->get_page_table()->deferred_ft_max_batch());
+    }
+    // Optional: write the first-touch placement map for a later measurement run.
+    {
+      const char* pd = m_config.get_gmmu_placement_dump();
+      if (pd && pd[0] != '\0' && m_gpu_module->get_page_table())
+        m_gpu_module->get_page_table()->dump_placement(pd);
+    }
+    for (unsigned c = 0; c < m_gpu_module->get_num_chiplets(); c++) {
+      m_gpu_module->get_gmmu(c)->print_stats(stdout);
+    }
+    // ST-3: under a fixed page-size policy (0/1/2) the other two TLB instances
+    // never see a request, yet printed 12 all-zero lines per SM per dump. Skip
+    // them. uniform_page_shift() is 0 for a mixed policy (3-5): print all three.
+    const unsigned ups = m_gpu_module->uniform_page_shift();
+    auto want_kind = [ups](unsigned shift) { return ups == 0 || ups == shift; };
+    // L1 TLB statistics per SM, one TLB per page size
+    for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
+        for (unsigned j = 0; j < m_shader_config->n_simt_cores_per_cluster; j++) {
+            shader_core_ctx* core = m_cluster[i]->get_core(j);
+            if (!core) continue;
+            if (core->get_l1_tlb()     && want_kind(GPU_PAGE_SHIFT)) core->get_l1_tlb()->print_stats(stdout);
+            if (core->get_l1_tlb_64k() && want_kind(GPU_64K_SHIFT))  core->get_l1_tlb_64k()->print_stats(stdout);
+            if (core->get_l1_tlb_2m()  && want_kind(GPU_HUGE_SHIFT)) core->get_l1_tlb_2m()->print_stats(stdout);
+            core->xlat_print_stats(stdout);   // XLATLAT: SM-level view
+        }
+    }
+    xlatsum_gpu_print(stdout);  // 34: GPU-wide XLATSUM rows (additive tag)
+    // L2 TLB statistics per chiplet, one TLB per page size
+    for (unsigned c = 0; c < m_gpu_module->get_num_chiplets(); c++) {
+      if (want_kind(GPU_PAGE_SHIFT)) m_gpu_module->get_chiplet(c)->get_l2_tlb_4k()->print_stats(stdout);
+      if (want_kind(GPU_64K_SHIFT))  m_gpu_module->get_chiplet(c)->get_l2_tlb_64k()->print_stats(stdout);
+      if (want_kind(GPU_HUGE_SHIFT)) m_gpu_module->get_chiplet(c)->get_l2_tlb_2m()->print_stats(stdout);
+    }
+    // (temp) diagnostics report -- P-5: only under ACCELSIM_DIAG.
+    if (g_accelsim_diag) {
+    // ACCEPT_ (temp): per-chiplet mem-accept backpressure + DRAM utilization.
+    // mem_full% high => convergence backpressure at accept path. If DRAM_util also
+    // high => real DRAM saturation; if DRAM_util low => throttle upstream of DRAM
+    // (L2 processing / icnt_L2 queue), not DRAM-BW bound.
+    {
+      unsigned nc = m_gpu_module->get_num_chiplets(); if (nc > 8) nc = 8;
+      // aggregate per-chiplet DRAM bwutil over that chiplet's memory channels
+      double dram_util_sum[8] = {0}; unsigned dram_ch_cnt[8] = {0};
+      for (unsigned p = 0; p < m_memory_config->m_n_mem; p++) {
+        unsigned ch = m_gpu_module->mem_sub_partition_to_chiplet(
+            p * m_memory_config->m_n_sub_partition_per_memory_channel);
+        if (ch < 8) { dram_util_sum[ch] += m_memory_partition_unit[p]->get_dram_bwutil();
+                      dram_ch_cnt[ch]++; }
+      }
+      for (unsigned c = 0; c < nc; c++) {
+        unsigned long long tot = g_memfull_total[c] ? g_memfull_total[c] : 1;
+        printf("[ACCEPT] chiplet=%u mem_full=%llu/%llu (%.1f%%)  DRAM_util=%.1f%%\n",
+               c, g_memfull_stall[c], g_memfull_total[c],
+               100.0 * g_memfull_stall[c] / tot,
+               dram_ch_cnt[c] ? 100.0 * dram_util_sum[c] / dram_ch_cnt[c] : 0.0);
+      }
+    }
+    // POPGATE_ (temp): per-chiplet repr-cluster icnt-pop gating. Written
+    // pre-Fix-A; with the endpoint round-robin, PTW replies spread across all
+    // clusters of the chiplet, so this row now samples only the repr cluster's
+    // share (a lower bound, not the whole chiplet's PTW gating).
+    for (unsigned c = 0; c < m_gpu_module->get_num_chiplets(); c++) {
+      unsigned repr = m_gpu_module->get_chiplet(c)->get_cluster_global_begin();
+      unsigned long long icnt_cycles = 0, gated = 0;
+      m_cluster[repr]->get_popgate_stats(icnt_cycles, gated);
+      printf("[POPGATE] repr_cluster=%u chiplet=%u icnt_cycles=%llu gated=%llu (%.1f%%) "
+             "[repr-cluster share only; lower bound since Fix-A]\n",
+             repr, c, icnt_cycles, gated,
+             icnt_cycles ? 100.0 * gated / icnt_cycles : 0.0);
+    }
+    // FUNNEL_ (temp): normal (non-PTW) reply xbar latency by SOURCE mem chiplet.
+    // Compare transit_avg here vs PTW [FUNNEL] reply-split transit_avg: if similar,
+    // the delay is general chiplet-source xbar congestion (placement), not PTW-specific.
+    {
+      extern unsigned long long g_normrep_transit_sum[8], g_normrep_lasthop_sum[8],
+          g_normrep_cnt[8];
+      for (unsigned c = 0; c < m_gpu_module->get_num_chiplets() && c < 8; c++) {
+        unsigned long long n = g_normrep_cnt[c] ? g_normrep_cnt[c] : 1;
+        printf("[NORMREP] src_chiplet=%u normal-reply: transit_avg=%.1f lasthop_avg=%.1f "
+               "[n=%llu]\n", c, (double)g_normrep_transit_sum[c] / n,
+               (double)g_normrep_lasthop_sum[c] / n, g_normrep_cnt[c]);
+      }
+      // FUNNEL_ (temp): normal-reply transit_avg matrix [src mem chiplet][dst cluster chiplet].
+      extern unsigned long long g_normrep_mtx_transit[8][8], g_normrep_mtx_cnt[8][8];
+      unsigned nc = m_gpu_module->get_num_chiplets(); if (nc > 8) nc = 8;
+      printf("[NORMREP-MTX] transit_avg  rows=src_mem_chiplet  cols=dst_cluster_chiplet\n");
+      for (unsigned s = 0; s < nc; s++) {
+        printf("[NORMREP-MTX] src%u:", s);
+        for (unsigned d = 0; d < nc; d++) {
+          unsigned long long m = g_normrep_mtx_cnt[s][d];
+          printf("  d%u=%.0f(n=%llu)", d,
+                 m ? (double)g_normrep_mtx_transit[s][d] / m : 0.0, m);
+        }
+        printf("\n");
+      }
+    }
+    }  // g_accelsim_diag (P-5): ACCEPT/POPGATE/NORMREP rows
+    printf("----------------------------END-of-GMMU-STATS-"
+           "----------------------------------\n");
+  }
+
+  // PHASE_TIMING: cumulative-so-far wall-clock share of each cycle() domain block.
+  // Printed here (not only at process exit) so a run that later crashes/deadlocks
+  // still leaves at least one snapshot. stderr, own tag, own stream -- never part
+  // of the stdout digest. See docs/parallelization_overview.ko.md Sec 8 item 2.
+  if (g_phase_timing_on) {
+    const unsigned long long total_ns =
+        g_phase_timers.dram_ns + g_phase_timers.l2gmmu_ns + g_phase_timers.icnt_ns +
+        g_phase_timers.phase_a_ns + g_phase_timers.phase_b_ns + g_phase_timers.phase_c_ns;
+    const double pct = total_ns ? 100.0 / (double)total_ns : 0.0;
+    fprintf(stderr,
+        "[PHASE_TIMING] threads=%d total=%.3fs "
+        "dram=%.1f%%(n=%llu) l2gmmu=%.1f%%(n=%llu) icnt=%.1f%%(n=%llu) "
+        "phase_a=%.1f%%(n=%llu) phase_b=%.1f%%(n=%llu) phase_c=%.1f%%(n=%llu)\n",
+#ifdef _OPENMP
+        omp_get_max_threads(),
+#else
+        1,
+#endif
+        (double)total_ns / 1.0e9,
+        g_phase_timers.dram_ns * pct, g_phase_timers.dram_calls,
+        g_phase_timers.l2gmmu_ns * pct, g_phase_timers.l2gmmu_calls,
+        g_phase_timers.icnt_ns * pct, g_phase_timers.icnt_calls,
+        g_phase_timers.phase_a_ns * pct, g_phase_timers.phase_a_calls,
+        g_phase_timers.phase_b_ns * pct, g_phase_timers.phase_b_calls,
+        g_phase_timers.phase_c_ns * pct, g_phase_timers.phase_c_calls);
+    if (g_phase_timers.phase_b_calls) {  // D1: phase B per chiplet group (stderr only)
+      fprintf(stderr, "[PHASE_TIMING_B] chip_s=");
+      for (unsigned c = 0; c < 8; c++)
+        if (g_phase_timers.phase_b_chip_ns[c])
+          fprintf(stderr, "%s%u:%.3f", c ? "," : "", c,
+                  (double)g_phase_timers.phase_b_chip_ns[c] / 1.0e9);
+      fprintf(stderr, " runs_by_thread=");
+      for (unsigned c = 0; c < 8; c++) {
+        if (!g_phase_timers.phase_b_chip_ns[c]) continue;
+        fprintf(stderr, "%s%u:{", c ? " " : "", c);
+        bool first = true;
+        for (unsigned t = 0; t < 16; t++)
+          if (g_phase_timers.phase_b_chip_thread[c][t]) {
+            fprintf(stderr, "%st%u=%llu", first ? "" : ",", t,
+                    g_phase_timers.phase_b_chip_thread[c][t]);
+            first = false;
+          }
+        fprintf(stderr, "}");
+      }
+      fprintf(stderr, "\n");
+      // D1b
+      fprintf(stderr, "[PHASE_TIMING_B2] cyclemax=%.3fs argmax=",
+              (double)g_phase_timers.phase_b_cyclemax_ns / 1.0e9);
+      for (unsigned c = 0; c < 8; c++)
+        if (g_phase_timers.phase_b_argmax_cnt[c])
+          fprintf(stderr, "%s%u:%llu", c ? "," : "", c, g_phase_timers.phase_b_argmax_cnt[c]);
+      fprintf(stderr, " max_hist_log2us=");
+      for (unsigned b = 0; b < 24; b++)
+        if (g_phase_timers.phase_b_max_hist[b])
+          fprintf(stderr, "%s%u:%llu", b ? "," : "", b, g_phase_timers.phase_b_max_hist[b]);
+      fprintf(stderr, " body_hist_log2us=");
+      for (unsigned b = 0; b < 24; b++)
+        if (g_phase_timers.phase_b_body_hist[b])
+          fprintf(stderr, "%s%u:%llu", b ? "," : "", b, g_phase_timers.phase_b_body_hist[b]);
+      fprintf(stderr, "\n");
+    }
+    // 31: coverage accounting. cycle_ns is the whole cycle() body; buckets
+    // above are its parts. "uncov" is what cycle() spends outside every bucket.
+    const unsigned long long bucket_sum = total_ns +
+        g_phase_timers.cluster_icnt_ns + g_phase_timers.tail_ns;
+    fprintf(stderr,
+        "[PHASE_TIMING_COVER] cycle=%.3fs cluster_icnt=%.3fs tail=%.3fs "
+        "uncov_in_cycle=%.3fs\n",
+        g_phase_timers.cycle_ns / 1.0e9,
+        g_phase_timers.cluster_icnt_ns / 1.0e9,
+        g_phase_timers.tail_ns / 1.0e9,
+        (g_phase_timers.cycle_ns > bucket_sum
+             ? (g_phase_timers.cycle_ns - bucket_sum) / 1.0e9 : 0.0));
+    fprintf(stderr, "[PHASE_TIMING_TAIL] issue=%.3fs occ=%.3fs rest=%.3fs\n",
+        g_phase_timers.tail_issue_ns / 1.0e9, g_phase_timers.tail_occ_ns / 1.0e9,
+        (g_phase_timers.tail_ns - g_phase_timers.tail_issue_ns -
+         g_phase_timers.tail_occ_ns) / 1.0e9);
+    // §25 pre-measurement: icnt split into local-xbar-Advance() (candidate for
+    // chiplet-width parallel) vs handoff/handoff_ring (must stay sequential --
+    // genuine chiplet-to-chiplet exchange). Percentages are of icnt_ns itself,
+    // not of total, so they read directly as "how much of ICNT would move".
+    // H3: include the pop loop so the three components sum to the icnt phase.
+    fprintf(stderr,
+        "[PHASE_TIMING_ICNT_POP] mem2icnt_pop=%.3fs(n=%llu) xbar_advance=%.3fs "
+        "handoff=%.3fs  sum=%.3fs  icnt_phase=%.3fs\n",
+        g_icnt_pop_ns / 1.0e9, g_icnt_pop_calls, g_icnt_local_ns / 1.0e9,
+        g_icnt_handoff_ns / 1.0e9,
+        (g_icnt_pop_ns + g_icnt_local_ns + g_icnt_handoff_ns) / 1.0e9,
+        g_phase_timers.icnt_ns / 1.0e9);
+    const unsigned long long icnt_sub_ns = g_icnt_local_ns + g_icnt_handoff_ns;
+    const double icnt_pct = icnt_sub_ns ? 100.0 / (double)icnt_sub_ns : 0.0;
+    fprintf(stderr,
+        "[PHASE_TIMING_ICNT_SPLIT] local_advance=%.1f%%(%.3fs,n=%llu) "
+        "handoff=%.1f%%(%.3fs,n=%llu)\n",
+        g_icnt_local_ns * icnt_pct, (double)g_icnt_local_ns / 1.0e9, g_icnt_local_calls,
+        g_icnt_handoff_ns * icnt_pct, (double)g_icnt_handoff_ns / 1.0e9, g_icnt_handoff_calls);
+    fflush(stderr);
+  }
+}
+
+void gpgpu_sim::deadlock_check() {
+  if (m_config.gpu_deadlock_detect && gpu_deadlock) {
+    fflush(stdout);
+    printf(
+        "\n\nGPGPU-Sim uArch: ERROR ** deadlock detected: last writeback core "
+        "%u @ gpu_sim_cycle %u (+ gpu_tot_sim_cycle %u) (%u cycles ago)\n",
+        gpu_sim_insn_last_update_sid, (unsigned)gpu_sim_insn_last_update,
+        (unsigned)(gpu_tot_sim_cycle - gpu_sim_cycle),
+        (unsigned)(gpu_sim_cycle - gpu_sim_insn_last_update));
+    unsigned num_cores = 0;
+    for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
+      unsigned not_completed = m_cluster[i]->get_not_completed();
+      if (not_completed) {
+        if (!num_cores) {
+          printf(
+              "GPGPU-Sim uArch: DEADLOCK  shader cores no longer committing "
+              "instructions [core(# threads)]:\n");
+          printf("GPGPU-Sim uArch: DEADLOCK  ");
+          m_cluster[i]->print_not_completed(stdout);
+        } else if (num_cores < 8) {
+          m_cluster[i]->print_not_completed(stdout);
+        } else if (num_cores >= 8) {
+          printf(" + others ... ");
+        }
+        num_cores += m_shader_config->n_simt_cores_per_cluster;
+      }
+    }
+    printf("\n");
+    for (unsigned i = 0; i < m_memory_config->m_n_mem; i++) {
+      bool busy = m_memory_partition_unit[i]->busy();
+      if (busy)
+        printf("GPGPU-Sim uArch DEADLOCK:  memory partition %u busy\n", i);
+    }
+    // XLATDBG: dump WHAT is stuck, not just that something is. m_request_tracker
+    // holds every request that entered the sub-partition and has not left, and
+    // mem_fetch::print reports its status plus the cycle that status last
+    // changed -- i.e. exactly where it stopped moving.
+    {
+      const unsigned subs = m_memory_config->m_n_sub_partition_per_memory_channel;
+      printf("XLATDBG_DEADLOCK: ===== stuck memory requests =====\n");
+      for (unsigned i = 0; i < m_memory_config->m_n_mem; i++) {
+        if (!m_memory_partition_unit[i]->busy()) continue;
+        const unsigned chip = m_gpu_module ? m_gpu_module->chiplet_of_mem(i) : 0;
+        for (unsigned s = 0; s < subs; s++) {
+          printf("XLATDBG_DEADLOCK: mem_part=%u (chiplet %u) sub=%u\n", i, chip, s);
+          m_memory_partition_unit[i]->get_sub_partition(s)->print(stdout);
+        }
+      }
+      printf("XLATDBG_DEADLOCK: ===== address-translation waiters =====\n");
+      for (unsigned c = 0; c < m_shader_config->n_simt_clusters; c++)
+        m_cluster[c]->xlatdbg_dump_waiters(stdout);
+      if (m_gpu_module)
+        for (unsigned c = 0; c < m_gpu_module->get_num_chiplets(); c++) {
+          m_gpu_module->get_gmmu(c)->xlatdbg_dump_pending(stdout);
+          m_gpu_module->get_chiplet(c)->get_l2_tlb_4k()->xlatdbg_dump(stdout, c, "4k");
+        }
+      if (m_gpu_module)
+        printf("XLATDBG_DEADLOCK: pwq_rollback(MISS rolled back, gate lost)=%llu\n",
+               m_gpu_module->m_xlatdbg_pwq_rollback);
+      printf("XLATDBG_DEADLOCK: ===== end =====\n");
+      fflush(stdout);
+    }
+    if (icnt_busy()) {
+      printf("GPGPU-Sim uArch DEADLOCK:  iterconnect contains traffic\n");
+      icnt_display_state(stdout);
+    }
+    printf(
+        "\nRe-run the simulator in gdb and use debug routines in .gdbinit to "
+        "debug this\n");
+    fflush(stdout);
+    abort();
+  }
+}
+
+/// printing the names and uids of a set of executed kernels (usually there is
+/// only one)
+std::string gpgpu_sim::executed_kernel_info_string() {
+  std::stringstream statout;
+
+  statout << "kernel_name = ";
+  for (unsigned int k = 0; k < m_executed_kernel_names.size(); k++) {
+    statout << m_executed_kernel_names[k] << " ";
+  }
+  statout << std::endl;
+  statout << "kernel_launch_uid = ";
+  for (unsigned int k = 0; k < m_executed_kernel_uids.size(); k++) {
+    statout << m_executed_kernel_uids[k] << " ";
+  }
+  statout << std::endl;
+
+  return statout.str();
+}
+
+std::string gpgpu_sim::executed_kernel_name() {
+  std::stringstream statout;
+  if (m_executed_kernel_names.size() == 1)
+    statout << m_executed_kernel_names[0];
+  else {
+    for (unsigned int k = 0; k < m_executed_kernel_names.size(); k++) {
+      statout << m_executed_kernel_names[k] << " ";
+    }
+  }
+  return statout.str();
+}
+void gpgpu_sim::set_cache_config(std::string kernel_name,
+                                 FuncCache cacheConfig) {
+  m_special_cache_config[kernel_name] = cacheConfig;
+}
+
+FuncCache gpgpu_sim::get_cache_config(std::string kernel_name) {
+  for (std::map<std::string, FuncCache>::iterator iter =
+           m_special_cache_config.begin();
+       iter != m_special_cache_config.end(); iter++) {
+    std::string kernel = iter->first;
+    if (kernel_name.compare(kernel) == 0) {
+      return iter->second;
+    }
+  }
+  return (FuncCache)0;
+}
+
+bool gpgpu_sim::has_special_cache_config(std::string kernel_name) {
+  for (std::map<std::string, FuncCache>::iterator iter =
+           m_special_cache_config.begin();
+       iter != m_special_cache_config.end(); iter++) {
+    std::string kernel = iter->first;
+    if (kernel_name.compare(kernel) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void gpgpu_sim::set_cache_config(std::string kernel_name) {
+  if (has_special_cache_config(kernel_name)) {
+    change_cache_config(get_cache_config(kernel_name));
+  } else {
+    change_cache_config(FuncCachePreferNone);
+  }
+}
+
+void gpgpu_sim::change_cache_config(FuncCache cache_config) {
+  if (cache_config != m_shader_config->m_L1D_config.get_cache_status()) {
+    printf("FLUSH L1 Cache at configuration change between kernels\n");
+    for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
+      m_cluster[i]->cache_invalidate();
+    }
+  }
+
+  switch (cache_config) {
+    case FuncCachePreferNone:
+      m_shader_config->m_L1D_config.init(
+          m_shader_config->m_L1D_config.m_config_string, FuncCachePreferNone);
+      m_shader_config->gpgpu_shmem_size =
+          m_shader_config->gpgpu_shmem_sizeDefault;
+      break;
+    case FuncCachePreferL1:
+      if ((m_shader_config->m_L1D_config.m_config_stringPrefL1 == NULL) ||
+          (m_shader_config->gpgpu_shmem_sizePrefL1 == (unsigned)-1)) {
+        printf("WARNING: missing Preferred L1 configuration\n");
+        m_shader_config->m_L1D_config.init(
+            m_shader_config->m_L1D_config.m_config_string, FuncCachePreferNone);
+        m_shader_config->gpgpu_shmem_size =
+            m_shader_config->gpgpu_shmem_sizeDefault;
+
+      } else {
+        m_shader_config->m_L1D_config.init(
+            m_shader_config->m_L1D_config.m_config_stringPrefL1,
+            FuncCachePreferL1);
+        m_shader_config->gpgpu_shmem_size =
+            m_shader_config->gpgpu_shmem_sizePrefL1;
+      }
+      break;
+    case FuncCachePreferShared:
+      if ((m_shader_config->m_L1D_config.m_config_stringPrefShared == NULL) ||
+          (m_shader_config->gpgpu_shmem_sizePrefShared == (unsigned)-1)) {
+        printf("WARNING: missing Preferred L1 configuration\n");
+        m_shader_config->m_L1D_config.init(
+            m_shader_config->m_L1D_config.m_config_string, FuncCachePreferNone);
+        m_shader_config->gpgpu_shmem_size =
+            m_shader_config->gpgpu_shmem_sizeDefault;
+      } else {
+        m_shader_config->m_L1D_config.init(
+            m_shader_config->m_L1D_config.m_config_stringPrefShared,
+            FuncCachePreferShared);
+        m_shader_config->gpgpu_shmem_size =
+            m_shader_config->gpgpu_shmem_sizePrefShared;
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+void gpgpu_sim::clear_executed_kernel_info() {
+  m_executed_kernel_names.clear();
+  m_executed_kernel_uids.clear();
+}
+
+void gpgpu_sim::gpu_print_stat(unsigned long long streamID) {
+  FILE *statfout = stdout;
+
+  std::string kernel_info_str = executed_kernel_info_string();
+  fprintf(statfout, "%s", kernel_info_str.c_str());
+
+  printf("kernel_stream_id = %llu\n", streamID);
+
+  printf("gpu_sim_cycle = %lld\n", gpu_sim_cycle);
+  printf("gpu_sim_insn = %lld\n", gpu_sim_insn);
+  printf("gpu_ipc = %12.4f\n", (float)gpu_sim_insn / gpu_sim_cycle);
+  printf("gpu_tot_sim_cycle = %lld\n", gpu_tot_sim_cycle + gpu_sim_cycle);
+  printf("gpu_tot_sim_insn = %lld\n", gpu_tot_sim_insn + gpu_sim_insn);
+  printf("gpu_tot_ipc = %12.4f\n", (float)(gpu_tot_sim_insn + gpu_sim_insn) /
+                                       (gpu_tot_sim_cycle + gpu_sim_cycle));
+  printf("gpu_tot_issued_cta = %lld\n",
+         gpu_tot_issued_cta + m_total_cta_launched);
+  printf("gpu_occupancy = %.4f%% \n", gpu_occupancy.get_occ_fraction() * 100);
+  printf("gpu_tot_occupancy = %.4f%% \n",
+         (gpu_occupancy + gpu_tot_occupancy).get_occ_fraction() * 100);
+
+  fprintf(statfout, "max_total_param_size = %llu\n",
+          gpgpu_ctx->device_runtime->g_max_total_param_size);
+
+  // performance counter for stalls due to congestion.
+  printf("gpu_stall_dramfull = %d\n", gpu_stall_dramfull);
+  printf("gpu_stall_icnt2sh    = %d\n", gpu_stall_icnt2sh);
+
+  // printf("partiton_reqs_in_parallel = %lld\n", partiton_reqs_in_parallel);
+  // printf("partiton_reqs_in_parallel_total    = %lld\n",
+  // partiton_reqs_in_parallel_total );
+  printf("partiton_level_parallism = %12.4f\n",
+         (float)partiton_reqs_in_parallel / gpu_sim_cycle);
+  printf("partiton_level_parallism_total  = %12.4f\n",
+         (float)(partiton_reqs_in_parallel + partiton_reqs_in_parallel_total) /
+             (gpu_tot_sim_cycle + gpu_sim_cycle));
+  // printf("partiton_reqs_in_parallel_util = %lld\n",
+  // partiton_reqs_in_parallel_util);
+  // printf("partiton_reqs_in_parallel_util_total    = %lld\n",
+  // partiton_reqs_in_parallel_util_total ); printf("gpu_sim_cycle_parition_util
+  // = %lld\n", gpu_sim_cycle_parition_util);
+  // printf("gpu_tot_sim_cycle_parition_util    = %lld\n",
+  // gpu_tot_sim_cycle_parition_util );
+  printf("partiton_level_parallism_util = %12.4f\n",
+         (float)partiton_reqs_in_parallel_util / gpu_sim_cycle_parition_util);
+  printf("partiton_level_parallism_util_total  = %12.4f\n",
+         (float)(partiton_reqs_in_parallel_util +
+                 partiton_reqs_in_parallel_util_total) /
+             (gpu_sim_cycle_parition_util + gpu_tot_sim_cycle_parition_util));
+  // printf("partiton_replys_in_parallel = %lld\n",
+  // partiton_replys_in_parallel); printf("partiton_replys_in_parallel_total =
+  // %lld\n", partiton_replys_in_parallel_total );
+  printf("L2_BW  = %12.4f GB/Sec\n",
+         ((float)(partiton_replys_in_parallel * 32) /
+          (gpu_sim_cycle * m_config.core_period)) /
+             1000000000);
+  printf("L2_BW_total  = %12.4f GB/Sec\n",
+         ((float)((partiton_replys_in_parallel +
+                   partiton_replys_in_parallel_total) *
+                  32) /
+          ((gpu_tot_sim_cycle + gpu_sim_cycle) * m_config.core_period)) /
+             1000000000);
+
+  time_t curr_time;
+  time(&curr_time);
+  unsigned long long elapsed_time =
+      MAX(curr_time - gpgpu_ctx->the_gpgpusim->g_simulation_starttime, 1);
+  printf("gpu_total_sim_rate=%u\n",
+         (unsigned)((gpu_tot_sim_insn + gpu_sim_insn) / elapsed_time));
+
+  // shader_print_l1_miss_stat( stdout );
+  shader_print_cache_stats(stdout);
+
+  cache_stats core_cache_stats;
+  core_cache_stats.clear();
+  for (unsigned i = 0; i < m_config.num_cluster(); i++) {
+    m_cluster[i]->get_cache_stats(core_cache_stats);
+  }
+  printf("\nTotal_core_cache_stats:\n");
+  core_cache_stats.print_stats(stdout, streamID,
+                               "Total_core_cache_stats_breakdown");
+  printf("\nTotal_core_cache_fail_stats:\n");
+  core_cache_stats.print_fail_stats(stdout, streamID,
+                                    "Total_core_cache_fail_stats_breakdown");
+  shader_print_scheduler_stat(stdout, false);
+
+  m_shader_stats->print(stdout);
+#ifdef GPGPUSIM_POWER_MODEL
+  if (m_config.g_power_simulation_enabled) {
+    if (m_config.g_power_simulation_mode > 0) {
+      // if(!m_config.g_aggregate_power_stats)
+      mcpat_reset_perf_count(m_gpgpusim_wrapper);
+      calculate_hw_mcpat(m_config, getShaderCoreConfig(), m_gpgpusim_wrapper,
+                         m_power_stats, m_config.gpu_stat_sample_freq,
+                         gpu_tot_sim_cycle, gpu_sim_cycle, gpu_tot_sim_insn,
+                         gpu_sim_insn, m_config.g_power_simulation_mode,
+                         m_config.g_dvfs_enabled, m_config.g_hw_perf_file_name,
+                         m_config.g_hw_perf_bench_name, executed_kernel_name(),
+                         m_config.accelwattch_hybrid_configuration,
+                         m_config.g_aggregate_power_stats);
+    }
+    m_gpgpusim_wrapper->print_power_kernel_stats(
+        gpu_sim_cycle, gpu_tot_sim_cycle, gpu_tot_sim_insn + gpu_sim_insn,
+        kernel_info_str, true);
+    // if(!m_config.g_aggregate_power_stats)
+    mcpat_reset_perf_count(m_gpgpusim_wrapper);
+  }
+#endif
+
+  // performance counter that are not local to one shader
+  m_memory_stats->memlatstat_print(m_memory_config->m_n_mem,
+                                   m_memory_config->nbk);
+  for (unsigned i = 0; i < m_memory_config->m_n_mem; i++)
+    m_memory_partition_unit[i]->print(stdout);
+
+  // L2 cache stats
+  if (!m_memory_config->m_L2_config.disabled()) {
+    cache_stats l2_stats;
+    struct cache_sub_stats l2_css;
+    struct cache_sub_stats total_l2_css;
+    l2_stats.clear();
+    l2_css.clear();
+    total_l2_css.clear();
+
+    printf("\n========= L2 cache stats =========\n");
+    flush_l2loop_idle();   // H3-3c: 건너뛴 방문의 포트 샘플을 읽기 전에 반영
+    for (unsigned i = 0; i < m_memory_config->m_n_mem_sub_partition; i++) {
+      m_memory_sub_partition[i]->accumulate_L2cache_stats(l2_stats);
+      m_memory_sub_partition[i]->get_L2cache_sub_stats(l2_css);
+
+      fprintf(stdout,
+              "L2_cache_bank[%d]: Access = %llu, Miss = %llu, Miss_rate = "
+              "%.3lf, Pending_hits = %llu, Reservation_fails = %llu\n",
+              i, l2_css.accesses, l2_css.misses,
+              (double)l2_css.misses / (double)l2_css.accesses,
+              l2_css.pending_hits, l2_css.res_fails);
+
+      total_l2_css += l2_css;
+    }
+    if (!m_memory_config->m_L2_config.disabled() &&
+        m_memory_config->m_L2_config.get_num_lines()) {
+      // L2c_print_cache_stat();
+      printf("L2_total_cache_accesses = %llu\n", total_l2_css.accesses);
+      printf("L2_total_cache_misses = %llu\n", total_l2_css.misses);
+      if (total_l2_css.accesses > 0)
+        printf("L2_total_cache_miss_rate = %.4lf\n",
+               (double)total_l2_css.misses / (double)total_l2_css.accesses);
+      printf("L2_total_cache_pending_hits = %llu\n", total_l2_css.pending_hits);
+      printf("L2_total_cache_reservation_fails = %llu\n",
+             total_l2_css.res_fails);
+      printf("L2_total_cache_breakdown:\n");
+      l2_stats.print_stats(stdout, streamID, "L2_cache_stats_breakdown");
+      printf("L2_total_cache_reservation_fail_breakdown:\n");
+      l2_stats.print_fail_stats(stdout, streamID,
+                                "L2_cache_stats_fail_breakdown");
+      total_l2_css.print_port_stats(stdout, "L2_cache");
+    }
+  }
+
+  if (m_config.gpgpu_cflog_interval != 0) {
+    spill_log_to_file(stdout, 1, gpu_sim_cycle);
+    insn_warp_occ_print(stdout);
+  }
+  if (gpgpu_ctx->func_sim->gpgpu_ptx_instruction_classification) {
+    StatDisp(gpgpu_ctx->func_sim->g_inst_classification_stat
+                 [gpgpu_ctx->func_sim->g_ptx_kernel_count]);
+    StatDisp(gpgpu_ctx->func_sim->g_inst_op_classification_stat
+                 [gpgpu_ctx->func_sim->g_ptx_kernel_count]);
+  }
+
+#ifdef GPGPUSIM_POWER_MODEL
+  if (m_config.g_power_simulation_enabled) {
+    m_gpgpusim_wrapper->detect_print_steady_state(
+        1, gpu_tot_sim_insn + gpu_sim_insn);
+  }
+#endif
+
+  // Interconnect power stat print
+  long total_simt_to_mem = 0;
+  long total_mem_to_simt = 0;
+  long temp_stm = 0;
+  long temp_mts = 0;
+  for (unsigned i = 0; i < m_config.num_cluster(); i++) {
+    m_cluster[i]->get_icnt_stats(temp_stm, temp_mts);
+    total_simt_to_mem += temp_stm;
+    total_mem_to_simt += temp_mts;
+  }
+  printf("\nicnt_total_pkts_mem_to_simt=%ld\n", total_mem_to_simt);
+  printf("icnt_total_pkts_simt_to_mem=%ld\n", total_simt_to_mem);
+
+  // Print MCM access statistics
+  if (m_gpu_module) {
+    printf("\n========= MCM Access Statistics (data packets, request+reply, PTW excluded) =========\n");
+    printf("mcm_remote_accesses=%llu\n", m_gpu_module->get_remote_access_count());
+    printf("mcm_local_accesses=%llu\n", m_gpu_module->get_local_access_count());
+    unsigned long long total_accesses = m_gpu_module->get_remote_access_count() +
+                                         m_gpu_module->get_local_access_count();
+    if (total_accesses > 0) {
+      double remote_ratio = (double)m_gpu_module->get_remote_access_count() / total_accesses * 100.0;
+      printf("mcm_remote_ratio=%.2f%%\n", remote_ratio);
+    }
+    printf("=========================================\n");
+  }
+
+  // PMM stats: free_pages equals init count until Phase 3 (gpu_malloc hook) is added.(new)
+  if (m_gpu_module) {
+    printf("\n========= PMM Statistics =========\n");
+    for (unsigned c = 0; c < m_gpu_module->get_num_chiplets(); c++)
+      printf("pmm_chiplet%u_free_pages=%zu\n",
+             c, m_gpu_module->get_chiplet(c)->free_page_count());
+    printf("===================================\n");
+  }
+
+  time_vector_print();
+  fflush(stdout);
+
+  clear_executed_kernel_info();
+}
+
+// performance counter that are not local to one shader
+unsigned gpgpu_sim::threads_per_core() const {
+  return m_shader_config->n_thread_per_shader;
+}
+
+void shader_core_ctx::mem_instruction_stats(const warp_inst_t &inst) {
+  unsigned active_count = inst.active_count();
+  // this breaks some encapsulation: the is_[space] functions, if you change
+  // those, change this.
+  switch (inst.space.get_type()) {
+    case undefined_space:
+    case reg_space:
+      break;
+    case shared_space:
+      {  // W5: shared scalar stat, incremented from every SM
+      #pragma omp atomic
+        m_stats->gpgpu_n_shmem_insn += active_count;
+      }
+      break;
+    case sstarr_space:
+      {  // W5: shared scalar stat, incremented from every SM
+      #pragma omp atomic
+        m_stats->gpgpu_n_sstarr_insn += active_count;
+      }
+      break;
+    case const_space:
+      {  // W5: shared scalar stat, incremented from every SM
+      #pragma omp atomic
+        m_stats->gpgpu_n_const_insn += active_count;
+      }
+      break;
+    case param_space_kernel:
+    case param_space_local:
+      {  // W5: shared scalar stat, incremented from every SM
+      #pragma omp atomic
+        m_stats->gpgpu_n_param_insn += active_count;
+      }
+      break;
+    case tex_space:
+      {  // W5: shared scalar stat, incremented from every SM
+      #pragma omp atomic
+        m_stats->gpgpu_n_tex_insn += active_count;
+      }
+      break;
+    case global_space:
+    case local_space:
+      if (inst.is_store())
+        {  // W5: shared scalar stat, incremented from every SM
+        #pragma omp atomic
+          m_stats->gpgpu_n_store_insn += active_count;
+        }
+      else
+        {  // W5: shared scalar stat, incremented from every SM
+        #pragma omp atomic
+          m_stats->gpgpu_n_load_insn += active_count;
+        }
+      break;
+    default:
+      abort();
+  }
+}
+bool shader_core_ctx::can_issue_1block(kernel_info_t &kernel) {
+  // Jin: concurrent kernels on one SM
+  if (m_config->gpgpu_concurrent_kernel_sm) {
+    if (m_config->max_cta(kernel) < 1) return false;
+
+    return occupy_shader_resource_1block(kernel, false);
+  } else {
+    return (get_n_active_cta() < m_config->max_cta(kernel));
+  }
+}
+
+int shader_core_ctx::find_available_hwtid(unsigned int cta_size, bool occupy) {
+  unsigned int step;
+  for (step = 0; step < m_config->n_thread_per_shader; step += cta_size) {
+    unsigned int hw_tid;
+    for (hw_tid = step; hw_tid < step + cta_size; hw_tid++) {
+      if (m_occupied_hwtid.test(hw_tid)) break;
+    }
+    if (hw_tid == step + cta_size)  // consecutive non-active
+      break;
+  }
+  if (step >= m_config->n_thread_per_shader)  // didn't find
+    return -1;
+  else {
+    if (occupy) {
+      for (unsigned hw_tid = step; hw_tid < step + cta_size; hw_tid++)
+        m_occupied_hwtid.set(hw_tid);
+    }
+    return step;
+  }
+}
+
+bool shader_core_ctx::occupy_shader_resource_1block(kernel_info_t &k,
+                                                    bool occupy) {
+  unsigned threads_per_cta = k.threads_per_cta();
+  const class function_info *kernel = k.entry();
+  unsigned int padded_cta_size = threads_per_cta;
+  unsigned int warp_size = m_config->warp_size;
+  if (padded_cta_size % warp_size)
+    padded_cta_size = ((padded_cta_size / warp_size) + 1) * (warp_size);
+
+  if (m_occupied_n_threads + padded_cta_size > m_config->n_thread_per_shader)
+    return false;
+
+  if (find_available_hwtid(padded_cta_size, false) == -1) return false;
+
+  const struct gpgpu_ptx_sim_info *kernel_info = ptx_sim_kernel_info(kernel);
+
+  if (m_occupied_shmem + kernel_info->smem > m_config->gpgpu_shmem_size)
+    return false;
+
+  unsigned int used_regs = padded_cta_size * ((kernel_info->regs + 3) & ~3);
+  if (m_occupied_regs + used_regs > m_config->gpgpu_shader_registers)
+    return false;
+
+  if (m_occupied_ctas + 1 > m_config->max_cta_per_core) return false;
+
+  if (occupy) {
+    m_occupied_n_threads += padded_cta_size;
+    m_occupied_shmem += kernel_info->smem;
+    m_occupied_regs += (padded_cta_size * ((kernel_info->regs + 3) & ~3));
+    m_occupied_ctas++;
+
+    SHADER_DPRINTF(LIVENESS,
+                   "GPGPU-Sim uArch: Occupied %u threads, %u shared mem, %u "
+                   "registers, %u ctas, on shader %d\n",
+                   m_occupied_n_threads, m_occupied_shmem, m_occupied_regs,
+                   m_occupied_ctas, m_sid);
+  }
+
+  return true;
+}
+
+void shader_core_ctx::release_shader_resource_1block(unsigned hw_ctaid,
+                                                     kernel_info_t &k) {
+  if (m_config->gpgpu_concurrent_kernel_sm) {
+    unsigned threads_per_cta = k.threads_per_cta();
+    const class function_info *kernel = k.entry();
+    unsigned int padded_cta_size = threads_per_cta;
+    unsigned int warp_size = m_config->warp_size;
+    if (padded_cta_size % warp_size)
+      padded_cta_size = ((padded_cta_size / warp_size) + 1) * (warp_size);
+
+    assert(m_occupied_n_threads >= padded_cta_size);
+    m_occupied_n_threads -= padded_cta_size;
+
+    int start_thread = m_occupied_cta_to_hwtid[hw_ctaid];
+
+    for (unsigned hwtid = start_thread; hwtid < start_thread + padded_cta_size;
+         hwtid++)
+      m_occupied_hwtid.reset(hwtid);
+    m_occupied_cta_to_hwtid.erase(hw_ctaid);
+
+    const struct gpgpu_ptx_sim_info *kernel_info = ptx_sim_kernel_info(kernel);
+
+    assert(m_occupied_shmem >= (unsigned int)kernel_info->smem);
+    m_occupied_shmem -= kernel_info->smem;
+
+    unsigned int used_regs = padded_cta_size * ((kernel_info->regs + 3) & ~3);
+    assert(m_occupied_regs >= used_regs);
+    m_occupied_regs -= used_regs;
+
+    assert(m_occupied_ctas >= 1);
+    m_occupied_ctas--;
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////
+
+/**
+ * Launches a cooperative thread array (CTA).
+ *
+ * @param kernel
+ *    object that tells us which kernel to ask for a CTA from
+ */
+
+unsigned exec_shader_core_ctx::sim_init_thread(
+    kernel_info_t &kernel, ptx_thread_info **thread_info, int sid, unsigned tid,
+    unsigned threads_left, unsigned num_threads, core_t *core,
+    unsigned hw_cta_id, unsigned hw_warp_id, gpgpu_t *gpu) {
+  return ptx_sim_init_thread(kernel, thread_info, sid, tid, threads_left,
+                             num_threads, core, hw_cta_id, hw_warp_id, gpu);
+}
+
+void shader_core_ctx::issue_block2core(kernel_info_t &kernel) {
+  if (!m_config->gpgpu_concurrent_kernel_sm)
+    set_max_cta(kernel);
+  else
+    assert(occupy_shader_resource_1block(kernel, true));
+
+  kernel.inc_running();
+
+  // find a free CTA context
+  unsigned free_cta_hw_id = (unsigned)-1;
+
+  unsigned max_cta_per_core;
+  if (!m_config->gpgpu_concurrent_kernel_sm)
+    max_cta_per_core = kernel_max_cta_per_shader;
+  else
+    max_cta_per_core = m_config->max_cta_per_core;
+  for (unsigned i = 0; i < max_cta_per_core; i++) {
+    if (m_cta_status[i] == 0) {
+      free_cta_hw_id = i;
+      break;
+    }
+  }
+  assert(free_cta_hw_id != (unsigned)-1);
+
+  // determine hardware threads and warps that will be used for this CTA
+  int cta_size = kernel.threads_per_cta();
+
+  // hw warp id = hw thread id mod warp size, so we need to find a range
+  // of hardware thread ids corresponding to an integral number of hardware
+  // thread ids
+  int padded_cta_size = cta_size;
+  if (cta_size % m_config->warp_size)
+    padded_cta_size =
+        ((cta_size / m_config->warp_size) + 1) * (m_config->warp_size);
+
+  unsigned int start_thread, end_thread;
+
+  if (!m_config->gpgpu_concurrent_kernel_sm) {
+    start_thread = free_cta_hw_id * padded_cta_size;
+    end_thread = start_thread + cta_size;
+  } else {
+    start_thread = find_available_hwtid(padded_cta_size, true);
+    assert((int)start_thread != -1);
+    end_thread = start_thread + cta_size;
+    assert(m_occupied_cta_to_hwtid.find(free_cta_hw_id) ==
+           m_occupied_cta_to_hwtid.end());
+    m_occupied_cta_to_hwtid[free_cta_hw_id] = start_thread;
+  }
+
+  // reset the microarchitecture state of the selected hardware thread and warp
+  // contexts
+  reinit(start_thread, end_thread, false);
+
+  // initalize scalar threads and determine which hardware warps they are
+  // allocated to bind functional simulation state of threads to hardware
+  // resources (simulation)
+  warp_set_t warps;
+  unsigned nthreads_in_block = 0;
+  function_info *kernel_func_info = kernel.entry();
+  symbol_table *symtab = kernel_func_info->get_symtab();
+  unsigned ctaid = kernel.get_next_cta_id_single();
+  checkpoint *g_checkpoint = new checkpoint();
+  for (unsigned i = start_thread; i < end_thread; i++) {
+    m_threadState[i].m_cta_id = free_cta_hw_id;
+    unsigned warp_id = i / m_config->warp_size;
+    nthreads_in_block += sim_init_thread(
+        kernel, &m_thread[i], m_sid, i, cta_size - (i - start_thread),
+        m_config->n_thread_per_shader, this, free_cta_hw_id, warp_id,
+        m_cluster->get_gpu());
+    m_threadState[i].m_active = true;
+    // load thread local memory and register file
+    if (m_gpu->resume_option == 1 && kernel.get_uid() == m_gpu->resume_kernel &&
+        ctaid >= m_gpu->resume_CTA && ctaid < m_gpu->checkpoint_CTA_t) {
+      char fname[2048];
+      snprintf(fname, 2048, "checkpoint_files/thread_%d_%d_reg.txt",
+               i % cta_size, ctaid);
+      m_thread[i]->resume_reg_thread(fname, symtab);
+      char f1name[2048];
+      snprintf(f1name, 2048, "checkpoint_files/local_mem_thread_%d_%d_reg.txt",
+               i % cta_size, ctaid);
+      g_checkpoint->load_global_mem(m_thread[i]->m_local_mem, f1name);
+    }
+    //
+    warps.set(warp_id);
+  }
+  assert(nthreads_in_block > 0 &&
+         nthreads_in_block <=
+             m_config->n_thread_per_shader);  // should be at least one, but
+                                              // less than max
+  m_cta_status[free_cta_hw_id] = nthreads_in_block;
+
+  if (m_gpu->resume_option == 1 && kernel.get_uid() == m_gpu->resume_kernel &&
+      ctaid >= m_gpu->resume_CTA && ctaid < m_gpu->checkpoint_CTA_t) {
+    char f1name[2048];
+    snprintf(f1name, 2048, "checkpoint_files/shared_mem_%d.txt", ctaid);
+
+    g_checkpoint->load_global_mem(m_thread[start_thread]->m_shared_mem, f1name);
+  }
+  // now that we know which warps are used in this CTA, we can allocate
+  // resources for use in CTA-wide barrier operations
+  m_barriers.allocate_barrier(free_cta_hw_id, warps);
+
+  // initialize the SIMT stacks and fetch hardware
+  init_warps(free_cta_hw_id, start_thread, end_thread, ctaid, cta_size, kernel);
+  m_n_active_cta++;
+  if (accelsim_log_cta()) {
+    // Derive x,y,z from the linear id: the trace-driven thread init has
+    // already advanced the dim3 cursor to the NEXT CTA by this point.
+    dim3 g = kernel.get_grid_dim();
+    dim3 xyz;
+    xyz.x = ctaid % g.x; xyz.y = (ctaid / g.x) % g.y; xyz.z = ctaid / (g.x * g.y);
+    // SMELL-6 fix: use the authoritative owner map instead of re-deriving the
+    // chiplet by integer division (wrong whenever split_range() hands the
+    // remainder clusters to the lower chiplets).
+    unsigned chiplet = m_gpu->get_gpu_module()
+                           ? m_gpu->get_gpu_module()->cluster_to_chiplet(m_tpc)
+                           : 0;
+    printf("[CTA_ISSUE] kernel=%u cta=%u xyz=(%u,%u,%u) sm=%u cluster=%u chiplet=%u hw_cta=%u cycle=%llu\n",
+           kernel.get_uid(), ctaid, xyz.x, xyz.y, xyz.z, m_sid, m_tpc, chiplet,
+           free_cta_hw_id,
+           (unsigned long long)(m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle));
+  }
+
+  shader_CTA_count_log(m_sid, 1);
+  SHADER_DPRINTF(LIVENESS,
+                 "GPGPU-Sim uArch: cta:%2u, start_tid:%4u, end_tid:%4u, "
+                 "initialized @(%lld,%lld), kernel_uid:%u, kernel_name:%s\n",
+                 free_cta_hw_id, start_thread, end_thread, m_gpu->gpu_sim_cycle,
+                 m_gpu->gpu_tot_sim_cycle, kernel.get_uid(),
+                 kernel.get_name().c_str());
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////
+
+void dram_t::dram_log(int task) {
+  if (task == SAMPLELOG) {
+    StatAddSample(mrqq_Dist, que_length());
+  } else if (task == DUMPLOG) {
+    printf("Queue Length DRAM[%d] ", id);
+    StatDisp(mrqq_Dist);
+  }
+}
+
+// Find next clock domain and increment its time
+int gpgpu_sim::next_clock_domain(void) {
+  double smallest = min3(core_time, icnt_time, dram_time);
+  int mask = 0x00;
+  if (l2_time <= smallest) {
+    smallest = l2_time;
+    mask |= L2;
+    l2_time += m_config.l2_period;
+  }
+  if (icnt_time <= smallest) {
+    mask |= ICNT;
+    icnt_time += m_config.icnt_period;
+  }
+  if (dram_time <= smallest) {
+    mask |= DRAM;
+    dram_time += m_config.dram_period;
+  }
+  if (core_time <= smallest) {
+    mask |= CORE;
+    core_time += m_config.core_period;
+  }
+  return mask;
+}
+
+// ============================================================
+// CTA Scheduler implementations
+// ============================================================
+
+cta_scheduler_t* cta_scheduler_t::create(cta_scheduling_policy_t policy) {
+  switch (policy) {
+    case CTA_SCHED_SEQUENTIAL:
+      return new SequentialScheduler();
+    case CTA_SCHED_ROUND_ROBIN_CHIPLET:
+      return new RoundRobinChipletScheduler();
+    case CTA_SCHED_STATIC_BINDING:
+      return new StaticBindingScheduler();
+    default:
+      fprintf(stderr, "ERROR: unknown cta_scheduling_policy %d\n", (int)policy);
+      assert(0);
+      return nullptr;
+  }
+}
+
+// Visits clusters starting one past last_issued, identical to the original loop.
+std::vector<unsigned> SequentialScheduler::cluster_order(
+    unsigned n_clusters, unsigned /*n_chiplets*/, unsigned last_issued) {
+  std::vector<unsigned> order;
+  order.reserve(n_clusters);
+  for (unsigned i = 0; i < n_clusters; i++)
+    order.push_back((i + last_issued + 1) % n_clusters);
+  return order;
+}
+
+// Interleaves cluster visits across chiplets: for each intra-chiplet slot,
+// all chiplets are visited before the slot advances.  m_start_chiplet rotates
+// each call so no chiplet is always visited first.
+std::vector<unsigned> RoundRobinChipletScheduler::cluster_order(
+    unsigned n_clusters, unsigned n_chiplets, unsigned /*last_issued*/) {
+  assert(n_chiplets > 0 && n_clusters % n_chiplets == 0);
+  unsigned clusters_per_chiplet = n_clusters / n_chiplets;
+
+  std::vector<unsigned> order;
+  order.reserve(n_clusters);
+
+  for (unsigned slot = 0; slot < clusters_per_chiplet; slot++) {
+    for (unsigned k = 0; k < n_chiplets; k++) {
+      unsigned chip = (m_start_chiplet + k) % n_chiplets;
+      order.push_back(chip * clusters_per_chiplet + slot);
+    }
+  }
+
+  // Rotate start chiplet so the lead alternates across rounds.
+  m_start_chiplet = (m_start_chiplet + 1) % n_chiplets;
+  return order;
+}
+// ============================================================
+
+// The pre-MCM issue_block2core() body survives as SequentialScheduler above
+// (policy 0): identical visit order, so config files without
+// -gpgpu_cta_scheduling_policy behave exactly as upstream.
+void gpgpu_sim::issue_block2core() {
+  // 32: when no kernel has CTAs left (kernel drain -- most BFS cycles), the
+  // whole scan below is side-effect free: select_kernel()'s mutations are all
+  // gated on a kernel with remaining CTAs, set_kernel() never fires (k stays
+  // NULL), and the issue pass never runs (selected_kernel NULL). Skipping it
+  // replaces 256 clusters x 128-slot select_kernel scans per cycle with this
+  // single 128-slot check. Measured before the change: 225s of a 407s wall
+  // (callgrind: select_kernel 18.6%, kernel_more_cta_left 10.3%).
+  if (!get_more_cta_left()) return;
+  // 39: skip the 256-cluster scan when nothing that can change its verdict
+  // happened since a scan that issued nothing. Events: CTA exit (slot freed),
+  // kernel launch, TB_latency hitting 0. A scan that DID issue re-arms itself
+  // (occupancy moved). The one state-mutating non-issuing path (idle core
+  // adopting a kernel via select_kernel) is a fixed point: re-running the scan
+  // on the adopted state still issues nothing, so skipping stays exact.
+  if (m_issue_seen_epoch == m_issue_event_epoch) return;
+  unsigned n_clusters = m_shader_config->n_simt_clusters;
+  // Falls back to 1 if gpu_module is not yet initialized; this makes
+  // ROUND_ROBIN_CHIPLET degenerate to SEQUENTIAL without crashing.
+  unsigned n_chiplets = m_gpu_module ? m_gpu_module->get_num_chiplets() : 1;
+
+  // Delegate cluster visit ordering to the configured scheduling policy.
+  // SEQUENTIAL          : clusters 0..N-1 with last_issued offset (original).
+  // ROUND_ROBIN_CHIPLET : chiplet-interleaved order for first-touch locality.
+  std::vector<unsigned> order =
+      m_cta_scheduler->cluster_order(n_clusters, n_chiplets, m_last_cluster_issue);
+
+  unsigned issued_total = 0;
+  for (unsigned idx : order) {
+    unsigned num = m_cluster[idx]->issue_block2core();
+    if (num) {
+      m_last_cluster_issue = idx;
+      m_total_cta_launched += num;
+      issued_total += num;
+    }
+  }
+  // 39: issued -> occupancy moved, scan again next cycle; barren scan -> sleep
+  // until the next event bumps the epoch.
+  if (issued_total == 0) m_issue_seen_epoch = m_issue_event_epoch;
+}
+
+unsigned long long g_single_step =
+    0;  // set this in gdb to single step the pipeline
+
+// H3-3: 미러 연결. 클러스터(trace_gpgpu_sim 생성자)와 인터커넥트 라우터(icnt_create)가 모두
+// 만들어진 뒤여야 하므로 첫 cycle() 에서 한 번 한다. 모든 바이트를 1 로 시작해 첫 사이클은
+// 전부 방문한다 -- 연결 이전에 쌓인 상태가 있어도 불변식(0 => 할 일 없음)이 성립한다.
+void gpgpu_sim::wire_icnt_mirrors() {
+  m_icnt_mirrors_wired = true;
+  const unsigned n_sub = m_memory_config->m_n_mem_sub_partition;
+  m_l2icnt_nonempty.assign(n_sub, 1);
+  for (unsigned i = 0; i < n_sub; i++)
+    m_memory_sub_partition[i]->set_l2icnt_mirror(&m_l2icnt_nonempty[i]);
+
+  const unsigned n_cl = m_shader_config->n_simt_clusters;
+  m_cluster_icnt_busy.assign(n_cl, 1);
+  // SST 모드는 응답이 다른 경로(sst 클러스터의 별도 FIFO)로 들어오고, intersim2 에는 출력
+  // 버퍼 훅이 없다. 두 경우 모두 건너뛰기를 끄고 원래대로 전부 방문한다.
+  m_cluster_icnt_mirror_ok = icnt_out_mirror_supported() && !m_memory_config->SST_mode;
+  if (m_cluster_icnt_mirror_ok) {
+    for (unsigned i = 0; i < n_cl; i++) {
+      assert(m_cluster[i]->get_cluster_id() == i);   // icnt_pop(m_cluster_id) 와 같은 장치 번호
+      m_cluster[i]->set_icnt_busy_mirror(&m_cluster_icnt_busy[i]);
+      icnt_set_out_mirror(i, &m_cluster_icnt_busy[i]);
+    }
+  }
+
+  // H3-3c: 서브파티션 L2 루프. 인터커넥트 출력 버퍼 훅이 필요하고(로컬 xbar), 방문마다 결과가
+  // 달라지는 선택 기능(power 누적, visualizer, SST)이 꺼져 있을 때만 건너뛴다.
+  m_l2loop_busy.assign(n_sub, 1);
+  m_l2loop_last.assign(n_sub, 0);
+  m_l2loop_mirror_ok = icnt_out_mirror_supported() && !m_memory_config->SST_mode &&
+                       !m_config.g_power_simulation_enabled && !m_config.g_visualizer_enabled;
+  if (m_l2loop_mirror_ok) {
+    for (unsigned i = 0; i < n_sub; i++) {
+      m_memory_sub_partition[i]->set_l2loop_mirror(&m_l2loop_busy[i]);
+      icnt_set_out_mirror(m_shader_config->mem2device(i), &m_l2loop_busy[i]);
+    }
+  }
+}
+
+// H3-3c: 틱 m_l2loop_tick 까지 건너뛴 방문의 포트 샘플을 모두 반영한다. 통계를 읽기 직전에 부른다.
+void gpgpu_sim::flush_l2loop_idle() {
+  if (!m_l2loop_mirror_ok) return;
+  for (unsigned i = 0; i < m_l2loop_last.size(); i++) {
+    const unsigned long long n = m_l2loop_tick - m_l2loop_last[i];
+    if (n) {
+      m_memory_sub_partition[i]->add_idle_l2loop_visits(n);
+      m_l2loop_last[i] = m_l2loop_tick;
+    }
+  }
+}
+
+void gpgpu_sim::cycle() {
+  // 31: whole-body bracket. wall - sum(cycle_ns) isolates work outside cycle()
+  // (trace parse at CTA issue is INSIDE, via issue_block2core -> tail bucket).
+  const unsigned long long __cyc0 = g_phase_timing_on ? phase_now_ns() : 0;
+  unsigned long long __pt_t0 = 0;  // set at the tail bracket; scope must outlive the CORE block
+  int clock_mask = next_clock_domain();
+  // H3-3: 미러 연결은 어떤 클럭 블록보다 먼저(첫 사이클에 CORE/ICNT 가 없어도 L2 루프 전에).
+  if (!m_icnt_mirrors_wired) wire_icnt_mirrors();
+
+  if (clock_mask & CORE) {
+    const unsigned long long __pt_ci0 = g_phase_timing_on ? phase_now_ns() : 0;
+    // shader core loading (pop from ICNT into core) follows CORE clock
+    // H3-3b: 응답 FIFO 도 비고 인터커넥트 출력 버퍼도 빈 클러스터의 icnt_cycle() 은
+    // 아무 일도 하지 않는다(icnt_pop 이 NULL, 부작용 없음). 미러가 0 인 칸은 건너뛴다.
+    // g_accelsim_diag 는 방문마다 카운터를 올리므로 그때는 건너뛰지 않는다 -- 다만 미러는
+    // 계속 실제 상태로 갱신해 두어, 켜고 끄는 사이에도 불변식이 깨지지 않게 한다.
+    const bool skip_idle_clusters = m_cluster_icnt_mirror_ok && !g_accelsim_diag;
+    for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
+      if (skip_idle_clusters && !m_cluster_icnt_busy[i]) {
+#ifdef H33_MIRROR_CHECK   // build with -DH33_MIRROR_CHECK to assert the skip is a no-op
+        assert(m_cluster[i]->icnt_response_empty() && icnt_out_empty(i));
+#endif
+        continue;
+      }
+      m_cluster[i]->icnt_cycle();
+      if (m_cluster_icnt_mirror_ok)
+        m_cluster_icnt_busy[i] =
+            (!m_cluster[i]->icnt_response_empty() || !icnt_out_empty(i)) ? 1 : 0;
+    }
+    if (g_phase_timing_on)
+      g_phase_timers.cluster_icnt_ns += phase_now_ns() - __pt_ci0;
+  }
+  unsigned partiton_replys_in_parallel_per_cycle = 0;
+  if (clock_mask & ICNT) {
+    const unsigned long long __pt2b = g_phase_timing_on ? phase_now_ns() : 0;
+    // pop from memory controller to interconnect
+    // H3-3a: L2->icnt 큐가 빈 서브파티션은 top()==NULL(부작용 없음) -> pop() 도 빈 fifo 에서
+    // 아무것도 바꾸지 않는다(min_len 0 큐; m_request_tracker.erase(NULL) 은 no-op).
+    // 미러가 0 인 칸은 건너뛰고, 방문한 칸은 방문 직후 실제 상태로 미러를 맞춘다.
+    for (unsigned i = 0; i < m_memory_config->m_n_mem_sub_partition; i++) {
+      if (!m_l2icnt_nonempty[i]) {
+#ifdef H33_MIRROR_CHECK
+        assert(m_memory_sub_partition[i]->l2icnt_queue_empty());
+#endif
+        continue;
+      }
+      mem_fetch *mf = m_memory_sub_partition[i]->top();
+      if (mf) {
+        unsigned response_size =
+            mf->get_is_write() ? mf->get_ctrl_size() : mf->size();
+        if (::icnt_has_buffer(m_shader_config->mem2device(i), response_size)) {
+          // if (!mf->get_is_write())
+          mf->set_return_timestamp(gpu_sim_cycle + gpu_tot_sim_cycle);
+          mf->set_status(IN_ICNT_TO_SHADER, gpu_sim_cycle + gpu_tot_sim_cycle);
+          m_gpu_module->icnt_push(m_shader_config->mem2device(i), mf->get_tpc(), mf,
+                      response_size);
+          m_memory_sub_partition[i]->pop();
+          partiton_replys_in_parallel_per_cycle++;
+        } else {
+          gpu_stall_icnt2sh++;
+        }
+      } else {
+        m_memory_sub_partition[i]->pop();
+      }
+      m_l2icnt_nonempty[i] = m_memory_sub_partition[i]->l2icnt_queue_empty() ? 0 : 1;  // H3-3a
+    }
+    if (g_phase_timing_on) {
+      const unsigned long long __pt2e = phase_now_ns();
+      g_phase_timers.icnt_ns += __pt2e - __pt2b;
+      g_phase_timers.icnt_calls++;
+      g_icnt_pop_ns += __pt2e - __pt2b;   // H3: mem-ctrl -> icnt pop loop
+      g_icnt_pop_calls++;
+    }
+  }
+  partiton_replys_in_parallel += partiton_replys_in_parallel_per_cycle;
+
+  if (clock_mask & DRAM) {
+    const unsigned long long __pt0 = g_phase_timing_on ? phase_now_ns() : 0;
+    // P5 (M5, deferred from P2c): partitions are independent -- proposition
+    // T-DRAM, audited in P2c. modern-gpu-simulator parallelises exactly this
+    // loop with no reduction and no critical section (gpu-sim.cc:2905 there).
+#pragma omp parallel for schedule(runtime)
+    for (unsigned i = 0; i < m_memory_config->m_n_mem; i++) {
+      if (m_memory_config->simple_dram_model)
+        m_memory_partition_unit[i]->simple_dram_model_cycle();
+      else
+        m_memory_partition_unit[i]
+            ->dram_cycle();  // Issue the dram command (scheduler + delay model)
+      // Update performance counters for DRAM
+      m_memory_partition_unit[i]->set_dram_power_stats(
+          m_power_stats->pwr_mem_stat->n_cmd[CURRENT_STAT_IDX][i],
+          m_power_stats->pwr_mem_stat->n_activity[CURRENT_STAT_IDX][i],
+          m_power_stats->pwr_mem_stat->n_nop[CURRENT_STAT_IDX][i],
+          m_power_stats->pwr_mem_stat->n_act[CURRENT_STAT_IDX][i],
+          m_power_stats->pwr_mem_stat->n_pre[CURRENT_STAT_IDX][i],
+          m_power_stats->pwr_mem_stat->n_rd[CURRENT_STAT_IDX][i],
+          m_power_stats->pwr_mem_stat->n_wr[CURRENT_STAT_IDX][i],
+          m_power_stats->pwr_mem_stat->n_wr_WB[CURRENT_STAT_IDX][i],
+          m_power_stats->pwr_mem_stat->n_req[CURRENT_STAT_IDX][i]);
+    }
+    if (g_phase_timing_on) {
+      g_phase_timers.dram_ns += phase_now_ns() - __pt0;
+      g_phase_timers.dram_calls++;
+    }
+  }
+
+  // L2 operations follow L2 clock domain
+  unsigned partiton_reqs_in_parallel_per_cycle = 0;
+  if (clock_mask & L2) {
+    const unsigned long long __pt1 = g_phase_timing_on ? phase_now_ns() : 0;
+    // §26 (2026-08-15): chiplet/sub-partition-width parallel-for was tried and
+    // reverted here -- digest stayed bit-identical (E1/E1b/E2 all passed) but
+    // gave zero net benefit and a measured 1t regression (448.5s -> 485.0s,
+    // BFS32 k1~k5), because this block's per-call payload is small (13-20s
+    // absolute) relative to the fork/join cost of two new parallel regions
+    // re-entered ~500k times. See implog §26 for the full before/after numbers.
+    // GMMU is per-chiplet and clocked with the L2 domain.
+    for (unsigned c = 0; c < m_n_chiplets; c++) {
+      m_gpu_module->get_gmmu(c)->cycle(
+          gpu_sim_cycle + gpu_tot_sim_cycle);
+    }
+    // P5: L2 TLB tick: no-op in Phase 5; reserved for future latency pipeline.
+    for (unsigned c = 0; c < m_gpu_module->get_num_chiplets(); c++) {
+      m_gpu_module->get_chiplet(c)->get_l2_tlb_4k()->tick(
+          gpu_sim_cycle + gpu_tot_sim_cycle);
+      m_gpu_module->get_chiplet(c)->get_l2_tlb_64k()->tick(
+          gpu_sim_cycle + gpu_tot_sim_cycle);
+      m_gpu_module->get_chiplet(c)->get_l2_tlb_2m()->tick(
+          gpu_sim_cycle + gpu_tot_sim_cycle);
+    }
+
+    m_power_stats->pwr_mem_stat->l2_cache_stats[CURRENT_STAT_IDX].clear();
+    // H3-3c: 한가한 서브파티션(l2loop_idle && 인터커넥트 출력 버퍼 빔)의 방문은 L2 포트 샘플
+    // 1회 외에 아무것도 하지 않는다. 미러가 0 이면 건너뛰고, 다시 방문할 때(또는 통계 출력 전)
+    // 건너뛴 횟수만큼 샘플을 더한다. diag 는 방문마다 카운터를 올리므로 그때는 건너뛰지 않되
+    // 미러·틱 장부는 계속 맞춰 둔다.
+    const unsigned long long l2tick = ++m_l2loop_tick;
+    const bool skip_idle_l2 = m_l2loop_mirror_ok && !g_accelsim_diag;
+    for (unsigned i = 0; i < m_memory_config->m_n_mem_sub_partition; i++) {
+      if (skip_idle_l2 && !m_l2loop_busy[i]) {
+#ifdef H33_MIRROR_CHECK
+        assert(m_memory_sub_partition[i]->l2loop_idle(SECTOR_CHUNCK_SIZE) &&
+               icnt_out_empty(m_shader_config->mem2device(i)));
+#endif
+        continue;
+      }
+      if (m_l2loop_mirror_ok) {
+        const unsigned long long skipped = l2tick - m_l2loop_last[i] - 1;
+        if (skipped) m_memory_sub_partition[i]->add_idle_l2loop_visits(skipped);
+        m_l2loop_last[i] = l2tick;
+      }
+      // move memory request from interconnect into memory partition (if not
+      // backed up) Note:This needs to be called in DRAM clock domain if there
+      // is no L2 cache in the system In the worst case, we may need to push
+      // SECTOR_CHUNCK_SIZE requests, so ensure you have enough buffer for them
+      // ACCEPT_ (temp, P-5 gated): per-chiplet mem-accept backpressure.
+      if (g_accelsim_diag) {
+        unsigned mch = m_gpu_module ? m_gpu_module->mem_sub_partition_to_chiplet(i) : 0;
+        if (mch < 8) {
+          g_memfull_total[mch]++;
+          if (m_memory_sub_partition[i]->full(SECTOR_CHUNCK_SIZE)) g_memfull_stall[mch]++;
+        }
+      }
+      if (m_memory_sub_partition[i]->full(SECTOR_CHUNCK_SIZE)) {
+        gpu_stall_dramfull++;
+      } else {
+        mem_fetch *mf = (mem_fetch *)icnt_pop(m_shader_config->mem2device(i));
+        m_memory_sub_partition[i]->push(mf, gpu_sim_cycle + gpu_tot_sim_cycle);
+        if (mf) partiton_reqs_in_parallel_per_cycle++;
+      }
+      m_memory_sub_partition[i]->cache_cycle(gpu_sim_cycle + gpu_tot_sim_cycle);
+      if (m_config.g_power_simulation_enabled) {
+        m_memory_sub_partition[i]->accumulate_L2cache_stats(
+            m_power_stats->pwr_mem_stat->l2_cache_stats[CURRENT_STAT_IDX]);
+      }
+      if (m_l2loop_mirror_ok)   // H3-3c
+        m_l2loop_busy[i] = (m_memory_sub_partition[i]->l2loop_idle(SECTOR_CHUNCK_SIZE) &&
+                            icnt_out_empty(m_shader_config->mem2device(i))) ? 0 : 1;
+    }
+    if (g_phase_timing_on) {
+      g_phase_timers.l2gmmu_ns += phase_now_ns() - __pt1;
+      g_phase_timers.l2gmmu_calls++;
+    }
+  }
+  partiton_reqs_in_parallel += partiton_reqs_in_parallel_per_cycle;
+  if (partiton_reqs_in_parallel_per_cycle > 0) {
+    partiton_reqs_in_parallel_util += partiton_reqs_in_parallel_per_cycle;
+    gpu_sim_cycle_parition_util++;
+  }
+
+  if (clock_mask & ICNT) {
+    const unsigned long long __pt2 = g_phase_timing_on ? phase_now_ns() : 0;
+    // FUNNEL_ (temp): xbar arrival timestamp. ST-10: only the ACCELSIM_DIAG
+    // readers (gmmu MEMLAT/FUNNEL, shader NORMREP) consume it, so stamp only then.
+    if (g_accelsim_diag) g_icnt_now = gpu_sim_cycle + gpu_tot_sim_cycle;
+    icnt_transfer();
+    if (g_phase_timing_on) {
+      g_phase_timers.icnt_ns += phase_now_ns() - __pt2;
+      g_phase_timers.icnt_calls++;
+    }
+  }
+
+  if (clock_mask & CORE) {
+    // P4: build the chiplet -> cluster grouping once. Done lazily here rather
+    // than in init() because m_gpu_module is not wired up at construction time.
+    if (m_chiplet_cluster_order.empty()) {
+      const unsigned n_chiplets =
+          m_gpu_module ? m_gpu_module->get_num_chiplets() : 1u;
+      m_chiplet_cluster_order.assign(n_chiplets, std::vector<unsigned>());
+      for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
+        const unsigned owner =
+            m_gpu_module ? m_gpu_module->cluster_to_chiplet(i) : 0u;
+        assert(owner < n_chiplets);
+        m_chiplet_cluster_order[owner].push_back(i);
+      }
+      // Every cluster must appear exactly once: the grouping is a permutation,
+      // never a filter. A mapping bug here would silently drop SMs.
+      unsigned total = 0;
+      for (unsigned c = 0; c < n_chiplets; c++)
+        total += m_chiplet_cluster_order[c].size();
+      assert(total == m_shader_config->n_simt_clusters);
+    }
+    // L1 cache + shader core pipeline stages
+    m_power_stats->pwr_mem_stat->core_cache_stats[CURRENT_STAT_IDX].clear();
+    // H2-A (speed): get_more_cta_left() is loop-invariant here -- it takes no
+    // per-cluster input -- yet it was called inside the loop below, where the `||`
+    // short circuit re-evaluates it for every IDLE cluster. It walks all
+    // -gpgpu_max_concurrent_kernel slots (128 in the MCM configs), so a cycle with
+    // many idle SMs paid up to 256 x 128 NULL checks. Measured at ~7% of run time.
+    //
+    // Hoisting is VALUE-identical, not merely close. The only mutation of the state
+    // it reads that is reachable from pass A is set_kernel_done()'s
+    // `m_running_kernels[k] = NULL` (via register_cta_thread_exit), and that call
+    // sits behind `!kernel_more_cta_left(kernel)`. So at that point either
+    // hit_max_cta_count() is true -- and then get_more_cta_left() returns false on
+    // its own first line, before and after -- or the kernel being retired had
+    // no_more_ctas_to_run(), i.e. it was already contributing false to the OR.
+    // Dropping a slot that contributed false cannot flip the result. CTA issue and
+    // m_total_cta_launched move only in the sequential tail, after this loop joins.
+    // (This is the snapshot the old T2-PROBE comment described; that probe was
+    // removed at some point and left its comment stranded above the accumulator.)
+    const bool more_cta_left = get_more_cta_left();
+    unsigned long long active_sms_this_cycle = 0;
+    // P5: one chiplet per thread. Order *within* a chiplet stays sequential --
+    // that is the order gpu_l2_tlb / gmmu state depends on (design doc 7-1).
+    // Chiplets touch disjoint L2 TLB and GMMU objects (proposition T5), so the
+    // outer iterations are independent. Both accumulators are integer sums, so
+    // reduction is bit-exact regardless of thread count.
+    // P5-2: the GPU-wide page table must not change while chiplets run
+    // concurrently -- gmmu::translate()/pt_walk() reach it from every chiplet
+    // and its owner maps are plain unordered_maps. Frozen placement makes it
+    // read-only; sample the mutation counter around the region and abort if it
+    // moved, so an unsafe configuration fails loudly instead of corrupting the
+    // maps (which is what a 2-thread run actually did before this guard).
+#ifdef _OPENMP
+    // Only meaningful when chiplets actually run at the same time. A 1-thread
+    // OpenMP build is sequential, so it may legitimately populate the table --
+    // that is how the placement map gets produced in the first place.
+    const bool pt_guard_active = (omp_get_max_threads() > 1);
+    const unsigned long long pt_mut_before =
+        (pt_guard_active && m_gpu_module)
+            ? m_gpu_module->get_page_table()->mutation_count() : 0ull;
+#endif
+    const unsigned n_chiplet_groups = m_chiplet_cluster_order.size();
+
+    // P10: the CORE phase is now three passes over the same clusters.
+    //   A  writeback + every non-ldst functional unit + ldst B1..B3   [per-SM]
+    //   B  ldst B4 -- the only part touching the chiplet-shared L2 TLB / GMMU
+    //   C  ldst B5..B9 + read_operands + issue + decode/fetch          [per-SM]
+    // Splitting them is what later lets A and C run at full SM width while B
+    // stays at chiplet width (design doc, plan 3). This step only restructures:
+    // all three passes keep the chiplet-width schedule they had, so the result
+    // must be bit-identical to P9.
+    //
+    // The run/skip decision is latched in pass A and reused by B and C. Pass A
+    // retires threads, so get_not_completed() can change under us; re-testing
+    // per pass could cycle an SM in one pass and skip it in another, leaving it
+    // half-cycled. One test, one decision -- exactly what the single-pass loop did.
+    if (m_cluster_ran.size() != m_shader_config->n_simt_clusters)
+      m_cluster_ran.assign(m_shader_config->n_simt_clusters, 0);
+
+    // Race bisection switch. ACCELSIM_SERIAL_PHASE=A|B|C forces that one phase to
+    // a single thread while the others stay parallel. If serialising exactly one
+    // phase makes an 8-thread run reproduce the sequential result, the race lives
+    // in that phase -- which narrows the search from "somewhere in the CORE
+    // phase" to a few hundred lines. Read once: getenv in the cycle loop would
+    // itself be a shared read every cycle.
+    static const char *serial_phase_env = getenv("ACCELSIM_SERIAL_PHASE");
+    static const bool par_a = !(serial_phase_env && *serial_phase_env == 'A');
+    static const bool par_b = !(serial_phase_env && *serial_phase_env == 'B');
+    static const bool par_c = !(serial_phase_env && *serial_phase_env == 'C');
+
+    // Sub-phase race probe (ACCELSIM_SERIAL_SUBSYS). It must be initialised
+    // before the first parallel region, and exactly once: a function local
+    // static does both without adding a shared read to every cycle.
+    static const bool probe_ready = (par_probe_init(), true);
+    (void)probe_ready;
+
+    // P11: pass A is per-SM work only (proved by grepping cycle_a / execute_a for
+    // l2_tlb / gmmu / get_chiplet: zero hits), so it runs FLAT over every cluster
+    // at full thread width. No chiplet grouping is needed here -- that grouping
+    // exists solely to bound pass B.
+    const unsigned n_clusters_flat = m_shader_config->n_simt_clusters;
+    const unsigned long long __pt_a0 = g_phase_timing_on ? phase_now_ns() : 0;
+// guided, per-loop (28): parked SMs make whole chunks trivial, so static
+// chunking starves some threads. guided fixes that here without touching the
+// 8-iteration icnt collapse(2) loop, which a global OMP_SCHEDULE=dynamic
+// silently serializes (measured: icnt 82.6s -> 334.5s).
+#pragma omp parallel for schedule(guided) if(par_a)
+    for (unsigned i = 0; i < n_clusters_flat; i++) {
+      // Evaluate once and reuse: keeps the original short-circuit semantics of
+      // "get_not_completed() || get_more_cta_left()" exactly.
+      const unsigned not_completed = m_cluster[i]->get_not_completed();
+      m_cluster_ran[i] = (not_completed || more_cta_left) ? 1 : 0;   // H2-A
+      if (m_cluster_ran[i]) m_cluster[i]->core_cycle_phase_a();
+    }
+    if (g_phase_timing_on) {
+      g_phase_timers.phase_a_ns += phase_now_ns() - __pt_a0;
+      g_phase_timers.phase_a_calls++;
+    }
+
+    // P11: pass B is the ONLY phase touching chiplet-shared state (the L2 TLB and
+    // the GMMU). It keeps the nested form: one chiplet per outer iteration, its
+    // SMs walked sequentially inside. That sequential inner walk is what
+    // preserves the B4a_i -> B4b_i -> B4e_i -> B4a_{i+1} chain the L2 MSHR
+    // depends on (design doc 7-1). Parallelism is capped at n_chiplets simply
+    // because the outer loop has that many iterations -- no num_threads needed;
+    // surplus threads idle here and pick the work back up in pass C.
+    const unsigned long long __pt_b0 = g_phase_timing_on ? phase_now_ns() : 0;
+#pragma omp parallel for schedule(runtime) if(par_b)
+    for (unsigned ch = 0; ch < n_chiplet_groups; ch++) {
+      const unsigned long long __pt_bc0 = g_phase_timing_on ? phase_now_ns() : 0;  // D1
+      for (unsigned ci = 0; ci < m_chiplet_cluster_order[ch].size(); ci++) {
+        const unsigned i = m_chiplet_cluster_order[ch][ci];
+        if (m_cluster_ran[i]) m_cluster[i]->core_cycle_phase_b();
+      }
+      if (g_phase_timing_on && ch < 8) {  // D1: per-group time + running thread
+        const unsigned long long __pt_body = phase_now_ns() - __pt_bc0;
+        g_phase_timers.phase_b_chip_ns[ch] += __pt_body;
+        g_phase_timers.phase_b_chip_cur_ns[ch] = __pt_body;  // D1b
+#ifdef _OPENMP
+        const int tid = omp_get_thread_num();
+#else
+        const int tid = 0;
+#endif
+        if (tid >= 0 && tid < 16) g_phase_timers.phase_b_chip_thread[ch][tid]++;
+      }
+    }
+    if (g_phase_timing_on) {
+      g_phase_timers.phase_b_ns += phase_now_ns() - __pt_b0;
+      g_phase_timers.phase_b_calls++;
+      {  // D1b: per-cycle maximum over groups (serial, after the region joined)
+        unsigned long long mx = 0; unsigned am = 0;
+        for (unsigned c = 0; c < n_chiplet_groups && c < 8; c++) {
+          const unsigned long long v = g_phase_timers.phase_b_chip_cur_ns[c];
+          g_phase_timers.phase_b_body_hist[phase_log2us_bucket(v)]++;
+          if (v > mx) { mx = v; am = c; }
+          g_phase_timers.phase_b_chip_cur_ns[c] = 0;
+        }
+        g_phase_timers.phase_b_cyclemax_ns += mx;
+        g_phase_timers.phase_b_argmax_cnt[am]++;
+        g_phase_timers.phase_b_max_hist[phase_log2us_bucket(mx)]++;
+      }
+    }
+
+    // P11: pass C is per-SM work only, same as pass A -- flat, full thread width.
+    const unsigned long long __pt_c0 = g_phase_timing_on ? phase_now_ns() : 0;
+// guided, per-loop: same rationale as pass A (28).
+#pragma omp parallel for schedule(guided) reduction(+ : active_sms_this_cycle) if(par_c)
+    for (unsigned i = 0; i < n_clusters_flat; i++) {
+      if (m_cluster_ran[i]) {
+        m_cluster[i]->core_cycle_phase_c();
+        // M2: accumulate into an integer local so the loop carries no shared
+        // dependence; folded into *active_sms once, after the loop.
+        active_sms_this_cycle += m_cluster[i]->get_n_active_sms();
+      }
+      // Update core icnt/cache stats for AccelWattch
+      if (m_config.g_power_simulation_enabled) {
+        m_cluster[i]->get_icnt_stats(
+            m_power_stats->pwr_mem_stat->n_simt_to_mem[CURRENT_STAT_IDX][i],
+            m_power_stats->pwr_mem_stat->n_mem_to_simt[CURRENT_STAT_IDX][i]);
+        m_cluster[i]->get_cache_stats(
+            m_power_stats->pwr_mem_stat->core_cache_stats[CURRENT_STAT_IDX]);
+      }
+    }
+    if (g_phase_timing_on) {
+      g_phase_timers.phase_c_ns += phase_now_ns() - __pt_c0;
+      g_phase_timers.phase_c_calls++;
+    }
+    // 31: everything from here to the end of cycle() -- kernel-completion
+    // scans, STATEHASH, issue_block2core() (which parses CTA traces), flushes.
+    __pt_t0 = g_phase_timing_on ? phase_now_ns() : 0;
+#ifdef _OPENMP
+    if (pt_guard_active && m_gpu_module &&
+        m_gpu_module->get_page_table()->mutation_count() != pt_mut_before) {
+      fprintf(stderr,
+              "\nFATAL: the GPU-wide page table was modified during the "
+              "parallel CORE phase\n"
+              "       (cycle %llu, %llu mutations). gmmu::translate() and "
+              "pt_walk() reach one\n"
+              "       shared gpu_page_table from every chiplet; concurrent "
+              "inserts corrupt it.\n"
+              "       Run with -gmmu_placement_load <map> so the table is "
+              "pre-built and read-only,\n"
+              "       or rebuild without -fopenmp.\n",
+              (unsigned long long)(gpu_sim_cycle + gpu_tot_sim_cycle),
+              m_gpu_module->get_page_table()->mutation_count() - pt_mut_before);
+      fflush(stderr);
+      abort();
+    }
+#endif
+    // A1: commit this cycle's buffered first-touch inserts (reference mode
+    // only; no-op otherwise). This runs after the parallel passes joined and
+    // after the pt-guard re-sampled the mutation counter, so the inserts are
+    // outside the guarded region by construction. Every owner-map reader
+    // (done_tlb_req level/leaf faults) executes at least one cycle after the
+    // translate that buffered the entry, so nothing observes the deferral.
+    if (m_gpu_module && m_gpu_module->get_page_table())
+      m_gpu_module->get_page_table()->commit_deferred_first_touch();
+    // M3: occupancy sampling accumulates into the shared gpu_occupancy struct,
+    // so it cannot stay inside the loop that will be parallelised. Cluster i's
+    // occupancy is only changed by cluster i's own core_cycle(), so sampling it
+    // after every cluster has cycled yields the same values as sampling it
+    // right after each one -- the accumulation is integer, hence order-free.
+    const unsigned long long __pt_occ0 = g_phase_timing_on ? phase_now_ns() : 0;
+    for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
+      m_cluster[i]->get_current_occupancy(
+          gpu_occupancy.aggregate_warp_slot_filled,
+          gpu_occupancy.aggregate_theoretical_warp_slots);
+    }
+    if (g_phase_timing_on) g_phase_timers.tail_occ_ns += phase_now_ns() - __pt_occ0;
+    *active_sms += (float)active_sms_this_cycle;
+
+    // STATEHASH: one fingerprint line per cycle, emitted from the sequential
+    // part of the cycle (all three passes have joined, so nothing is racing the
+    // read). Diffing a 1-thread log against an N-thread log gives the FIRST
+    // cycle at which the two diverge -- the divergence is global by the end of
+    // the run, so only the first cycle localises anything. Off by default:
+    // ACCELSIM_STATEHASH=1 turns it on, and it is not cheap (it walks every TLB
+    // array every cycle).
+    static const bool statehash_on = (getenv("ACCELSIM_STATEHASH") != NULL);
+    if (statehash_on && m_gpu_module) {
+      unsigned long long h_l2 = 0, h_l1 = 0;
+      for (unsigned c = 0; c < m_gpu_module->get_num_chiplets(); c++)
+        h_l2 += m_gpu_module->get_chiplet(c)->get_l2_tlb_4k()->state_fingerprint();
+      // Position-sensitive over SMs: a plain sum cancels when one SM runs ahead
+      // and another falls behind by the same amount, which is exactly what the
+      // first divergence looked like (sm=178 behind, sm=220 differing) -- the
+      // aggregate stayed equal for 11 cycles after the per-SM state had already
+      // parted. Fold the SM index in so nothing cancels.
+      unsigned long long h_sm = 1469598103934665603ull;
+      for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
+        h_l1 += m_cluster[i]->xlat_l1_fingerprint();
+        h_sm ^= (unsigned long long)m_shader_stats->m_num_sim_winsn[i] + i * 2654435761ull;
+        h_sm *= 1099511628211ull;
+      }
+      printf("[STATEHASH] cyc=%llu insn=%llu l2=%llu l1=%llu sm=%llu\n",
+             (unsigned long long)(gpu_sim_cycle + gpu_tot_sim_cycle),
+             (unsigned long long)gpu_sim_insn, h_l2, h_l1, h_sm);
+
+      // Per-SM detail inside a narrow cycle window. The aggregate above tells us
+      // WHEN the two runs part; this tells us WHICH SM. m_num_sim_winsn[sid] is
+      // the per-SM warp-instruction count that gpu_sim_insn aggregates, so the
+      // SM whose count differs is the one that ran ahead.
+      static const char *lo_s = getenv("ACCELSIM_STATEHASH_LO");
+      static const char *hi_s = getenv("ACCELSIM_STATEHASH_HI");
+      static const unsigned long long win_lo = lo_s ? strtoull(lo_s, 0, 10) : 0;
+      static const unsigned long long win_hi = hi_s ? strtoull(hi_s, 0, 10) : 0;
+      const unsigned long long now = gpu_sim_cycle + gpu_tot_sim_cycle;
+      if (win_hi && now >= win_lo && now <= win_hi) {
+        for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++)
+          printf("[SMDETAIL] cyc=%llu sm=%u winsn=%u cyc_cnt=%u l1=%llu\n",
+                 now, i, m_shader_stats->m_num_sim_winsn[i],
+                 m_shader_stats->shader_cycles[i],
+                 m_cluster[i]->xlat_l1_fingerprint());
+      }
+    }
+
+    float temp = 0;
+    for (unsigned i = 0; i < m_shader_config->num_shader(); i++) {
+      temp += m_shader_stats->m_pipeline_duty_cycle[i];
+    }
+    temp = temp / m_shader_config->num_shader();
+    *average_pipeline_duty_cycle = ((*average_pipeline_duty_cycle) + temp);
+    // cout<<"Average pipeline duty cycle:
+    // "<<*average_pipeline_duty_cycle<<endl;
+
+    if (g_single_step &&
+        ((gpu_sim_cycle + gpu_tot_sim_cycle) >= g_single_step)) {
+      raise(SIGTRAP);  // Debug breakpoint
+    }
+    gpu_sim_cycle++;
+
+    if (g_interactive_debugger_enabled) gpgpu_debug();
+
+      // McPAT main cycle (interface with McPAT)
+#ifdef GPGPUSIM_POWER_MODEL
+    if (m_config.g_power_simulation_enabled) {
+      if (m_config.g_power_simulation_mode == 0) {
+        mcpat_cycle(m_config, getShaderCoreConfig(), m_gpgpusim_wrapper,
+                    m_power_stats, m_config.gpu_stat_sample_freq,
+                    gpu_tot_sim_cycle, gpu_sim_cycle, gpu_tot_sim_insn,
+                    gpu_sim_insn, m_config.g_dvfs_enabled);
+      }
+    }
+#endif
+
+    const unsigned long long __pt_ib0 = g_phase_timing_on ? phase_now_ns() : 0;
+    issue_block2core();
+    if (g_phase_timing_on) g_phase_timers.tail_issue_ns += phase_now_ns() - __pt_ib0;
+    decrement_kernel_latency();
+
+    // Depending on configuration, invalidate the caches once all of threads are
+    // completed.
+    int all_threads_complete = 1;
+    if (m_config.gpgpu_flush_l1_cache) {
+      for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
+        if (m_cluster[i]->get_not_completed() == 0) {
+          // H2-C: tag_array::invalidate() returns immediately unless the array was
+          // touched since the last invalidate (gpu-cache.cc: `if (!is_used) return`),
+          // so the call was a no-op on almost every cluster on almost every cycle --
+          // but it still cost a walk into each core's tag_array (4.3% of run time at
+          // 256 SMs). m_l1_used mirrors that flag per cluster in one contiguous
+          // array; a zero there means is_used is false on every core of the cluster,
+          // so the skipped call could not have changed any state.
+          if (m_l1_used.empty() || m_l1_used[i]) {
+            m_cluster[i]->cache_invalidate();
+            if (!m_l1_used.empty()) m_l1_used[i] = 0;
+          }
+        } else
+          all_threads_complete = 0;
+      }
+    }
+
+    if (m_config.gpgpu_flush_l2_cache) {
+      if (!m_config.gpgpu_flush_l1_cache) {
+        for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
+          if (m_cluster[i]->get_not_completed() != 0) {
+            all_threads_complete = 0;
+            break;
+          }
+        }
+      }
+
+      if (all_threads_complete && !m_memory_config->m_L2_config.disabled()) {
+        printf("Flushed L2 caches...\n");
+        if (m_memory_config->m_L2_config.get_num_lines()) {
+          int dlc = 0;
+          for (unsigned i = 0; i < m_memory_config->m_n_mem; i++) {
+            dlc = m_memory_sub_partition[i]->flushL2();
+            assert(dlc == 0);  // TODO: need to model actual writes to DRAM here
+            printf("Dirty lines flushed from L2 %d is %d\n", i, dlc);
+          }
+        }
+      }
+    }
+
+    if (!(gpu_sim_cycle % m_config.gpu_stat_sample_freq)) {
+      time_t days, hrs, minutes, sec;
+      time_t curr_time;
+      time(&curr_time);
+      unsigned long long elapsed_time =
+          MAX(curr_time - gpgpu_ctx->the_gpgpusim->g_simulation_starttime, 1);
+      if ((elapsed_time - last_liveness_message_time) >=
+              m_config.liveness_message_freq &&
+          DTRACE(LIVENESS)) {
+        days = elapsed_time / (3600 * 24);
+        hrs = elapsed_time / 3600 - 24 * days;
+        minutes = elapsed_time / 60 - 60 * (hrs + 24 * days);
+        sec = elapsed_time - 60 * (minutes + 60 * (hrs + 24 * days));
+
+        unsigned long long active = 0, total = 0;
+        for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
+          m_cluster[i]->get_current_occupancy(active, total);
+        }
+        DPRINTFG(LIVENESS,
+                 "uArch: inst.: %lld (ipc=%4.1f, occ=%0.4f%% [%llu / %llu]) "
+                 "sim_rate=%u (inst/sec) elapsed = %u:%u:%02u:%02u / %s",
+                 gpu_tot_sim_insn + gpu_sim_insn,
+                 (double)gpu_sim_insn / (double)gpu_sim_cycle,
+                 float(active) / float(total) * 100, active, total,
+                 (unsigned)((gpu_tot_sim_insn + gpu_sim_insn) / elapsed_time),
+                 (unsigned)days, (unsigned)hrs, (unsigned)minutes,
+                 (unsigned)sec, ctime(&curr_time));
+        fflush(stdout);
+        last_liveness_message_time = elapsed_time;
+      }
+      visualizer_printstat();
+      m_memory_stats->memlatstat_lat_pw();
+      if (m_config.gpgpu_runtime_stat &&
+          (m_config.gpu_runtime_stat_flag != 0)) {
+        if (m_config.gpu_runtime_stat_flag & GPU_RSTAT_BW_STAT) {
+          for (unsigned i = 0; i < m_memory_config->m_n_mem; i++)
+            m_memory_partition_unit[i]->print_stat(stdout);
+          printf("maxmrqlatency = %d \n", m_memory_stats->max_mrq_latency);
+          printf("maxmflatency = %d \n", m_memory_stats->max_mf_latency);
+        }
+        if (m_config.gpu_runtime_stat_flag & GPU_RSTAT_SHD_INFO)
+          shader_print_runtime_stat(stdout);
+        if (m_config.gpu_runtime_stat_flag & GPU_RSTAT_L1MISS)
+          shader_print_l1_miss_stat(stdout);
+        if (m_config.gpu_runtime_stat_flag & GPU_RSTAT_SCHED)
+          shader_print_scheduler_stat(stdout, false);
+      }
+    }
+
+    if (!(gpu_sim_cycle % 50000)) {
+      // deadlock detection
+      if (m_config.gpu_deadlock_detect && gpu_sim_insn == last_gpu_sim_insn) {
+        gpu_deadlock = true;
+      } else {
+        last_gpu_sim_insn = gpu_sim_insn;
+      }
+    }
+    try_snap_shot(gpu_sim_cycle);
+    spill_log_to_file(stdout, 0, gpu_sim_cycle);
+
+#if (CUDART_VERSION >= 5000)
+    // launch device kernel
+    gpgpu_ctx->device_runtime->launch_one_device_kernel();
+#endif
+  }
+  if (g_phase_timing_on) {
+    const unsigned long long __now = phase_now_ns();
+    if (clock_mask & CORE) g_phase_timers.tail_ns += __now - __pt_t0;
+    g_phase_timers.cycle_ns += __now - __cyc0;
+  }
+}
+
+void sst_gpgpu_sim::cycle() {
+  SST_cycle();
+  return;
+}
+
+void shader_core_ctx::dump_warp_state(FILE *fout) const {
+  fprintf(fout, "\n");
+  fprintf(fout, "per warp functional simulation status:\n");
+  for (unsigned w = 0; w < m_config->max_warps_per_shader; w++)
+    m_warp[w]->print(fout);
+}
+
+void gpgpu_sim::perf_memcpy_to_gpu(size_t dst_start_addr, size_t count) {
+  if (m_memory_config->m_perf_sim_memcpy) {
+    // if(!m_config.trace_driven_mode)    //in trace-driven mode, CUDA runtime
+    // can start nre data structure at any position 	assert (dst_start_addr %
+    // 32
+    //== 0);
+
+    // counter must be size_t: a 32-bit unsigned wraps to 0 at exactly 4GiB
+    // (count == 2^32), turning this loop infinite. First hit by LUD's 4GiB
+    // HtoD copy; every smaller memcpy terminates and hid the bug.
+    // S2: the four 32 B sectors of one 128 B line share their sub-partition
+    // whenever no chip/bank/hash bit lies below bit 7 (checked once); decode the
+    // line once instead of once per sector. Same calls, same order, same values.
+    static const bool line_memo =
+        m_memory_config->m_address_mapping.sub_partition_fixed_within(7);
+    bool have_line = false;
+    size_t memo_line = 0;
+    unsigned memo_sub = 0;
+    for (size_t counter = 0; counter < count; counter += 32) {
+      // s31: 64-bit like Accel-Sim v2.0.0 (was `const unsigned`, which cut the
+      // 64-bit destination address to its low 32 bits). Note: this address is the
+      // memcpy destination VA -- this warm-up is not translated, so the MCM
+      // experiments run with -gpgpu_perf_sim_memcpy 0 (docs/s31 section 6).
+      const size_t wr_addr = dst_start_addr + counter;
+      mem_access_sector_mask_t mask;
+      mask.set(wr_addr % 128 / 32);
+      if (!(line_memo && have_line && (wr_addr >> 7) == memo_line)) {
+        addrdec_t raw_addr;
+        m_memory_config->m_address_mapping.addrdec_tlx(wr_addr, &raw_addr);
+        memo_sub = raw_addr.sub_partition;
+        memo_line = wr_addr >> 7;
+        have_line = true;
+      }
+      const unsigned partition_id =
+          memo_sub / m_memory_config->m_n_sub_partition_per_memory_channel;
+      m_memory_partition_unit[partition_id]->handle_memcpy_to_gpu(
+          wr_addr, memo_sub, mask);
+    }
+  }
+}
+
+void gpgpu_sim::dump_pipeline(int mask, int s, int m) const {
+  /*
+     You may want to use this function while running GPGPU-Sim in gdb.
+     One way to do that is add the following to your .gdbinit file:
+
+        define dp
+           call g_the_gpu.dump_pipeline_impl((0x40|0x4|0x1),$arg0,0)
+        end
+
+     Then, typing "dp 3" will show the contents of the pipeline for shader
+     core 3.
+  */
+
+  printf("Dumping pipeline state...\n");
+  if (!mask) mask = 0xFFFFFFFF;
+  for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
+    if (s != -1) {
+      i = s;
+    }
+    if (mask & 1)
+      m_cluster[m_shader_config->sid_to_cluster(i)]->display_pipeline(
+          i, stdout, 1, mask & 0x2E);
+    if (s != -1) {
+      break;
+    }
+  }
+  if (mask & 0x10000) {
+    for (unsigned i = 0; i < m_memory_config->m_n_mem; i++) {
+      if (m != -1) {
+        i = m;
+      }
+      printf("DRAM / memory controller %u:\n", i);
+      if (mask & 0x100000) m_memory_partition_unit[i]->print_stat(stdout);
+      if (mask & 0x1000000) m_memory_partition_unit[i]->visualize();
+      if (mask & 0x10000000) m_memory_partition_unit[i]->print(stdout);
+      if (m != -1) {
+        break;
+      }
+    }
+  }
+  fflush(stdout);
+}
+
+const shader_core_config *gpgpu_sim::getShaderCoreConfig() {
+  return m_shader_config;
+}
+
+const memory_config *gpgpu_sim::getMemoryConfig() { return m_memory_config; }
+
+simt_core_cluster *gpgpu_sim::getSIMTCluster() { return *m_cluster; }
+
+void sst_gpgpu_sim::SST_gpgpusim_numcores_equal_check(unsigned sst_numcores) {
+  if (m_shader_config->n_simt_clusters != sst_numcores) {
+    assert(
+        "\nSST core is not equal the GPGPU-sim cores. Open gpgpu-sim.config "
+        "file and ensure n_simt_clusters"
+        "is the same as SST gpu cores.\n" &&
+        0);
+  } else {
+    printf("\nSST GPU core is equal the GPGPU-sim cores = %d\n", sst_numcores);
+  }
+}
+
+void sst_gpgpu_sim::SST_cycle() {
+  // shader core loading (pop from ICNT into core) follows CORE clock
+  for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++)
+    static_cast<sst_simt_core_cluster *>(m_cluster[i])->icnt_cycle_SST();
+
+  // L1 cache + shader core pipeline stages
+  m_power_stats->pwr_mem_stat->core_cache_stats[CURRENT_STAT_IDX].clear();
+  for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
+    if (m_cluster[i]->get_not_completed() || get_more_cta_left()) {
+      m_cluster[i]->core_cycle();
+      *active_sms += m_cluster[i]->get_n_active_sms();
+    }
+    // Update core icnt/cache stats for GPUWattch
+    m_cluster[i]->get_icnt_stats(
+        m_power_stats->pwr_mem_stat->n_simt_to_mem[CURRENT_STAT_IDX][i],
+        m_power_stats->pwr_mem_stat->n_mem_to_simt[CURRENT_STAT_IDX][i]);
+    m_cluster[i]->get_cache_stats(
+        m_power_stats->pwr_mem_stat->core_cache_stats[CURRENT_STAT_IDX]);
+  }
+  float temp = 0;
+  for (unsigned i = 0; i < m_shader_config->num_shader(); i++) {
+    temp += m_shader_stats->m_pipeline_duty_cycle[i];
+  }
+  temp = temp / m_shader_config->num_shader();
+  *average_pipeline_duty_cycle = ((*average_pipeline_duty_cycle) + temp);
+  // cout<<"Average pipeline duty cycle: "<<*average_pipeline_duty_cycle<<endl;
+
+  if (g_single_step && ((gpu_sim_cycle + gpu_tot_sim_cycle) >= g_single_step)) {
+    asm("int $03");
+  }
+  gpu_sim_cycle++;
+  if (g_interactive_debugger_enabled) gpgpu_debug();
+
+    // McPAT main cycle (interface with McPAT)
+#ifdef GPGPUSIM_POWER_MODEL
+  if (m_config.g_power_simulation_enabled) {
+    mcpat_cycle(m_config, getShaderCoreConfig(), m_gpgpusim_wrapper,
+                m_power_stats, m_config.gpu_stat_sample_freq, gpu_tot_sim_cycle,
+                gpu_sim_cycle, gpu_tot_sim_insn, gpu_sim_insn,
+                m_config.g_dvfs_enabled);
+  }
+#endif
+
+  issue_block2core();
+
+  if (!(gpu_sim_cycle % m_config.gpu_stat_sample_freq)) {
+    time_t days, hrs, minutes, sec;
+    time_t curr_time;
+    time(&curr_time);
+    unsigned long long elapsed_time =
+        MAX(curr_time - gpgpu_ctx->the_gpgpusim->g_simulation_starttime, 1);
+    if ((elapsed_time - last_liveness_message_time) >=
+        m_config.liveness_message_freq) {
+      days = elapsed_time / (3600 * 24);
+      hrs = elapsed_time / 3600 - 24 * days;
+      minutes = elapsed_time / 60 - 60 * (hrs + 24 * days);
+      sec = elapsed_time - 60 * (minutes + 60 * (hrs + 24 * days));
+
+      last_liveness_message_time = elapsed_time;
+    }
+    visualizer_printstat();
+    m_memory_stats->memlatstat_lat_pw();
+    if (m_config.gpgpu_runtime_stat && (m_config.gpu_runtime_stat_flag != 0)) {
+      if (m_config.gpu_runtime_stat_flag & GPU_RSTAT_BW_STAT) {
+        for (unsigned i = 0; i < m_memory_config->m_n_mem; i++)
+          m_memory_partition_unit[i]->print_stat(stdout);
+        printf("maxmrqlatency = %d \n", m_memory_stats->max_mrq_latency);
+        printf("maxmflatency = %d \n", m_memory_stats->max_mf_latency);
+      }
+      if (m_config.gpu_runtime_stat_flag & GPU_RSTAT_SHD_INFO)
+        shader_print_runtime_stat(stdout);
+      if (m_config.gpu_runtime_stat_flag & GPU_RSTAT_L1MISS)
+        shader_print_l1_miss_stat(stdout);
+      if (m_config.gpu_runtime_stat_flag & GPU_RSTAT_SCHED)
+        shader_print_scheduler_stat(stdout, false);
+    }
+  }
+
+  if (!(gpu_sim_cycle % 20000)) {
+    // deadlock detection
+    if (m_config.gpu_deadlock_detect && gpu_sim_insn == last_gpu_sim_insn) {
+      gpu_deadlock = true;
+    } else {
+      last_gpu_sim_insn = gpu_sim_insn;
+    }
+  }
+  try_snap_shot(gpu_sim_cycle);
+  spill_log_to_file(stdout, 0, gpu_sim_cycle);
+
+#if (CUDART_VERSION >= 5000)
+  // launch device kernel
+  gpgpu_ctx->device_runtime->launch_one_device_kernel();
+#endif
+}
+
+// Hook for gpu_module to observe mallocs and track virtual address ranges
+void gpgpu_sim::on_gpu_malloc(uint64_t va, size_t aligned_size,
+                              unsigned page_shift) {
+  if (m_gpu_module)
+    m_gpu_module->on_malloc(va, aligned_size, page_shift);
+}
+
+// Turns the -gpgpu_page_size_policy setting into a page shift for one allocation.
+//
+// Fixed policies (0-2) give every allocation the same page size: page size is the
+// only variable, which is what a page-size sweep wants. A tiny allocation then
+// burns a whole page, so PMM use is worst-case; map_leaf() asserts if it runs out.
+// Automatic policies (3-5) instead pick the largest enabled page the allocation
+// can fill (size >= page size), which is closer to what a real driver does.
+unsigned gpgpu_sim::decide_page_shift(size_t size) const {
+  const unsigned policy = m_shader_config->gpgpu_page_size_policy;
+  switch (policy) {
+    // ---- fixed ----
+    case 0: return GPU_PAGE_SHIFT;   // all 4KB (baseline)
+    case 1: return GPU_64K_SHIFT;    // all 64KB
+    case 2: return GPU_HUGE_SHIFT;   // all 2MB
+    // ---- automatic: largest enabled page with size >= page size ----
+    case 3: return (size >= GPU_HUGE_PAGE_SIZE) ? GPU_HUGE_SHIFT   // 4KB/64KB/2MB
+                 : (size >= GPU_64K_PAGE_SIZE)  ? GPU_64K_SHIFT
+                                                : GPU_PAGE_SHIFT;
+    case 4: return (size >= GPU_HUGE_PAGE_SIZE) ? GPU_HUGE_SHIFT   // 4KB / 2MB
+                                                : GPU_PAGE_SHIFT;
+    case 5: return (size >= GPU_64K_PAGE_SIZE)  ? GPU_64K_SHIFT    // 4KB / 64KB
+                                                : GPU_PAGE_SHIFT;
+    default:
+      fprintf(stderr, "GPGPU-Sim: unknown -gpgpu_page_size_policy %u\n", policy);
+      abort();
+  }
+}
