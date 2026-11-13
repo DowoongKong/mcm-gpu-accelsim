@@ -1,0 +1,4 @@
+upstream: accel-sim-framework https://github.com/accel-sim/accel-sim-framework.git commit 3016c658f810bdae9a14bf4534ee99e9945eedae (Tue Mar 24 11:47:03 2026 +0800 Fix kernel attribute query when cuLaunchKernel uses CUkernel handles (#521))
+our changes: util/tracer_nvbit/tracer_tool/tracer_tool.cu only = patch 28 (async/driver memcpy recording, docs/s1_tracer_async_memcpy.ko.md) + patch 30 (SASS dump, docs/s25_tracer_sass_dump_patch30.ko.md); NVBit core in the tree: 1.7.6
+ util/tracer_nvbit/tracer_tool/tracer_tool.cu | 85 +++++++++++++++++++++++++---
+ 1 file changed, 77 insertions(+), 8 deletions(-)

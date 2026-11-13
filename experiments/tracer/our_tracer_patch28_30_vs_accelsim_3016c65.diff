@@ -1,0 +1,131 @@
+diff --git a/util/tracer_nvbit/tracer_tool/tracer_tool.cu b/util/tracer_nvbit/tracer_tool/tracer_tool.cu
+index e0bef89..af61452 100644
+--- a/util/tracer_nvbit/tracer_tool/tracer_tool.cu
++++ b/util/tracer_nvbit/tracer_tool/tracer_tool.cu
+@@ -79,6 +79,9 @@ int user_defined_folders = 0;
+ 
+ /* Use xz to compress the *.trace file */
+ int xz_compress_trace = 0;
++/* Print every driver memcpy callback (discovery aid, off by default) */
++int memcpy_cbid_log = 0;
++int sass_dump = 0;  // patch 30 (2026-11-10): SASS_DUMP=1 writes one static SASS listing per instrumented function
+ 
+ /* opcode to id map and reverse map  */
+ std::map<std::string, int> opcode_to_id_map;
+@@ -268,6 +271,11 @@ void nvbit_at_init() {
+               "Enable spinlock fast forwarding");
+   GET_VAR_INT(spinlock_iter_to_keep, "SPINLOCK_ITER_TO_KEEP", 1,
+               "Number of iterations to keep for spinlock fast forwarding");
++  GET_VAR_INT(memcpy_cbid_log, "MEMCPY_CBID_LOG", 0,
++              "Print every driver memcpy callback (enter/exit, cbid, name, bytes) to stderr");
++  GET_VAR_INT(sass_dump, "SASS_DUMP", 0,
++              "Write the static SASS of every instrumented function to <traces folder>/traces/sass/func-<n>.sass "
++              "(index.tsv maps n to the function name); trace content is unchanged");
+   std::string pad(100, '-');
+   printf("%s\n", pad.c_str());
+ 
+@@ -313,6 +321,30 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func) {
+     }
+ 
+     const std::vector<Instr *> &instrs = nvbit_get_instrs(ctx, f);
++    if (sass_dump) {
++      // patch 30: static SASS listing, once per function (same guard as the instrumentation itself);
++      // the dynamic trace is untouched. File n is in creation order; sass/index.tsv maps n -> function name.
++      static int sass_n = 0;
++      std::string sass_dir = user_folder + "/traces/sass";
++      mkdir((user_folder + "/traces").c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
++      mkdir(sass_dir.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
++      char sass_path[1024];
++      snprintf(sass_path, sizeof(sass_path), "%s/func-%d.sass", sass_dir.c_str(), sass_n);
++      FILE *sf = fopen(sass_path, "w");
++      if (sf) {
++        fprintf(sf, "-function name = %s\n-function addr = 0x%lx\n-n instrs = %zu\n",
++                nvbit_get_func_name(ctx, f, true), nvbit_get_func_addr(ctx, f), instrs.size());
++        for (auto si : instrs) fprintf(sf, "%04x %s\n", si->getOffset(), si->getSass());
++        fclose(sf);
++        FILE *xf = fopen((sass_dir + "/index.tsv").c_str(), "a");
++        if (xf) {
++          fprintf(xf, "%d\t%s\t0x%lx\t%zu\n", sass_n, nvbit_get_func_name(ctx, f, true),
++                  nvbit_get_func_addr(ctx, f), instrs.size());
++          fclose(xf);
++        }
++      }
++      sass_n++;
++    }
+     if (verbose >= 1) {
+       printf("Inspecting function %s at address 0x%lx\n",
+              nvbit_get_func_name(ctx, f), nvbit_get_func_addr(ctx, f));
+@@ -322,14 +354,20 @@ void instrument_function_if_needed(CUcontext ctx, CUfunction func) {
+     /* iterate on all the static instructions in the function */
+     for (auto instr : instrs) {
+       uint32_t line_num = 0;
+-      // Temporary workaround for a bug in NVBit 1.7.4, which does not correctly
+-      // handle `call.rel`. Instrumenting this instruction leads to illegal
+-      // memory access. Refer to:
+-      // https://github.com/NVlabs/NVBit/issues/142#issue-2911561744
+-      if (!strcmp(instr->getOpcode(), "CALL.REL.NOINC")) {
+-        printf("Warning: Ignoring CALL.REL.NOINC (NVBit 1.7.4 bug)\n");
+-        continue;
+-      }
++      // RESOLVED - kept commented out for reference only.
++      // NVBit v1.7.5 (2025-06-02) changelog, Fixed #1: "Fixed CALL.REL.NOINC handling
++      // (https://github.com/NVlabs/NVBit/issues/142)". This tool builds against NVBit 1.7.6, and
++      // Accel-Sim 2.0 (NVBit 1.8) dropped the same workaround. Skipping the instruction is no longer
++      // needed and would silently remove CALL.REL.NOINC from traces and instruction counts.
++      // Original NVBit 1.7.4 workaround:
++      // // Temporary workaround for a bug in NVBit 1.7.4, which does not correctly
++      // // handle `call.rel`. Instrumenting this instruction leads to illegal
++      // // memory access. Refer to:
++      // // https://github.com/NVlabs/NVBit/issues/142#issue-2911561744
++      // if (!strcmp(instr->getOpcode(), "CALL.REL.NOINC")) {
++      //   printf("Warning: Ignoring CALL.REL.NOINC (NVBit 1.7.4 bug)\n");
++      //   continue;
++      // }
+ 
+       if (cnt < instr_begin_interval || cnt >= instr_end_interval) {
+         cnt++;
+@@ -691,6 +729,22 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
+     fclose(statsFile);
+   }
+ 
++  // Discovery aid: print every driver memcpy callback so the path each host API takes is observed,
++  // not assumed. MEMCPY_CBID_LOG=0 (default) keeps the tool's behavior unchanged.
++  if (memcpy_cbid_log && strstr(name, "Memcpy") != NULL) {
++    long long bytes = -1;
++    if (cbid == API_CUDA_cuMemcpyHtoD_v2 || cbid == API_CUDA_cuMemcpyHtoD_v2_ptds)
++      bytes = (long long)((cuMemcpyHtoD_v2_params *)params)->ByteCount;
++    else if (cbid == API_CUDA_cuMemcpyHtoDAsync_v2 || cbid == API_CUDA_cuMemcpyHtoDAsync_v2_ptsz)
++      bytes = (long long)((cuMemcpyHtoDAsync_v2_params *)params)->ByteCount;
++    else if (cbid == API_CUDA_cuMemcpy)
++      bytes = (long long)((cuMemcpy_params *)params)->ByteCount;
++    else if (cbid == API_CUDA_cuMemcpyAsync || cbid == API_CUDA_cuMemcpyAsync_ptsz)
++      bytes = (long long)((cuMemcpyAsync_params *)params)->ByteCount;
++    fprintf(stderr, "[memcpy-cbid] %s cbid=%d name=%s bytes=%lld\n", is_exit ? "exit " : "enter",
++            (int)cbid, name, bytes);
++  }
++
+   switch (cbid) {
+   // We start with recording kernel launch events
+   // Identify all the possible CUDA launch events without stream
+@@ -826,6 +880,21 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
+       fclose(kernelsFile);
+     }
+   } break;
++  // Asynchronous host-to-device copies (cudaMemcpyAsync, PyTorch non_blocking and pageable uploads).
++  // The simulator treats MemcpyHtoD records as the only evidence that device memory holds data, so
++  // these must be recorded too. Same record format as the synchronous case: no parser change.
++  // vLLM 0.19.1 / PyTorch 2.10 upload all weights through this callback (MEMCPY_CBID_LOG discovery).
++  case API_CUDA_cuMemcpyHtoDAsync_v2: {
++    if (!is_exit) {
++      cuMemcpyHtoDAsync_v2_params *p = (cuMemcpyHtoDAsync_v2_params *)params;
++      char buffer[1024];
++      kernelsFile = fopen(ctx_kernelslist[ctx].c_str(), "a");
++      sprintf(buffer, "MemcpyHtoD,0x%016llx,%llu", p->dstDevice, p->ByteCount);
++      fprintf(kernelsFile, buffer);
++      fprintf(kernelsFile, "\n");
++      fclose(kernelsFile);
++    }
++  } break;
+   // For cuProfiler, we need to set the active region accordingly
+   case API_CUDA_cuProfilerStart: {
+     if (is_exit && !active_from_start) {

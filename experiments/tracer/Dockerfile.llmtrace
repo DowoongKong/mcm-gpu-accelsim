@@ -1,0 +1,7 @@
+FROM accelsim/dev:cuda12.2
+# vLLM 0.19.1 pins torch 2.10.0 (CUDA 12.8 wheels), the newest stack verified on host driver 535.
+RUN /venv/bin/pip install --no-cache-dir vllm==0.19.1
+# Match the host account (user, uid/gid 1035) so files written to bind mounts stay host-owned and
+# getpass.getuser() works (torch inductor derives its cache dir from it). Kept after the pip layer
+# so changing the account does not invalidate the cached vLLM install.
+RUN groupadd -g 1035 user && useradd -u 1035 -g 1035 -m -s /bin/bash user
