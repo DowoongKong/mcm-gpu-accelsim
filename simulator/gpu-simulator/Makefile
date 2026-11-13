@@ -39,12 +39,13 @@ endif
 ifeq ($(DEBUG),1)
 	CXXFLAGS = -Wall -O0 -g3 -fPIC -std=c++17
 else
-	CXXFLAGS = -Wall -O3 -g3 -fPIC -std=c++17
+	CXXFLAGS = -Wall -O3 -g3 -fPIC -std=c++17 -fopenmp
 endif
 
 CXXFLAGS+=-I./trace-driven -I./trace-parser -I$(GPGPUSIM_ROOT)/libcuda -I$(GPGPUSIM_ROOT)/src -I$(CUDA_INSTALL_PATH)/include -I$(BUILD_DIR)
 
-LIBS+=-L$(GPGPUSIM_ROOT)/lib/$(GPGPUSIM_CONFIG)/ -lcudart -lm -lz -lGL -pthread $(BUILD_DIR)/*.o 
+# -rdynamic: export symbols so backtrace_symbols_fd names the frames
+LIBS+=-rdynamic -L$(GPGPUSIM_ROOT)/lib/$(GPGPUSIM_CONFIG)/ -lcudart -lm -lz -lGL -pthread $(BUILD_DIR)/*.o 
 
 all: $(BIN_DIR)/accel-sim.out
 

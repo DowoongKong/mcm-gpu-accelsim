@@ -129,6 +129,27 @@ void trace_kernel_info_t::get_next_threadblock_traces(
       m_kernel_trace_info->enable_lineinfo, m_kernel_trace_info->pipeReader);
 }
 
+// PCC: each chiplet owns an independent reader over the same trace file and
+// consumes only its own thread blocks (ascending id order, like the cursor).
+void trace_kernel_info_t::get_threadblock_traces_pcc(
+    std::vector<std::vector<inst_trace_t> *> threadblock_traces,
+    unsigned chiplet, unsigned want_lin) {
+  assert(pcc_on() && chiplet < pcc_n());
+  if (m_pcc_readers.size() < pcc_n()) m_pcc_readers.resize(pcc_n());
+  if (!m_pcc_readers[chiplet]) {
+    m_pcc_readers[chiplet].reset(new PipeReader(m_kernel_trace_info->filePath));
+    m_parser->skip_kernel_header(*m_pcc_readers[chiplet]);
+  }
+  m_parser->get_next_threadblock_traces(
+      threadblock_traces, m_kernel_trace_info->trace_verion,
+      m_kernel_trace_info->enable_lineinfo, *m_pcc_readers[chiplet],
+      (long long)want_lin, m_kernel_trace_info->grid_dim_x,
+      m_kernel_trace_info->grid_dim_y);
+  // The cursor was already advanced (last thread init precedes init_traces):
+  // if this chiplet has nothing left, release its decompressor now.
+  if (!pcc_has_cta(chiplet)) m_pcc_readers[chiplet].reset();
+}
+
 types_of_operands get_oprnd_type(op_type op, special_ops sp_op) {
   switch (op) {
     case SP_OP:
@@ -508,9 +529,9 @@ void trace_config::set_latency(unsigned category, unsigned &latency,
 void trace_gpgpu_sim::createSIMTCluster() {
   m_cluster = new simt_core_cluster *[m_shader_config->n_simt_clusters];
   for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++)
-    m_cluster[i] =
-        new trace_simt_core_cluster(this, i, m_shader_config, m_memory_config,
-                                    m_shader_stats, m_memory_stats);
+    m_cluster[i] = new trace_simt_core_cluster(
+        this, m_gpu_module, i, m_shader_config, m_memory_config, m_shader_stats,
+        m_memory_stats);
 }
 
 void trace_simt_core_cluster::create_shader_core_ctx() {
@@ -576,7 +597,7 @@ void trace_shader_core_ctx::init_warps(unsigned cta_id, unsigned start_thread,
   unsigned end_warp = end_thread / m_config->warp_size +
                       ((end_thread % m_config->warp_size) ? 1 : 0);
 
-  init_traces(start_warp, end_warp, kernel);
+  init_traces(start_warp, end_warp, kernel, ctaid);
 }
 
 const warp_inst_t *trace_shader_core_ctx::get_next_inst(unsigned warp_id,
@@ -606,7 +627,7 @@ void trace_shader_core_ctx::updateSIMTStack(unsigned warpId,
 }
 
 void trace_shader_core_ctx::init_traces(unsigned start_warp, unsigned end_warp,
-                                        kernel_info_t &kernel) {
+                                        kernel_info_t &kernel, unsigned ctaid) {
   std::vector<std::vector<inst_trace_t> *> threadblock_traces;
   for (unsigned i = start_warp; i < end_warp; ++i) {
     trace_shd_warp_t *m_trace_warp = static_cast<trace_shd_warp_t *>(m_warp[i]);
@@ -615,7 +636,11 @@ void trace_shader_core_ctx::init_traces(unsigned start_warp, unsigned end_warp,
   }
   trace_kernel_info_t &trace_kernel =
       static_cast<trace_kernel_info_t &>(kernel);
-  trace_kernel.get_next_threadblock_traces(threadblock_traces);
+  if (trace_kernel.pcc_on())   // PCC: this CTA's home chiplet reads its own block
+    trace_kernel.get_threadblock_traces_pcc(threadblock_traces,
+                                            trace_kernel.pcc_home(ctaid), ctaid);
+  else
+    trace_kernel.get_next_threadblock_traces(threadblock_traces);
 
   // set the pc from the traces and ignore the functional model
   for (unsigned i = start_warp; i < end_warp; ++i) {

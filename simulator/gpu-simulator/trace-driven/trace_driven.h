@@ -38,6 +38,7 @@
 #define TRACE_DRIVEN_H
 
 #include "../ISA_Def/trace_opcode.h"
+#include <memory>
 #include "../trace-parser/trace_parser.h"
 #include "abstract_hardware_model.h"
 #include "gpgpu-sim/shader.h"
@@ -92,6 +93,10 @@ class trace_kernel_info_t : public kernel_info_t {
 
   void get_next_threadblock_traces(
       std::vector<std::vector<inst_trace_t> *> threadblock_traces);
+  // PCC: read thread block `want_lin` through this chiplet's own reader.
+  void get_threadblock_traces_pcc(
+      std::vector<std::vector<inst_trace_t> *> threadblock_traces,
+      unsigned chiplet, unsigned want_lin);
 
   unsigned long long get_cuda_stream_id() {
     return m_kernel_trace_info->cuda_stream_id;
@@ -109,6 +114,7 @@ class trace_kernel_info_t : public kernel_info_t {
   trace_parser *m_parser;
   kernel_trace_t *m_kernel_trace_info;
   bool m_was_launched;
+  std::vector<std::unique_ptr<PipeReader>> m_pcc_readers;   // PCC, lazily opened
 
   friend class trace_shd_warp_t;
 };
@@ -174,12 +180,14 @@ class trace_gpgpu_sim : public gpgpu_sim {
 
 class trace_simt_core_cluster : public simt_core_cluster {
  public:
-  trace_simt_core_cluster(class gpgpu_sim *gpu, unsigned cluster_id,
+  trace_simt_core_cluster(class gpgpu_sim *gpu, class gpu_module *module,
+                          unsigned cluster_id,
                           const shader_core_config *config,
                           const memory_config *mem_config,
                           class shader_core_stats *stats,
                           class memory_stats_t *mstats)
-      : simt_core_cluster(gpu, cluster_id, config, mem_config, stats, mstats) {
+      : simt_core_cluster(gpu, module, cluster_id, config, mem_config, stats,
+                          mstats) {
     create_shader_core_ctx();
   }
 
@@ -226,7 +234,7 @@ class trace_shader_core_ctx : public shader_core_ctx {
 
  private:
   void init_traces(unsigned start_warp, unsigned end_warp,
-                   kernel_info_t &kernel);
+                   kernel_info_t &kernel, unsigned ctaid);
 };
 
 types_of_operands get_oprnd_type(op_type op, special_ops sp_op);

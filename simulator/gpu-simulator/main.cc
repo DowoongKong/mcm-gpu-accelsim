@@ -1,6 +1,24 @@
 // developed by Mahmoud Khairy, Purdue Univ
 // abdallm@purdue.edu
 
+#include <csignal>
+#include <execinfo.h>
+#include <unistd.h>
+
+// XLATDBG: print a backtrace on SIGSEGV. gdb cannot catch this particular crash --
+// it changes the process environment (and therefore the heap/stack layout) and the
+// fault does not reproduce under it. Handling the signal in-process keeps the
+// layout byte-identical to the failing run.
+static void xlatdbg_segv_handler(int sig) {
+  void* frames[40];
+  int n = backtrace(frames, 40);
+  const char msg[] = "\n*** XLATDBG SIGSEGV backtrace ***\n";
+  ssize_t w = write(STDERR_FILENO, msg, sizeof(msg) - 1); (void)w;
+  backtrace_symbols_fd(frames, n, STDERR_FILENO);
+  signal(sig, SIG_DFL);
+  raise(sig);
+}
+
 #include "accel-sim.h"
 
 /* TO DO:
@@ -26,6 +44,8 @@
  */
 
 int main(int argc, const char **argv) {
+  signal(SIGSEGV, xlatdbg_segv_handler);  // XLATDBG
+
   accel_sim_framework accel_sim(argc, argv);
   accel_sim.simulation_loop();
 

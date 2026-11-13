@@ -61,8 +61,17 @@ struct inst_trace_t {
 
   inst_memadd_info_t *memadd_info;
 
-  bool parse_from_string(std::string trace, unsigned tracer_version,
+  // S1 (llm_exp/docs/s31_sim_speed_review_llm.ko.md): parse_from_string() tries
+  // parse_fast() first and falls back to parse_from_string_slow() (the original
+  // stringstream parser, unchanged) for any line the fast path does not fully
+  // understand. ACCELSIM_PARSE_CHECK=1 runs both on every line and aborts on any
+  // field difference.
+  bool parse_from_string(const std::string &trace, unsigned tracer_version,
                          unsigned enable_lineinfo);
+  bool parse_from_string_slow(std::string trace, unsigned tracer_version,
+                              unsigned enable_lineinfo);
+  bool parse_fast(const std::string &trace, unsigned tracer_version,
+                  unsigned enable_lineinfo);
 
   bool check_opcode_contain(const std::vector<std::string> &opcode,
                             std::string param) const;
@@ -130,6 +139,7 @@ struct kernel_trace_t {
   unsigned long long shmem_base_addr;
   unsigned long long local_base_addr;
   PipeReader pipeReader;
+  std::string filePath;   // PCC: per-chiplet readers re-open the same trace
 };
 
 class trace_parser {
@@ -144,10 +154,17 @@ class trace_parser {
   void parse_memcpy_info(const std::string &memcpy_command, size_t &add,
                          size_t &count);
 
+  // want_lin >= 0 (PCC): parse only the thread block whose linear id is
+  // want_lin, skipping earlier foreign blocks; the stream must be ascending.
   void get_next_threadblock_traces(
       std::vector<std::vector<inst_trace_t> *> threadblock_traces,
       unsigned trace_version, unsigned enable_lineinfo,
-      class PipeReader &pipeReader);
+      class PipeReader &pipeReader, long long want_lin = -1,
+      unsigned grid_x = 0, unsigned grid_y = 0);
+
+  // PCC: consume the kernel header of a freshly opened reader (same stop rule
+  // as parse_kernel_info: the first line starting with '#').
+  void skip_kernel_header(class PipeReader &pipeReader);
 
   void kernel_finalizer(kernel_trace_t *trace_info);
 
