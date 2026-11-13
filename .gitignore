@@ -1,0 +1,18 @@
+# simulator build outputs
+simulator/gpu-simulator/bin/
+simulator/gpu-simulator/build/
+simulator/gpu-simulator/gpgpu-sim/lib/
+simulator/gpu-simulator/gpgpu-sim/build/
+simulator/build_status.txt
+simulator/build.log
+*.o
+*.d
+*.so
+*.a
+compile_commands.json
+__pycache__/
+# experiment data (traces, simulation runs, kits) is kept out of the repository
+*.traceg.xz
+*.trace.xz
+*.tar
+*.tar.gz
