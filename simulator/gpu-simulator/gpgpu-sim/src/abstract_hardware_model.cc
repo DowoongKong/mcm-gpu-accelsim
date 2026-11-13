@@ -804,6 +804,7 @@ kernel_info_t::kernel_info_t(dim3 gridDim, dim3 blockDim,
   // Initialize LASP configuration with default values
   m_lasp_config.policy = lasp::KERNEL_WIDE;
   m_lasp_config.chunk_size = 1;
+  m_pcc_on = false; m_pcc_static = false; m_pcc_n = 0; m_pcc_total = 0; m_pcc_remaining = 0;
 }
 
 /*A snapshot of the texture mappings needs to be stored in the kernel's info as
@@ -845,6 +846,85 @@ kernel_info_t::kernel_info_t(
   // Initialize LASP configuration with default values
   m_lasp_config.policy = lasp::KERNEL_WIDE;
   m_lasp_config.chunk_size = 1;
+  m_pcc_on = false; m_pcc_static = false; m_pcc_n = 0; m_pcc_total = 0; m_pcc_remaining = 0;
+}
+
+// ---------------------------------------------------------------------------
+// PCC: per-chiplet CTA cursors (docs/cta_chiplet_cursor.ko.md)
+// ---------------------------------------------------------------------------
+unsigned kernel_info_t::pcc_lin(const dim3 &d) const {
+  return d.x + m_grid_dim.x * d.y + m_grid_dim.x * m_grid_dim.y * d.z;
+}
+
+dim3 kernel_info_t::pcc_dim3(unsigned lin) const {
+  dim3 d;
+  const unsigned gx = m_grid_dim.x, gy = m_grid_dim.y;
+  d.x = lin % gx;
+  d.y = (lin / gx) % gy;
+  d.z = lin / (gx * gy);
+  return d;
+}
+
+// Mirrors the judgement in simt_core_cluster::issue_block2core() (shader.cc):
+// LASP binding takes precedence; STATIC_BINDING is lin % n.
+unsigned kernel_info_t::pcc_home(unsigned lin) const {
+  assert(m_pcc_n > 0);
+  if (m_pcc_static) return lin % m_pcc_n;
+  const dim3 d = pcc_dim3(lin);
+  unsigned h;
+  if (m_lasp_config.policy == lasp::ROW_BINDING) {
+    const unsigned rows = (m_grid_dim.y + m_pcc_n - 1) / m_pcc_n;
+    h = d.y / rows;
+  } else if (m_lasp_config.policy == lasp::COL_BINDING) {
+    const unsigned cols = (m_grid_dim.x + m_pcc_n - 1) / m_pcc_n;
+    h = d.x / cols;
+  } else {  // CHUNK_BINDING
+    const unsigned cs = m_lasp_config.chunk_size ? m_lasp_config.chunk_size : 1;
+    h = (lin / cs) % m_pcc_n;
+  }
+  return (h >= m_pcc_n) ? m_pcc_n - 1 : h;   // same clamp as the issue path
+}
+
+void kernel_info_t::pcc_init(unsigned n_chiplets, bool static_binding) {
+  assert(n_chiplets > 0);
+  m_pcc_n      = n_chiplets;
+  m_pcc_total  = (unsigned)num_blocks();
+  m_pcc_static = static_binding && (m_lasp_config.policy == lasp::KERNEL_WIDE);
+  m_pcc_on     = true;
+  m_pcc_remaining = m_pcc_total;
+  m_pcc_cur.assign(n_chiplets, m_pcc_total);
+  m_pcc_issued.assign(n_chiplets, 0u);
+  m_pcc_last_issue.assign(n_chiplets, 0ull);
+  for (unsigned c = 0; c < n_chiplets; c++)
+    for (unsigned lin = 0; lin < m_pcc_total; lin++)
+      if (pcc_home(lin) == c) { m_pcc_cur[c] = lin; break; }
+  m_next_cta = m_grid_dim;   // sentinel: nothing selected yet
+  m_next_tid.x = 0; m_next_tid.y = 0; m_next_tid.z = 0;
+}
+
+void kernel_info_t::pcc_select(unsigned c) {
+  assert(m_pcc_on && pcc_has_cta(c));
+  m_next_cta = pcc_dim3(m_pcc_cur[c]);
+  m_next_tid.x = 0; m_next_tid.y = 0; m_next_tid.z = 0;
+  m_pcc_issued[c]++;
+}
+
+void kernel_info_t::pcc_advance() {
+  const unsigned lin = pcc_lin(m_next_cta);
+  assert(lin < m_pcc_total && "PCC: increment without a selected CTA");
+  const unsigned c = pcc_home(lin);
+  assert(m_pcc_cur[c] == lin);
+  unsigned nxt = m_pcc_total;
+  for (unsigned i = lin + 1; i < m_pcc_total; i++)
+    if (pcc_home(i) == c) { nxt = i; break; }
+  m_pcc_cur[c] = nxt;
+  assert(m_pcc_remaining > 0);
+  m_pcc_remaining--;
+  m_next_cta = m_grid_dim;   // sentinel until the next pcc_select()
+}
+
+bool kernel_info_t::pcc_all_exhausted() const {
+  return m_pcc_remaining == 0;   // scalar on purpose: no heap access (see gpu-sim.cc kernel_more_cta_left)
 }
 
 kernel_info_t::~kernel_info_t() {

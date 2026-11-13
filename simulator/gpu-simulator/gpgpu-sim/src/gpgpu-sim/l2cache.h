@@ -195,6 +195,23 @@ class memory_sub_partition {
   bool dram_L2_queue_full() const;
   void dram_L2_queue_push(class mem_fetch *mf);
 
+  // H3-3a (speed): "L2->icnt 응답 큐가 비어 있지 않을 수 있음" 미러 바이트.
+  // gpgpu_sim 이 소유한 배열의 칸을 넘겨받아, 이 큐에 넣을 때마다(l2icnt_push) 1 로 켠다.
+  // 끄는 것은 gpgpu_sim 의 mem->icnt pop 루프가 방문 직후 실제 상태로 한다.
+  // 불변식: 바이트가 0 이면 m_L2_icnt_queue 는 비어 있다.
+  void set_l2icnt_mirror(unsigned char *slot) { m_l2icnt_mirror = slot; }
+  bool l2icnt_queue_empty() const { return m_L2_icnt_queue->empty(); }
+
+  // H3-3c (speed): 서브파티션 L2 루프(gpgpu_sim::cycle 의 "l2gmmu" 블록) 용 미러 바이트.
+  // 루프 밖에서 이 서브파티션을 깨울 수 있는 경로 -- DRAM 응답 적재(dram_L2_queue_push),
+  // flushL2, force_l2_tag_update -- 가 1 로 켠다(인터커넥트 출력 버퍼는 라우터 쪽에서 켠다).
+  void set_l2loop_mirror(unsigned char *slot) { m_l2loop_mirror = slot; }
+  // 루프 한 번의 방문이 "L2 캐시 포트 샘플 1회" 외에 아무 일도 하지 않는 상태인가.
+  // 인터커넥트 출력 버퍼가 비었는지는 호출자가 따로 확인한다.
+  bool l2loop_idle(unsigned sector_chunk) const;
+  // 건너뛴 방문 n 번의 부수효과(L2 포트 샘플)를 반영한다. L2 가 꺼져 있으면 부수효과 없음.
+  void add_idle_l2loop_visits(unsigned long long n);
+
   void visualizer_print(gzFile visualizer_file);
   void print_cache_stat(unsigned &accesses, unsigned &misses) const;
   void print(FILE *fp) const;
@@ -210,6 +227,7 @@ class memory_sub_partition {
                            mem_access_sector_mask_t mask) {
     m_L2cache->force_tag_access(addr, m_memcpy_cycle_offset + time, mask);
     m_memcpy_cycle_offset += 1;
+    if (m_l2loop_mirror) *m_l2loop_mirror = 1;   // H3-3c: 보수적으로 깨운다
   }
 
  private:
@@ -233,6 +251,13 @@ class memory_sub_partition {
   fifo_pipeline<mem_fetch> *m_L2_dram_queue;
   fifo_pipeline<mem_fetch> *m_dram_L2_queue;
   fifo_pipeline<mem_fetch> *m_L2_icnt_queue;  // L2 cache hit response queue
+  // H3-3a: m_L2_icnt_queue 에 넣는 유일한 경로. 넣은 뒤 미러를 켠다.
+  unsigned char *m_l2icnt_mirror = nullptr;
+  unsigned char *m_l2loop_mirror = nullptr;   // H3-3c
+  void l2icnt_push(class mem_fetch *mf) {
+    m_L2_icnt_queue->push(mf);
+    if (m_l2icnt_mirror) *m_l2icnt_mirror = 1;
+  }
 
   class mem_fetch *L2dramout;
   unsigned long long int wb_addr;

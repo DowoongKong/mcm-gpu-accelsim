@@ -946,11 +946,15 @@ void shader_core_ctx::decode() {
   }
 }
 
+// T4 (P4-4): see shd_warp_t::note_fetch_event() / shader_core_ctx::p4_note_fetch_event().
+void shd_warp_t::note_fetch_event() { m_shader->p4_note_fetch_event(); }
+
 void shader_core_ctx::fetch() {
   if (!m_inst_fetch_buffer.m_valid) {
     if (m_L1I->access_ready()) {
       mem_fetch *mf = m_L1I->next_access();
       m_warp[mf->get_wid()]->clear_imiss_pending();
+      m_fetch_memo_armed = false;  // T4: that warp just became fetchable again
       m_inst_fetch_buffer =
           ifetch_buffer_t(m_warp[mf->get_wid()]->get_pc(),
                           mf->get_access_size(), mf->get_wid());
@@ -962,6 +966,19 @@ void shader_core_ctx::fetch() {
       m_warp[mf->get_wid()]->set_last_fetch(m_gpu->gpu_sim_cycle);
       delete mf;
     } else {
+      // T4 (P4-4): skip the whole-warp scan while nothing that can change a
+      // verdict has happened since a scan that found nothing (see shader.h).
+      const uint64_t fetch_key = m_p4_issue_epoch +
+                                 m_scoreboard->release_epoch() + m_fetch_epoch;
+      const bool fetch_memo_hit =
+          (m_fetch_memo_armed && m_fetch_memo_key == fetch_key);
+#ifdef P4_CHECK
+      const bool fetch_run_scan = true;   // run anyway, assert the prediction
+#else
+      const bool fetch_run_scan = !fetch_memo_hit;
+#endif
+      bool fetch_acted = false;   // retired or fetched something this scan
+      if (fetch_run_scan) {
       // find an active warp with space in instruction buffer that is not
       // already waiting on a cache miss and get next 1-2 instructions from
       // i-cache...
@@ -974,6 +991,7 @@ void shader_core_ctx::fetch() {
         if (m_warp[warp_id]->hardware_done() &&
             !m_scoreboard->pendingWrites(warp_id) &&
             !m_warp[warp_id]->done_exit()) {
+          fetch_acted = true;  // T4
           bool did_exit = false;
           for (unsigned t = 0; t < m_config->warp_size; t++) {
             unsigned tid = warp_id * m_config->warp_size + t;
@@ -1001,6 +1019,7 @@ void shader_core_ctx::fetch() {
         if (!m_warp[warp_id]->functional_done() &&
             !m_warp[warp_id]->imiss_pending() &&
             m_warp[warp_id]->ibuffer_empty()) {
+          fetch_acted = true;  // T4 (every status below changes state)
           address_type pc;
           pc = m_warp[warp_id]->get_pc();
           address_type ppc = pc + PROGRAM_MEM_START;
@@ -1044,6 +1063,18 @@ void shader_core_ctx::fetch() {
           break;
         }
       }
+      // T4: a scan that neither retired nor fetched touched nothing (no
+      // counter, no m_last_warp_fetched update), so its verdicts hold until
+      // one of the three epochs moves.
+      if (!fetch_acted) {
+        m_fetch_memo_armed = true;
+        m_fetch_memo_key = fetch_key;
+      }
+      }  // fetch_run_scan
+#ifdef P4_CHECK
+      assert(!(fetch_memo_hit && fetch_acted) &&
+             "P4_CHECK(T4): armed fetch memo but the scan retired or fetched");
+#endif
     }
   }
 
@@ -1069,6 +1100,7 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
   m_warp[warp_id]->ibuffer_free();
   assert(next_inst->valid());
   **pipe_reg = *next_inst;  // static instruction information
+  pipe_reg_set.note_external_fill();  // T6: direct copy bypasses move_in()
   (*pipe_reg)->issue(
       active_mask, warp_id, m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle,
       m_warp[warp_id]->get_dynamic_warp_id(), sch_id,
@@ -1951,7 +1983,27 @@ void shader_core_ctx::execute_a() {
       *(m_result_bus[i]) >>= 1;
     }
   }
+  assert(m_num_function_units <= 64 && "T6: m_fu_busy_mask holds 64 units");
   for (unsigned n = 0; n + 1 < m_num_function_units; n++) {
+    register_set &issue_inst = m_pipeline_reg[m_issue_port[n]];
+    const unsigned long long fu_bit = 1ull << n;
+    // T6 (P4-5): a unit whose pipeline is idle and whose issue register set
+    // is empty has nothing to do this cycle -- its cycle() would be skipped by
+    // 44-7 below and the issue test is false. Both facts are held in per-SM
+    // state (m_fu_busy_mask, recomputed at the end of every run of this body,
+    // and register_set::any_occupied()), so the skip costs two loads instead
+    // of the virtual pipe_idle() plus two slot dereferences per unit. Exact:
+    // a non-ldst unit's pipeline state changes only inside this body (cycle()
+    // and issue()), and its issue set is filled only by the operand collector
+    // through register_set::move_in, which cannot make any_occupied() false.
+    if (!(m_fu_busy_mask & fu_bit) && !issue_inst.any_occupied()) {
+#ifdef P4_CHECK
+      assert(m_fu[n]->pipe_idle() && "P4_CHECK(T6): busy bit clear, unit busy");
+      assert(!issue_inst.has_ready() && "P4_CHECK(T6): occupancy 0, slot full");
+      assert(issue_inst.occupancy_consistent());
+#endif
+      continue;
+    }
     // 44-7 (P4-2): a completely idle unit's cycle() is a no-op (all three
     // branches false, occupied zero so the shift moves nothing) and its
     // active-lane accounting adds zero (power sim off path) -- skip both.
@@ -1961,31 +2013,43 @@ void shader_core_ctx::execute_a() {
       for (unsigned c = 0; c < multiplier; c++) m_fu[n]->cycle();
       m_fu[n]->active_lanes_in_pipeline();
     }
-    unsigned issue_port = m_issue_port[n];
-    register_set &issue_inst = m_pipeline_reg[issue_port];
     unsigned reg_id;
     bool partition_issue =
         m_config->sub_core_model && m_fu[n]->is_issue_partitioned();
     if (partition_issue) {
       reg_id = m_fu[n]->get_issue_reg_id();
     }
-    warp_inst_t **ready_reg = issue_inst.get_ready(partition_issue, reg_id);
-    if (issue_inst.has_ready(partition_issue, reg_id) &&
-        m_fu[n]->can_issue(**ready_reg)) {
-      bool schedule_wb_now = !m_fu[n]->stallable();
-      int resbus = -1;
-      if (schedule_wb_now &&
-          (resbus = test_res_bus((*ready_reg)->latency)) != -1) {
-        assert((*ready_reg)->latency < MAX_ALU_LATENCY);
-        m_result_bus[resbus]->set((*ready_reg)->latency);
-        m_result_bus_active++;  // 44-7: test_res_bus picked a clear bit
-        m_fu[n]->issue(issue_inst);
-      } else if (!schedule_wb_now) {
-        m_fu[n]->issue(issue_inst);
-      } else {
-        // stall issue (cannot reserve result bus)
+    // T6: test has_ready() before get_ready() -- the latter dereferences the
+    // slots (and scans them all in the non-partitioned case) and is only
+    // meaningful when something is there. Neither call has side effects, so
+    // this is the original "get_ready; if (has_ready && ...)" in a cheaper
+    // order.
+    if (issue_inst.has_ready(partition_issue, reg_id)) {
+      warp_inst_t **ready_reg = issue_inst.get_ready(partition_issue, reg_id);
+      if (m_fu[n]->can_issue(**ready_reg)) {
+        bool schedule_wb_now = !m_fu[n]->stallable();
+        int resbus = -1;
+        if (schedule_wb_now &&
+            (resbus = test_res_bus((*ready_reg)->latency)) != -1) {
+          assert((*ready_reg)->latency < MAX_ALU_LATENCY);
+          m_result_bus[resbus]->set((*ready_reg)->latency);
+          m_result_bus_active++;  // 44-7: test_res_bus picked a clear bit
+          m_fu[n]->issue(issue_inst);
+        } else if (!schedule_wb_now) {
+          m_fu[n]->issue(issue_inst);
+        } else {
+          // stall issue (cannot reserve result bus)
+        }
       }
     }
+    // T6: remember whether this unit needs a body run next cycle.
+    if (m_fu[n]->pipe_idle())
+      m_fu_busy_mask &= ~fu_bit;
+    else
+      m_fu_busy_mask |= fu_bit;
+#ifdef P4_CHECK
+    assert(issue_inst.occupancy_consistent());
+#endif
   }
   m_ldst_unit->cycle_a();
 }
@@ -2004,23 +2068,32 @@ void shader_core_ctx::execute_c() {
   if (partition_issue) {
     reg_id = m_fu[n]->get_issue_reg_id();
   }
-  warp_inst_t **ready_reg = issue_inst.get_ready(partition_issue, reg_id);
-  if (issue_inst.has_ready(partition_issue, reg_id) &&
-      m_fu[n]->can_issue(**ready_reg)) {
-    bool schedule_wb_now = !m_fu[n]->stallable();
-    int resbus = -1;
-    if (schedule_wb_now &&
-        (resbus = test_res_bus((*ready_reg)->latency)) != -1) {
-      assert((*ready_reg)->latency < MAX_ALU_LATENCY);
-      m_result_bus[resbus]->set((*ready_reg)->latency);
-      m_result_bus_active++;  // 44-7: test_res_bus picked a clear bit
-      m_fu[n]->issue(issue_inst);
-    } else if (!schedule_wb_now) {
-      m_fu[n]->issue(issue_inst);
-    } else {
-      // stall issue (cannot reserve result bus)
+  // T11 (P4-10): same reorder as T6's execute_a -- one occupancy load, then
+  // has_ready(), and get_ready() only when something is there. Neither
+  // query has side effects, so the issue decision is unchanged.
+  if (issue_inst.any_occupied() &&
+      issue_inst.has_ready(partition_issue, reg_id)) {
+    warp_inst_t **ready_reg = issue_inst.get_ready(partition_issue, reg_id);
+    if (m_fu[n]->can_issue(**ready_reg)) {
+      bool schedule_wb_now = !m_fu[n]->stallable();
+      int resbus = -1;
+      if (schedule_wb_now &&
+          (resbus = test_res_bus((*ready_reg)->latency)) != -1) {
+        assert((*ready_reg)->latency < MAX_ALU_LATENCY);
+        m_result_bus[resbus]->set((*ready_reg)->latency);
+        m_result_bus_active++;  // 44-7: test_res_bus picked a clear bit
+        m_fu[n]->issue(issue_inst);
+      } else if (!schedule_wb_now) {
+        m_fu[n]->issue(issue_inst);
+      } else {
+        // stall issue (cannot reserve result bus)
+      }
     }
   }
+#ifdef P4_CHECK
+  assert(issue_inst.occupancy_consistent() &&
+         m_pipeline_reg[EX_WB].occupancy_consistent());
+#endif
 }
 
 void ldst_unit::print_cache_stats(FILE *fp, unsigned &dl1_accesses,
@@ -2132,6 +2205,11 @@ void shader_core_ctx::writeback() {
   m_stats->m_last_num_sim_insn[m_sid] = m_stats->m_num_sim_insn[m_sid];
   m_stats->m_last_num_sim_winsn[m_sid] = m_stats->m_num_sim_winsn[m_sid];
 
+  // T11 (P4-10): an empty EX_WB set makes get_ready() scan all its slots (8
+  // dereferences) and return NULL. any_occupied() (T6 counter, exact for
+  // EX_WB: filled by move_in, drained by the in-place clear below) answers
+  // that with one load; the loop below is unreachable when it is false.
+  if (!m_pipeline_reg[EX_WB].any_occupied()) return;
   warp_inst_t **preg = m_pipeline_reg[EX_WB].get_ready();
   warp_inst_t *pipe_reg = (preg == NULL) ? NULL : *preg;
   while (preg and !pipe_reg->empty()) {
@@ -2162,6 +2240,7 @@ void shader_core_ctx::writeback() {
     m_last_inst_gpu_sim_cycle = m_gpu->gpu_sim_cycle;
     m_last_inst_gpu_tot_sim_cycle = m_gpu->gpu_tot_sim_cycle;
     pipe_reg->clear();
+    m_pipeline_reg[EX_WB].note_external_clear();  // T6: in-place clear
     preg = m_pipeline_reg[EX_WB].get_ready();
     pipe_reg = (preg == NULL) ? NULL : *preg;
   }
@@ -2292,6 +2371,7 @@ mem_stage_stall_type ldst_unit::process_memory_access_queue_l1cache(
       if ((l1_latency_queue[bank_id][m_config->m_L1D_config.l1_latency - 1]) ==
           NULL) {
         l1_latency_queue[bank_id][m_config->m_L1D_config.l1_latency - 1] = mf;
+        m_l1q_count[bank_id]++;  // T8
 
         if (mf->get_inst().is_store()) {
           unsigned inc_ack =
@@ -2337,6 +2417,15 @@ mem_stage_stall_type ldst_unit::process_memory_access_queue_l1cache(
 
 void ldst_unit::L1_latency_queue_cycle() {
   for (unsigned int j = 0; j < m_config->m_L1D_config.l1_banks; j++) {
+    // T8 (P4-7): an empty bank has no head to service and nothing to shift.
+    if (m_l1q_count[j] == 0) {
+#ifdef P4_CHECK
+      for (unsigned st = 0; st < m_config->m_L1D_config.l1_latency; st++)
+        assert(l1_latency_queue[j][st] == NULL &&
+               "P4_CHECK(T8): count 0 but a latency-queue slot is occupied");
+#endif
+      continue;
+    }
     if ((l1_latency_queue[j][0]) != NULL) {
       mem_fetch *mf_next = l1_latency_queue[j][0];
       std::list<cache_event> events;
@@ -2352,6 +2441,7 @@ void ldst_unit::L1_latency_queue_cycle() {
       if (status == HIT) {
         assert(!read_sent);
         l1_latency_queue[j][0] = NULL;
+        m_l1q_count[j]--;  // T8
         if (mf_next->get_inst().is_load()) {
           for (unsigned r = 0; r < MAX_OUTPUT_VALUES; r++)
             if (mf_next->get_inst().out[r] > 0) {
@@ -2402,6 +2492,7 @@ void ldst_unit::L1_latency_queue_cycle() {
       } else {
         assert(status == MISS || status == HIT_RESERVED);
         l1_latency_queue[j][0] = NULL;
+        m_l1q_count[j]--;  // T8
         if (m_config->m_L1D_config.get_write_policy() != WRITE_THROUGH &&
             mf_next->get_inst().is_store() &&
             (m_config->m_L1D_config.get_write_allocate_policy() ==
@@ -2426,6 +2517,14 @@ void ldst_unit::L1_latency_queue_cycle() {
         l1_latency_queue[j][stage] = l1_latency_queue[j][stage + 1];
         l1_latency_queue[j][stage + 1] = NULL;
       }
+#ifdef P4_CHECK
+    {
+      unsigned c = 0;
+      for (unsigned st = 0; st < m_config->m_L1D_config.l1_latency; st++)
+        if (l1_latency_queue[j][st] != NULL) c++;
+      assert(c == m_l1q_count[j] && "P4_CHECK(T8): latency-queue count drift");
+    }
+#endif
   }
 }
 
@@ -2532,14 +2631,9 @@ bool ldst_unit::memory_cycle(warp_inst_t &inst,
       // scan, the scan is a pure re-read and would end any_pending again --
       // skip it. Guarded off when L1 TLB ports are modeled (PORT_BUSY probes
       // record l1_port_polls per attempt, which skipping would lose).
-      const bool memo_ok = (m_l1_tlb_4k->ports() == 0) &&
-                           (!m_l1_tlb_64k || m_l1_tlb_64k->ports() == 0) &&
-                           (!m_l1_tlb_2m  || m_l1_tlb_2m->ports()  == 0);
+      const bool memo_ok = xlat_l1_ports_off();
       if (memo_ok) {
-        auto pit = m_xlat_probe_memo.find(wid);
-        if (pit != m_xlat_probe_memo.end() &&
-            pit->second.second == inst.get_uid() &&
-            pit->second.first == l1_xlat_epoch_sum()) {
+        if (xlat_memo_match(inst)) {   // T2: shared core, see xlat_memo_hit()
           if (m_decouple_tlb) { m_dispatch_parked = true; return true; }
           stall_reason = TLB_STALL;
           bool iswrite = inst.is_store();
@@ -2575,7 +2669,13 @@ bool ldst_unit::memory_cycle(warp_inst_t &inst,
         // 44-5: remember the post-scan epoch; a later dispatch of this same
         // instruction re-scans only after the epoch moves.
         if (memo_ok)
-          m_xlat_probe_memo[wid] = {l1_xlat_epoch_sum(), inst.get_uid()};
+        {  // T9: array slot; same two values as the old map entry
+          xlat_memo_t m;
+          m.valid = true;
+          m.epoch = l1_xlat_epoch_sum();
+          m.uid = inst.get_uid();
+          m_xlat_probe_memo[wid] = m;
+        }
         if (m_decouple_tlb) { m_dispatch_parked = true; return true; }
         stall_reason = TLB_STALL;
         bool iswrite = inst.is_store();
@@ -2646,7 +2746,7 @@ bool ldst_unit::memory_cycle(warp_inst_t &inst,
     m_xlat_table_4k.erase(wid);
     m_xlat_table_64k.erase(wid);
     m_xlat_table_2m.erase(wid);
-    m_xlat_probe_memo.erase(wid);  // 44-5
+    m_xlat_probe_memo[wid].valid = false;  // 44-5 (T9: array slot)
   }
   return inst.accessq_empty();
 }
@@ -2926,6 +3026,11 @@ void ldst_unit::init(mem_fetch_interface *icnt,
   m_stats = stats;
   m_sid = sid;
   m_tpc = tpc;
+  // T9: per-warp arrays (see shader.h); warp ids are < max_warps_per_shader.
+  m_xlat_parked.init(config->max_warps_per_shader);
+  m_xlat_in_park_order.assign(config->max_warps_per_shader, 0);
+  m_xlat_wake_pending.assign(config->max_warps_per_shader, 0);
+  m_xlat_probe_memo.assign(config->max_warps_per_shader, xlat_memo_t());
 #define STRSIZE 1024
   char L1T_name[STRSIZE];
   char L1C_name[STRSIZE];
@@ -2967,6 +3072,9 @@ ldst_unit::ldst_unit(mem_fetch_interface *icnt,
     m_L1D = new l1_cache(L1D_name, m_config->m_L1D_config, m_sid,
                          get_shader_normal_cache_id(), m_icnt, m_mf_allocator,
                          IN_L1D_MISS_QUEUE, core->get_gpu(), L1_GPU_CACHE);
+    // H2-C: let the per-cycle L1-flush sweep see "was this cluster's L1 touched"
+    // from one contiguous array instead of reaching into every core's tag_array.
+    m_L1D->set_used_mirror(core->get_gpu()->l1_used_mirror_slot(m_sid));
     // (P4)
     m_l1_tlb_4k = new gpu_l1_tlb(
       m_config->gpgpu_l1_tlb_4k_sets,    // 1  (fully-associative)
@@ -3021,6 +3129,7 @@ ldst_unit::ldst_unit(mem_fetch_interface *icnt,
     for (unsigned j = 0; j < m_config->m_L1D_config.l1_banks; j++)
       l1_latency_queue[j].resize(m_config->m_L1D_config.l1_latency,
                                  (mem_fetch *)NULL);
+    m_l1q_count.assign(m_config->m_L1D_config.l1_banks, 0);  // T8
   }
   m_name = "MEM ";
 }
@@ -3099,9 +3208,15 @@ void ldst_unit::writeback() {
         }
       }
       if (insn_completed) {
-        m_core->warp_inst_complete(m_next_wb);
         if (m_next_wb.m_is_ldgsts) {
+          // LDGSTS has no output register, so the memory stage already called
+          // warp_inst_complete when it left the dispatch register (cycle_c,
+          // "release LDGSTS"). Completing it again here counted every active
+          // LDGSTS twice in the warp/thread instruction statistics. Only release
+          // the dependency bar, as the L1 hit path in L1_latency_queue_cycle does.
           m_core->unset_depbar(m_next_wb);
+        } else {
+          m_core->warp_inst_complete(m_next_wb);
         }
       }
 
@@ -3313,7 +3428,7 @@ void ldst_unit::cycle_b() {
 
       // Poll L2 TLB for completed VPN translations (MISS/MSHR_HIT path only).
       // L2 HIT path fills L1 TLB directly in memory_cycle(); those VPNs have
-      // ready=true in L1 MSHR already and are not returned by get_pending_vpns().
+      // ready=true in L1 MSHR already and are not visited by for_each_pending().
       // P-1 (speed-audit V3 fix): the scan can only find work after a fill on
       // this L2 TLB (nothing else sets pte_ready), and a scan that finds
       // nothing mutates nothing -- so skip it while fill_seq() stands still.
@@ -3321,7 +3436,10 @@ void ldst_unit::cycle_b() {
       // completions in exactly the order the per-cycle poll always did.
       // An unused TLB (empty 64k/2m config) never fills -> never scans.
       if (l2_tlb->fill_seq() != m_l2_fill_seen[p]) {
-        for (uint64_t vpn : mshr.get_pending_vpns()) {
+        // T1-c: iterate the MSHR in place (same container order the old
+        // per-fill vector snapshot had). The body only sets ready on the
+        // visited vpn (fill -> mark_ready); no entry is added or erased here.
+        auto consume = [&](uint64_t vpn) {
           gpu_pte_t pte;
           // query_completed() checks pte_ready and removes this cluster_id.
           // Returns true once GMMU complete_walk() called l2_tlb->fill().
@@ -3338,7 +3456,39 @@ void ldst_unit::cycle_b() {
                   (unsigned long long)vpn, (unsigned long long)pte.pfn());
             #endif
           }
+        };
+        // T10 (P4-9): the scan above answers "which of my pending VPNs did the
+        // L2 complete?" by probing every pending L1 MSHR entry (a hash lookup
+        // each) on every SM of the chiplet whenever any fill happened. The L2
+        // keeps that answer per cluster (ready_for(): exactly the VPNs for
+        // which query_completed() would return true), so: nothing on the list
+        // that is still pending here -> the scan would consume nothing; exactly
+        // one -> the scan would consume exactly that VPN (query_completed() is
+        // mutation-free when false, so visiting the others changed nothing);
+        // two or more -> run the scan itself, so the L1 fills keep the MSHR
+        // container order. Members no longer pending here are kept (see
+        // gpu_l2_tlb::ready_for) and filtered again next time.
+        std::vector<uint64_t> &rc = l2_tlb->ready_for(m_tpc);
+        unsigned n_live = 0;
+        uint64_t only_vpn = 0;
+        for (size_t k = 0; k < rc.size(); k++)
+          if (mshr.is_pending(rc[k])) {
+            n_live++;
+            only_vpn = rc[k];
+          }
+#ifdef P4_CHECK
+        {
+          unsigned slow = 0;
+          mshr.for_each_pending([&](uint64_t vpn) {
+            if (l2_tlb->completable(vpn, m_tpc)) slow++;
+          });
+          assert(slow == n_live && "P4_CHECK(T10): ready list != MSHR scan");
         }
+#endif
+        if (n_live == 1)
+          consume(only_vpn);
+        else if (n_live > 1)
+          mshr.for_each_pending(consume);
         m_l2_fill_seen[p] = l2_tlb->fill_seq();
       }
       l1_tlb->cycle(cur_cycle);  // drain mark_ready'd MSHR entries; unchanged
@@ -3348,15 +3498,15 @@ void ldst_unit::cycle_b() {
         l1_tlb_mshr::l1_fill_token tok = cmshr.next_access();
         if (m_decouple_tlb)
           for (unsigned w : tok.waiters) {
-            if (m_xlat_parked.count(w)) m_xlat_replay_q.push_back(w);
-            else                           m_xlat_wake_pending.insert(w);  // don't drop; deliver on re-park
+            if (m_xlat_parked.has(w)) m_xlat_replay_q.push_back(w);
+            else                         wset_insert(m_xlat_wake_pending, w);  // don't drop; deliver on re-park
           }
       }
       // P5: wake parked warps whose lookup resolved to a cached HIT (no MSHR entry).
       unsigned hit_w;
       while (l1_tlb->pop_hit_wakeup(hit_w)) {
-        if (m_xlat_parked.count(hit_w)) m_xlat_replay_q.push_back(hit_w);
-        else                               m_xlat_wake_pending.insert(hit_w);  // don't drop; deliver on re-park
+        if (m_xlat_parked.has(hit_w)) m_xlat_replay_q.push_back(hit_w);
+        else                             wset_insert(m_xlat_wake_pending, hit_w);  // don't drop; deliver on re-park
       }
       // Drain L1->L2 request queue (P3): send one queued miss to L2 per cycle.
       // req_va is the page base; huge-page allocations are page-aligned, so it
@@ -3376,9 +3526,43 @@ void ldst_unit::cycle_b() {
         // the head-of-line block (observed: L2 concurrent_max stuck at exactly
         // issue_width). Only new hand-overs and rejections cost bandwidth.
         const unsigned issue_width = m_core->get_config()->gpgpu_l2_tlb_issue_width;
+        // T16 (P4-13): if the last complete walk left every entry asleep and
+        // nothing that can wake one has happened since (no new entry, no gate
+        // expired, no set epoch moved, no consumption for merge-cap waiters,
+        // table still full for table-full waiters), this walk would visit
+        // every entry, call nothing and only charge the skip counters. Charge
+        // them in one batch and skip the walk. See gpu_l1_tlb::walk_memo_t.
+        gpu_l1_tlb::walk_memo_t &wm = l1_tlb->walk_memo();
+        if (wm.armed && wm.enq_seq == l1_tlb->l2_req_enq_seq() &&
+            (wm.n_gated == 0 || cur_cycle < wm.min_next_poll) &&
+            l2_tlb->ep_set_any() == wm.ep_set_any &&
+            (wm.n_merge == 0 || l2_tlb->ep_consume() == wm.ep_consume) &&
+            (wm.n_table == 0 || l2_tlb->table_full())) {
+#ifdef P4_CHECK
+          {  // re-derive every entry's verdict the way the walk would
+            unsigned g = 0, mm = 0, tt = 0;
+            for (auto it = l1_tlb->l2_req_begin(); it != l1_tlb->l2_req_end(); ++it) {
+              if (cur_cycle < it->next_poll) { g++; continue; }
+              assert(it->wait_epoch != 0 &&
+                     l2_tlb->ep_set_idx((unsigned)it->wait_ep3) == it->wait_ep2 &&
+                     (it->wait_merge ? (l2_tlb->ep_consume() == it->wait_epoch)
+                                     : l2_tlb->table_full()) &&
+                     "P4_CHECK(T16): walk memo armed but an entry is eligible");
+              if (it->wait_merge) mm++; else tt++;
+            }
+            assert(g == wm.n_gated && mm == wm.n_merge && tt == wm.n_table &&
+                   "P4_CHECK(T16): walk memo counts drift");
+          }
+#endif
+          l2_tlb->note_gate_pending_n(wm.n_gated);
+          l2_tlb->note_mshr_full_skip_n(wm.n_merge, wm.n_table);
+        } else {
+        wm.armed = false;
         unsigned sent = 0;
-        for (auto it = l1_tlb->l2_req_begin();
-             it != l1_tlb->l2_req_end() && sent < issue_width; ) {
+        unsigned n_gated = 0, n_merge = 0, n_table = 0, n_eligible = 0;  // T16
+        uint64_t min_poll = ~0ull;
+        auto it = l1_tlb->l2_req_begin();
+        for (; it != l1_tlb->l2_req_end() && sent < issue_width; ) {
           // 44-3: while the L2 probe gate for this entry is still open, the
           // call would answer LOOKUP_PENDING with no state change and no link
           // use. Skip it entirely; reproduce the one gate_pending count the
@@ -3386,6 +3570,8 @@ void ldst_unit::cycle_b() {
           // pending (the gate is only rewritten on arm / post-expiry re-arm).
           if (cur_cycle < it->next_poll) {
             l2_tlb->note_gate_pending();
+            n_gated++;                                            // T16
+            if (it->next_poll < min_poll) min_poll = it->next_poll;
             ++it;
             continue;
           }
@@ -3393,8 +3579,27 @@ void ldst_unit::cycle_b() {
           // type) is a pure function of L2 (array, MSHR) state, frozen while
           // the L2 state epoch stands still -- skip the call and charge the
           // same counters one reached-cycle at a time.
-          if (it->wait_epoch != 0 && l2_tlb->mshr_epoch() == it->wait_epoch) {
+          // T12 (P4-11): compare only the epochs that can flip THIS entry's
+          // verdict (see gpu_l2_tlb::ep_*); the single global epoch woke every
+          // frozen entry on every MSHR mutation (~1,600 re-polls per chiplet
+          // on ~30% of the cycles, D1b), almost all answering MSHR_FULL again.
+          // T13: table-full waiters read the live table state instead of an
+          // erase epoch -- once the first waiter of the cycle took the freed
+          // slot, the rest are provably MSHR_FULL(table) again.
+          if (it->wait_epoch != 0 &&
+              l2_tlb->ep_set_idx((unsigned)it->wait_ep3) == it->wait_ep2 &&
+              (it->wait_merge ? (l2_tlb->ep_consume() == it->wait_epoch)
+                              : l2_tlb->table_full())) {
+#ifdef P4_CHECK
+            {
+              bool chk_merge = false;
+              assert(l2_tlb->full_verdict(it->vpn, &chk_merge) &&
+                     chk_merge == it->wait_merge &&
+                     "P4_CHECK(T12): frozen verdict changed with no typed epoch");
+            }
+#endif
             l2_tlb->note_mshr_full_skip(it->wait_merge);
+            if (it->wait_merge) n_merge++; else n_table++;         // T16
             ++it;
             continue;
           }
@@ -3407,8 +3612,11 @@ void ldst_unit::cycle_b() {
                                                &pending_until, &full_kind);
           if (pending_until) it->next_poll = pending_until;
           if (full_kind) {          // 44-4: arm the epoch skip (no L2 mutation
-            it->wait_epoch = l2_tlb->mshr_epoch();  // happened on this verdict)
-            it->wait_merge = (full_kind == 1u);
+            it->wait_merge = (full_kind == 1u);       // happened on this verdict)
+            // T12/T13: snapshot what this verdict depends on (set index once).
+            it->wait_ep3 = l2_tlb->set_of(it->vpn);
+            it->wait_ep2 = l2_tlb->ep_set_idx((unsigned)it->wait_ep3);
+            it->wait_epoch = it->wait_merge ? l2_tlb->ep_consume() : 1;  // T14: 1 = frozen
           } else {
             it->wait_epoch = 0;     // any other answer: poll normally again
           }
@@ -3423,12 +3631,52 @@ void ldst_unit::cycle_b() {
             }
             it = l1_tlb->l2_req_erase(it);          // resolved -> remove
           } else {
+            // T16: classify the entry's state after this call, the way the
+            // next walk's first two tests would see it.
+            if (cur_cycle < it->next_poll) {
+              n_gated++;
+              if (it->next_poll < min_poll) min_poll = it->next_poll;
+            } else if (it->wait_epoch != 0) {
+              if (it->wait_merge) n_merge++; else n_table++;
+            } else {
+              n_eligible++;
+            }
             ++it;                                   // still pending -> skip, do not block
           }
         }
+        // T16: arm only when the loop reached the end (no budget stop) and
+        // left no eligible entry; snapshot what the skip test compares.
+        if (it == l1_tlb->l2_req_end() && n_eligible == 0) {
+          wm.armed = true;
+          wm.n_gated = n_gated; wm.n_merge = n_merge; wm.n_table = n_table;
+          wm.min_next_poll = min_poll;
+          wm.ep_set_any = l2_tlb->ep_set_any();
+          wm.ep_consume = l2_tlb->ep_consume();
+          wm.enq_seq = l1_tlb->l2_req_enq_seq();
+        }
+        }  // T16 else (walk)
       }
     }
   }
+}
+
+// T2: the exact condition under which memory_cycle(inst) returns true with
+// m_dispatch_parked set and NO other side effect. Mirrors, in order, the early
+// returns of memory_cycle() (empty / space / active lanes / access queue), the
+// tlb_on and ideal-TLB guards, the decoupled-TLB park, the ports guard of the
+// 44-5 memo and finally the memo match itself. Any false here means the SAFETY
+// NET must dispatch for real.
+bool ldst_unit::xlat_memo_hit(const warp_inst_t &inst) const {
+  if (inst.empty()) return false;
+  const auto sp = inst.space.get_type();
+  if (sp != global_space && sp != local_space && sp != param_space_local) return false;
+  if (inst.active_count() == 0) return false;
+  if (inst.accessq_empty()) return false;
+  if (!(m_l1_tlb_4k && m_gpu && m_gpu->get_gpu_module())) return false;  // tlb_on
+  if (m_config->gpgpu_tlb_ideal) return false;
+  if (!m_decouple_tlb) return false;
+  if (!xlat_l1_ports_off()) return false;
+  return xlat_memo_match(inst);
 }
 
 // B5..B9: cache cycles, XLATLAT sampling, replay / SAFETY NET, memory_cycle,
@@ -3468,11 +3716,11 @@ void ldst_unit::cycle_c() {
     // defensive: only dispatch if actually parked. A stale/duplicate replay id
     // (warp already dispatched) would otherwise default-construct a garbage
     // inst via operator[].
-    auto it = m_xlat_parked.find(w);
-    if (it != m_xlat_parked.end() && !it->second.empty()) {
-      *m_dispatch_reg = std::move(it->second.front());
-      it->second.pop_front();
-      if (it->second.empty()) m_xlat_parked.erase(it);
+    std::deque<warp_inst_t> *pq = m_xlat_parked.find(w);  // T9
+    if (pq && !pq->empty()) {
+      *m_dispatch_reg = std::move(pq->front());
+      pq->pop_front();
+      if (pq->empty()) m_xlat_parked.erase(w);
     }
   }
   // SAFETY NET (level-triggered replay): nothing queued for replay but parked
@@ -3488,22 +3736,46 @@ void ldst_unit::cycle_c() {
     m_dprobe_safetynet_fires++;
     m_dprobe_safetynet_last_cycle =
         m_core->get_gpu()->gpu_sim_cycle + m_core->get_gpu()->gpu_tot_sim_cycle;
-    auto it = m_xlat_parked.end();
+    std::deque<warp_inst_t> *pq = NULL;  // T9: array-backed lookup
+    unsigned wsrv = 0;
     while (!m_xlat_park_order.empty()) {
       const unsigned cand = m_xlat_park_order.front();
       m_xlat_park_order.pop_front();
-      m_xlat_in_park_order.erase(cand);   // V7a: entry consumed (stale or served)
-      it = m_xlat_parked.find(cand);
-      if (it != m_xlat_parked.end() && !it->second.empty()) break;
-      it = m_xlat_parked.end();
+      pq = m_xlat_parked.find(cand);
+      if (pq && !pq->empty()) {  // live (T2: set entry kept, see below)
+        wsrv = cand;
+        break;
+      }
+      wset_erase(m_xlat_in_park_order, cand);   // V7a: stale entry consumed
+      pq = NULL;
     }
-    if (it != m_xlat_parked.end()) {
-      const unsigned wsrv = it->first;
-      *m_dispatch_reg = std::move(it->second.front());
-      it->second.pop_front();
-      if (it->second.empty()) {
-        m_xlat_parked.erase(it);
-      } else if (m_xlat_in_park_order.insert(wsrv).second) {
+    if (pq) {
+      // T2 shortcut. If memory_cycle() would answer this instruction with the
+      // 44-5 memo ("nothing on this SM's TLBs moved since its last full scan"),
+      // the dispatch below is a pure round trip: dispatch reg <- front, the
+      // other *_cycle() calls return immediately (space is global/local),
+      // memory_cycle() parks it again without touching state, and the re-park
+      // block pushes it to the BACK of its deque and re-queues the warp. Make
+      // that end state directly: rotate the deque, re-queue the warp, deliver
+      // a stashed wakeup. m_xlat_in_park_order already holds wsrv (the
+      // original erase + insert pair is a no-op) and the dispatch reg stays
+      // empty. Everything else (counters above, m_mem_rc) is set as before.
+      if (xlat_memo_hit(pq->front())) {
+        if (pq->size() > 1) {
+          pq->push_back(std::move(pq->front()));
+          pq->pop_front();
+        }
+        m_xlat_park_order.push_back(wsrv);
+        m_mem_rc = NO_RC_FAIL;
+        if (wset_erase(m_xlat_wake_pending, wsrv)) m_xlat_replay_q.push_back(wsrv);
+        return;
+      }
+      wset_erase(m_xlat_in_park_order, wsrv);   // V7a: entry consumed (served) -- the pre-T2 order
+      *m_dispatch_reg = std::move(pq->front());
+      pq->pop_front();
+      if (pq->empty()) {
+        m_xlat_parked.erase(wsrv);
+      } else if (wset_insert(m_xlat_in_park_order, wsrv)) {
         // V7a: still holds parked instructions -> re-queue at the back so the
         // backstop can reach them even if every edge-triggered wakeup is lost.
         m_xlat_park_order.push_back(wsrv);
@@ -3523,7 +3795,7 @@ void ldst_unit::cycle_c() {
 
   if (m_dispatch_parked) {                 // set-aside, free the dispatch reg
     unsigned w = pipe_reg.warp_id();
-    m_xlat_parked[w].push_back(std::move(pipe_reg));  // cleared right below
+    m_xlat_parked.at_or_insert(w).push_back(std::move(pipe_reg));  // cleared right below (T9)
     // V7a (model revision, user-approved): the backstop queue holds at most ONE
     // entry per currently-parked warp (set-deduped). This bounds the queue by
     // the warp count instead of the total park count (the old queue grew
@@ -3531,13 +3803,13 @@ void ldst_unit::cycle_c() {
     // see the refuted first attempt in the fix log). Every parked instruction
     // stays backstop-reachable: the safety net re-queues a served warp below
     // while it still holds parked instructions.
-    if (m_xlat_in_park_order.insert(w).second) m_xlat_park_order.push_back(w);
+    if (wset_insert(m_xlat_in_park_order, w)) m_xlat_park_order.push_back(w);
     m_dispatch_reg->clear();
     m_dispatch_parked = false;
     // A fill/wakeup that landed while this warp was momentarily unparked was
     // stashed in m_xlat_wake_pending; deliver it now so the warp replays next
     // cycle (deterministic, cycle-accurate) instead of relying on the backstop.
-    if (m_xlat_wake_pending.erase(w)) m_xlat_replay_q.push_back(w);
+    if (wset_erase(m_xlat_wake_pending, w)) m_xlat_replay_q.push_back(w);
     return;   // do NOT complete / release regs / dec_inst_in_pipeline
   }
 
@@ -4910,6 +5182,16 @@ void opndcoll_rfu_t::init(unsigned num_banks, shader_core_ctx *shader) {
   for (unsigned j = 0; j < m_dispatch_units.size(); j++) {
     m_dispatch_units[j].init(sub_core_model, m_num_warp_scheds);
   }
+  // T7: distinct input register sets for idle().
+  m_in_sets.clear();
+  for (unsigned p = 0; p < m_in_ports.size(); p++)
+    for (unsigned i = 0; i < m_in_ports[p].m_in.size(); i++) {
+      register_set *rs = m_in_ports[p].m_in[i];
+      bool seen = false;
+      for (unsigned k = 0; k < m_in_sets.size(); k++)
+        if (m_in_sets[k] == rs) seen = true;
+      if (!seen) m_in_sets.push_back(rs);
+    }
   m_initialized = true;
 }
 
@@ -4967,6 +5249,31 @@ bool opndcoll_rfu_t::writeback(warp_inst_t &inst) {
     }
   }
   return true;
+}
+
+// T7 (P4-6): O(#distinct input sets) test replacing the T5 scan over every
+// collector unit and every input-port slot. Exact: m_busy_cus counts the
+// collector units with m_free == false (flipped only in allocate()/dispatch(),
+// which report here), and any_occupied() == has_ready() for the input sets
+// (their slots are filled only by shader_core_ctx::issue_warp -- which calls
+// note_external_fill -- and drained only by collector_unit_t::allocate's
+// move_out_to). P4_CHECK builds recompute the original predicate and compare.
+bool opndcoll_rfu_t::idle() {
+  bool fast = (m_busy_cus == 0);
+  for (unsigned i = 0; fast && i < m_in_sets.size(); i++)
+    if (m_in_sets[i]->any_occupied()) fast = false;
+#ifdef P4_CHECK
+  bool slow = true;
+  for (unsigned k = 0; k < m_cu.size(); k++)
+    if (!m_cu[k]->is_free()) slow = false;
+  for (unsigned p = 0; p < m_in_ports.size(); p++)
+    for (unsigned i = 0; i < m_in_ports[p].m_in.size(); i++)
+      if (m_in_ports[p].m_in[i]->has_ready()) slow = false;
+  assert(fast == slow && "P4_CHECK(T7): fast idle() disagrees with the scan");
+  for (unsigned i = 0; i < m_in_sets.size(); i++)
+    assert(m_in_sets[i]->occupancy_consistent());
+#endif
+  return fast;
 }
 
 void opndcoll_rfu_t::dispatch_ready_cu() {
@@ -5120,6 +5427,7 @@ bool opndcoll_rfu_t::collector_unit_t::allocate(register_set *pipeline_reg_set,
   assert(m_free);
   assert(m_not_ready.none());
   m_free = false;
+  m_rfu->cu_allocated();  // T7
   m_output_register = output_reg_set;
   warp_inst_t **pipeline_reg = pipeline_reg_set->get_ready();
   if ((pipeline_reg) and !((*pipeline_reg)->empty())) {
@@ -5154,6 +5462,7 @@ void opndcoll_rfu_t::collector_unit_t::dispatch() {
   assert(m_not_ready.none());
   m_output_register->move_in(m_sub_core_model, m_reg_id, m_warp);
   m_free = true;
+  m_rfu->cu_dispatched();  // T7
   m_output_register = NULL;
   for (unsigned i = 0; i < MAX_REG_OPERANDS * 2; i++) m_src_op[i].reset();
 }
@@ -5279,6 +5588,7 @@ unsigned simt_core_cluster::issue_block2core() {
   // STATIC_BINDING), compute the next CTA's home chiplet.
   unsigned preferred_chiplet = (unsigned)-1;
   kernel_info_t *selected_kernel = NULL;
+  kernel_info_t *pcc_kernel = NULL;   // PCC: kernel with per-chiplet cursors
 
   for (unsigned i = 0; i < m_config->n_simt_cores_per_cluster; i++) {
     unsigned core =
@@ -5301,6 +5611,10 @@ unsigned simt_core_cluster::issue_block2core() {
 
     if (m_gpu->kernel_more_cta_left(kernel)) {
       selected_kernel = kernel;
+
+      // PCC: the home chiplet is decided by the kernel's own cursor for THIS
+      // chiplet; no global "next CTA" is consulted (docs/cta_chiplet_cursor.ko.md).
+      if (kernel->pcc_on()) { pcc_kernel = kernel; break; }
 
       // LASP binding (config -gpgpu_lasp_policy) takes precedence over
       // STATIC_BINDING. With LASP off every kernel keeps the ctor default
@@ -5351,6 +5665,27 @@ unsigned simt_core_cluster::issue_block2core() {
     }
   }
   
+  // PCC pass: my chiplet's own cursor. A CTA of another chiplet that cannot be
+  // placed never blocks this chiplet (the single-cursor head-of-line is gone).
+  if (pcc_kernel) {
+    const unsigned n_chiplets = m_gpu->get_gpu_module()->get_num_chiplets();
+    const unsigned my_chip = m_cluster_id / (m_config->n_simt_clusters / n_chiplets);
+    if (!pcc_kernel->pcc_has_cta(my_chip)) return 0;
+    for (unsigned i = 0; i < m_config->n_simt_cores_per_cluster; i++) {
+      unsigned core =
+          (i + m_cta_issue_next_core + 1) % m_config->n_simt_cores_per_cluster;
+      if (m_core[core]->can_issue_1block(*pcc_kernel)) {
+        pcc_kernel->pcc_select(my_chip);
+        pcc_kernel->pcc_note_issue_cycle(
+            my_chip, m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+        m_core[core]->issue_block2core(*pcc_kernel);
+        m_cta_issue_next_core = core;
+        return 1;
+      }
+    }
+    return 0;
+  }
+
   // Second pass: issue ONLY to the preferred chiplet (strict affinity).
   if (preferred_chiplet != (unsigned)-1 && selected_kernel) {
     unsigned n_chiplets = m_gpu->get_gpu_module()->get_num_chiplets();
@@ -5852,7 +6187,8 @@ void ldst_unit::xlat_print_stats(FILE* fp, unsigned sid) const {
 
 void ldst_unit::xlatdbg_dump_parked(FILE* fp, unsigned sid) const {
   size_t n = 0;
-  for (const auto& kv : m_xlat_parked) n += kv.second.size();
+  for (unsigned w = 0; w < m_xlat_parked.slots(); w++)  // T9: warp-id order
+    if (m_xlat_parked.has(w)) n += m_xlat_parked.at(w).size();
   if (n) {
     fprintf(fp, "XLATDBG_DEADLOCK:   sm=%u parked_warps=%zu insts=%zu order_q=%zu\n",
             sid, m_xlat_parked.size(), n, m_xlat_park_order.size());
@@ -5867,10 +6203,10 @@ void ldst_unit::xlatdbg_dump_parked(FILE* fp, unsigned sid) const {
             m_xlat_replay_q.size(), (int)m_mem_rc,
             m_dprobe_replay_fires, m_dprobe_safetynet_fires,
             m_dprobe_safetynet_last_cycle, m_dprobe_gate_closed_cycles);
-    for (const auto& kv : m_xlat_parked)
-      if (!kv.second.empty())
+    for (unsigned w = 0; w < m_xlat_parked.slots(); w++)  // T9: warp-id order
+      if (m_xlat_parked.has(w) && !m_xlat_parked.at(w).empty())
         fprintf(fp, "XLATDBG_DEADLOCK:     wid=%u parked=%zu pc=0x%x\n",
-                kv.first, kv.second.size(), kv.second.front().pc);
+                w, m_xlat_parked.at(w).size(), m_xlat_parked.at(w).front().pc);
   }
   if (m_l1_tlb_4k)  m_l1_tlb_4k->xlatdbg_dump(fp, sid, "4k");
   if (m_l1_tlb_64k) m_l1_tlb_64k->xlatdbg_dump(fp, sid, "64k");

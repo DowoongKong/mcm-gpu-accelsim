@@ -45,6 +45,8 @@ static void addrdec_getmasklimit(new_addr_type mask, unsigned char *high,
 linear_to_raw_address_translation::linear_to_raw_address_translation() {
   addrdec_option = NULL;
   ADDR_CHIP_S = 10;
+  m_hash_chiplets = 1;
+  m_slices_per_chiplet = 0;
   memset(addrdec_mklow, 0, N_ADDRDEC);
   memset(addrdec_mkhigh, 64, N_ADDRDEC);
   // Built-in default mapping only. Every experiment config that passes
@@ -75,8 +77,14 @@ void linear_to_raw_address_translation::addrdec_setoption(option_parser_t opp) {
   option_parser_register(
       opp, "-gpgpu_memory_partition_indexing", OPT_UINT32,
       &memory_partition_indexing,
-      "0 = no indexing, 1 = bitwise xoring, 2 = IPoly, 3 = custom indexing",
+      "0 = no indexing, 1 = bitwise xoring, 2 = IPoly, 3 = custom indexing, "
+      "7 = IPoly inside each chiplet (chiplet kept, see -gpgpu_mem_hash_chiplets)",
       "0");
+  option_parser_register(
+      opp, "-gpgpu_mem_hash_chiplets", OPT_UINT32, &m_hash_chiplets,
+      "chiplets kept apart by -gpgpu_memory_partition_indexing 7; must equal "
+      "-gpgpu_n_chiplets",
+      "1");
 }
 
 new_addr_type linear_to_raw_address_translation::partition_address(
@@ -187,6 +195,31 @@ void linear_to_raw_address_translation::addrdec_tlx(new_addr_type addr,
       assert(tlx->sub_partition < m_n_channel * m_n_sub_partition_in_channel);
       return;
       break;
+    }
+    case CHIPLET_IPOLY: {
+      // IPOLY inside one chiplet. The sub-partitions of chiplet c are the
+      // contiguous range [c * S, (c + 1) * S), S = m_slices_per_chiplet -- the
+      // same contiguous split gpu_module uses -- so the chiplet is sub / S and is
+      // never changed: the frame number alone still decides which chiplet's
+      // memory holds a page. Only the index inside the range is hashed. The hash
+      // input is every address bit that is neither a channel nor a sub-partition
+      // bit, taken from above the lowest channel bit, i.e. exactly the bits
+      // partition_address() keeps. IPOLY is index XOR f(those bits), so for a
+      // fixed partition address the index permutation is one-to-one and two
+      // addresses can share a slice only if their partition addresses differ.
+      assert(!gap);
+      const unsigned sub = tlx->chip * m_n_sub_partition_in_channel +
+                           (tlx->bk & (m_n_sub_partition_in_channel - 1));
+      const unsigned chiplet = sub / m_slices_per_chiplet;
+      const unsigned local = sub % m_slices_per_chiplet;
+      const new_addr_type high =
+          partition_address(addr) >> addrdec_mklow[CHIP];
+      const unsigned hashed =
+          ipoly_hash_function(high, local, m_slices_per_chiplet);
+      tlx->sub_partition = chiplet * m_slices_per_chiplet + hashed;
+      tlx->chip = tlx->sub_partition / m_n_sub_partition_in_channel;
+      assert(tlx->sub_partition / m_slices_per_chiplet == chiplet);
+      return;
     }
     case CUSTOM:
       /* No custom set function implemented */
@@ -462,6 +495,33 @@ void linear_to_raw_address_translation::init(
     }
   }
   printf("sub_partition_id_mask = %016llx\n", sub_partition_id_mask);
+
+  // CHIPLET_IPOLY needs whole chiplets of channels and a slice count per chiplet
+  // that ipoly_hash_function() has equations for. Checked before sweep_test(),
+  // which already decodes addresses through the hash.
+  if (memory_partition_indexing == CHIPLET_IPOLY) {
+    if (gap || m_hash_chiplets == 0 || m_n_channel % m_hash_chiplets != 0) {
+      fprintf(stderr,
+              "FATAL: -gpgpu_memory_partition_indexing 7 needs a power-of-two "
+              "channel count divisible by -gpgpu_mem_hash_chiplets (%u "
+              "channels, %u chiplets)\n",
+              m_n_channel, m_hash_chiplets);
+      abort();
+    }
+    m_slices_per_chiplet = m_n_sub_partition_total / m_hash_chiplets;
+    if (m_slices_per_chiplet != 16 && m_slices_per_chiplet != 32 &&
+        m_slices_per_chiplet != 64) {
+      fprintf(stderr,
+              "FATAL: -gpgpu_memory_partition_indexing 7 hashes %u "
+              "sub-partitions per chiplet; ipoly_hash_function() supports 16, "
+              "32 or 64\n",
+              m_slices_per_chiplet);
+      abort();
+    }
+    printf("chiplet_ipoly: %u chiplets x %u sub-partitions, hash input = "
+           "partition_address >> %u\n",
+           m_hash_chiplets, m_slices_per_chiplet, addrdec_mklow[CHIP]);
+  }
 
   if (run_test) {
     sweep_test();

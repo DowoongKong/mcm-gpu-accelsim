@@ -109,7 +109,29 @@ struct phase_timers_t {
   unsigned long long phase_a_ns = 0, phase_b_ns = 0, phase_c_ns = 0;
   unsigned long long dram_calls = 0, l2gmmu_calls = 0, icnt_calls = 0;
   unsigned long long phase_a_calls = 0, phase_b_calls = 0, phase_c_calls = 0;
+  // D1 (pressure_speedup_implog Sec 5): phase B wall time per chiplet group and
+  // which OMP thread ran each group (checks the dynamic schedule). Written
+  // inside the parallel loop, one group per iteration, so no two threads ever
+  // touch the same index at the same time. Measurement only, PHASE_TIMING-gated.
+  unsigned long long phase_b_chip_ns[8] = {0};
+  unsigned long long phase_b_chip_thread[8][16] = {{0}};
+  // D1b: this cycle's body time per group (written in the loop, read by the
+  // master after the region joins), the sum over cycles of the per-cycle
+  // maximum (the region's critical path if scheduling were free), which group
+  // was the maximum, and log2(us) histograms of the per-cycle maximum and of
+  // every group body.
+  unsigned long long phase_b_chip_cur_ns[8] = {0};
+  unsigned long long phase_b_cyclemax_ns = 0;
+  unsigned long long phase_b_argmax_cnt[8] = {0};
+  unsigned long long phase_b_max_hist[24] = {0};
+  unsigned long long phase_b_body_hist[24] = {0};
 };
+static inline unsigned phase_log2us_bucket(unsigned long long ns) {  // D1b
+  unsigned long long us = ns / 1000ull;
+  unsigned b = 0;
+  while (us > 1 && b < 23) { us >>= 1; b++; }
+  return b;
+}
 static phase_timers_t g_phase_timers;
 // §25 pre-measurement: split icnt_ns into the part that will become
 // chiplet-parallel (local xbar Advance()) vs the part that must stay
@@ -118,6 +140,12 @@ static phase_timers_t g_phase_timers;
 // them without needing phase_timers_t's definition.
 unsigned long long g_icnt_local_ns = 0, g_icnt_handoff_ns = 0;
 unsigned long long g_icnt_local_calls = 0, g_icnt_handoff_calls = 0;
+// H3 measurement: the icnt phase timer covers TWO blocks -- the memory-controller
+// -> interconnect pop loop (this counter) and icnt_transfer()'s xbar Advance
+// (g_icnt_local_ns + g_icnt_handoff_ns). icnt_calls is exactly 2x local_calls
+// because of that, which made the phase look like it had unexplained overhead.
+// Split it out so the two are attributable separately.
+unsigned long long g_icnt_pop_ns = 0, g_icnt_pop_calls = 0;
 static inline unsigned long long phase_now_ns() {
   using namespace std::chrono;
   return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
@@ -971,6 +999,12 @@ void gpgpu_sim_config::reg_options(option_parser_t opp) {
                         "pre-map every page from this placement map before the first "
                         "kernel, so the measured region takes zero faults (empty = disabled)",
                         "");
+  option_parser_register(opp, "-gmmu_placement_exact", OPT_BOOL,
+                        &gmmu_placement_exact,
+                        "with -gmmu_placement_load: place every data page, page-table node and the "
+                        "root at the PFN recorded in the (v3) map, not only on the recorded owner "
+                        "chiplet. 0 = replay owners only and re-derive PFNs (pre-existing behaviour)",
+                        "0");
   option_parser_register(opp, "-gmmu_local_ptw", OPT_BOOL,
                         &gmmu_local_ptw,
                         "replicate the page table on every chiplet (own root/CR3 and own "
@@ -984,6 +1018,14 @@ void gpgpu_sim_config::reg_options(option_parser_t opp) {
   option_parser_register(opp, "-gpgpu_l2_tlb_assoc", OPT_UINT32,
                         &m_l2_tlb_assoc,
                         "L2 TLB associativity per chiplet (default 8)", "8");
+  option_parser_register(opp, "-gpgpu_l2_tlb_set_hash", OPT_UINT32,
+                        &m_l2_tlb_set_hash,
+                        "L2 TLB set index (all page sizes): 0 = VPN mod sets (pre-existing), "
+                        "1 = XOR-fold of the VPN in log2(sets)-bit chunks, i.e. set bit k = XOR of VPN "
+                        "bits k, k+b, k+2b, ... -- the structure of the XOR set hashes reverse-engineered "
+                        "on NVIDIA Pascal/Ampere L2/L3 TLBs (Nayak'21 XOR-7, NDSS'26) and confirmed on "
+                        "RTX 3090 (regular_exp/docs/tlb_set_hashing.ko.md). Requires power-of-two sets.",
+                        "0");
   option_parser_register(opp, "-gpgpu_l2_tlb_mshr_entries", OPT_UINT32,
                         &m_l2_tlb_mshr_entries,
                         "L2 TLB MSHR unique VPN capacity per chiplet (default 128)", "128");
@@ -1044,8 +1086,13 @@ void gpgpu_sim_config::reg_options(option_parser_t opp) {
                         "1=ROW_BINDING (grid row -> chiplet, contiguous row "
                         "blocks), 2=COL_BINDING (grid column -> chiplet), "
                         "3=CHUNK_BINDING (chunk_size consecutive CTAs "
-                        "round-robin across chiplets). Takes precedence over "
-                        "-gpgpu_cta_scheduling_policy when nonzero",
+                        "round-robin across chiplets), 4=KERNEL_PARTITION "
+                        "(MCM-GPU ISCA'17 distributed CTA scheduler: the "
+                        "kernel's CTAs are split into n_chiplets contiguous "
+                        "ranges of ceil(#CTAs/n_chiplets); chunk computed per "
+                        "kernel at launch, -gpgpu_lasp_chunk_size ignored). "
+                        "Takes precedence over -gpgpu_cta_scheduling_policy "
+                        "when nonzero",
                         "0");
   option_parser_register(opp, "-gpgpu_lasp_chunk_size", OPT_UINT32,
                         &m_lasp_chunk_size,
@@ -1053,6 +1100,25 @@ void gpgpu_sim_config::reg_options(option_parser_t opp) {
                         "batch = page_size / datablock_size, kernel-wide "
                         "partitioning = ceil(#CTAs / n_chiplets)",
                         "1");
+  option_parser_register(opp, "-gpgpu_cta_chiplet_cursor", OPT_UINT32,
+                        &m_cta_chiplet_cursor,
+                        "1 = per-chiplet CTA cursors (PCC): a CTA is issued as "
+                        "soon as its home chiplet has a free slot, independent "
+                        "of the other chiplets' progress (CTA->chiplet map "
+                        "unchanged; needs STATIC_BINDING or a LASP policy); "
+                        "0 = single sequential cursor (legacy)",
+                        "0");
+  option_parser_register(opp, "-gpgpu_kernel_rebind", OPT_UINT32,
+                        &m_kernel_rebind,
+                        "what an SM core bound to a finished kernel does when the "
+                        "next kernel arrives. 0 = v7b hand-over (default): the core "
+                        "continues with the next kernel created by the trace "
+                        "framework, busy or not -- bit-identical to every v7b result, "
+                        "which got this behaviour from allocator address reuse; "
+                        "1 = the core drops the finished kernel and rebinds through "
+                        "select_kernel() once it is idle (the upstream comment's "
+                        "intent). Both are deterministic",
+                        "0");
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -1114,11 +1180,49 @@ void gpgpu_sim::launch(kernel_info_t *kinfo) {
           (pol == 1) ? lasp::ROW_BINDING
                      : (pol == 2) ? lasp::COL_BINDING : lasp::CHUNK_BINDING;
       unsigned cs = m_config.get_lasp_chunk_size();
+      if (pol == 4) {
+        // KERNEL_PARTITION (MCM-GPU ISCA'17 Sec. 5.2: "divide the total
+        // number of CTAs in a kernel equally among the number of GPMs, and
+        // assign a group of contiguous CTAs to a GPM"). Expressed as
+        // CHUNK_BINDING with a per-kernel chunk of ceil(#CTAs / n_chiplets):
+        // (lin / chunk) then ranges over 0..n_chiplets-1, so the trailing
+        // "% n_chiplets" in the issue path and pcc_home() is the identity and
+        // every downstream consumer stays unchanged. Still a pure function of
+        // the CTA id (timing-independent), like the other bindings.
+        unsigned n_chiplets = m_gpu_module ? m_gpu_module->get_num_chiplets()
+                                           : m_config.get_num_chiplets();
+        if (n_chiplets == 0) n_chiplets = 1;
+        unsigned n_ctas = (unsigned)kinfo->num_blocks();
+        cs = (n_ctas + n_chiplets - 1) / n_chiplets;
+      }
       kinfo->m_lasp_config.chunk_size = cs ? cs : 1;
-      printf("[LASP] kernel uid=%u '%s' policy=%s chunk_size=%u\n",
+      printf("[LASP] kernel uid=%u '%s' policy=%s chunk_size=%u%s\n",
              kinfo->get_uid(), kinfo->name().c_str(),
              lasp::policy_to_string(kinfo->m_lasp_config.policy),
-             kinfo->m_lasp_config.chunk_size);
+             kinfo->m_lasp_config.chunk_size,
+             (pol == 4) ? " (KERNEL_PARTITION)" : "");
+    }
+  }
+
+  // PCC: per-chiplet CTA cursors (docs/cta_chiplet_cursor.ko.md). Only the
+  // issue ORDER changes; the CTA->chiplet map is the same pure function.
+  if (m_config.get_cta_chiplet_cursor()) {
+    const bool static_bind =
+        (m_config.get_cta_sched_policy() == CTA_SCHED_STATIC_BINDING);
+    const bool bound =
+        (kinfo->m_lasp_config.policy != lasp::KERNEL_WIDE) || static_bind;
+    if (bound && m_gpu_module) {
+      kinfo->pcc_init(m_gpu_module->get_num_chiplets(), static_bind);
+      printf("[PCC] kernel uid=%u '%s' per-chiplet cursors on: n_chiplets=%u "
+             "ctas=%u rule=%s\n",
+             kinfo->get_uid(), kinfo->name().c_str(), kinfo->pcc_n(),
+             (unsigned)kinfo->num_blocks(),
+             (kinfo->m_lasp_config.policy != lasp::KERNEL_WIDE)
+                 ? lasp::policy_to_string(kinfo->m_lasp_config.policy)
+                 : "STATIC_BINDING");
+    } else {
+      printf("[PCC] kernel uid=%u option set but no chiplet binding active "
+             "(or gpu_module not wired) -- ignored\n", kinfo->get_uid());
     }
   }
 
@@ -1151,9 +1255,74 @@ bool gpgpu_sim::hit_max_cta_count() const {
 bool gpgpu_sim::kernel_more_cta_left(kernel_info_t *kernel) const {
   if (hit_max_cta_count()) return false;
 
+  // PCC: a core may still hold the pointer of a kernel that finished and was
+  // deleted, so do not dereference it unless it is still in m_running_kernels.
+  // (The original note called the legacy freed-object read harmless; it was not --
+  // it followed allocator address reuse into the next kernel. See
+  // gpgpu_sim::on_kernel_deleted().)
+  // KERNEL HAND-OVER (2026-09-13): this guard used to run only with the cursor on.
+  // It now runs always, as the second line of defence behind on_kernel_deleted()/
+  // on_kernel_created(), which already keep every core off freed kernels: a kernel
+  // that is not in m_running_kernels is never dereferenced here.
+  if (kernel) {
+    bool running = false;
+    for (unsigned n = 0; n < m_running_kernels.size(); n++)
+      if (m_running_kernels[n] == kernel) { running = true; break; }
+    if (!running) return false;
+  }
+
   if (kernel && !kernel->no_more_ctas_to_run()) return true;
 
   return false;
+}
+
+// KERNEL HAND-OVER (2026-09-13).
+// accel_sim_framework::cleanup() deletes a finished kernel while SM cores still
+// hold its pointer (shader_core_ctx::m_kernel), and issue_block2core() then
+// evaluated kernel_more_cta_left() on it: a heap use-after-free (AddressSanitizer:
+// kernel_info_t::no_more_ctas_to_run; the same code is in upstream Accel-Sim
+// v2.0.0). What that read returned was decided by the allocator. With glibc
+// tcache the next kernel is allocated at the very address just freed, so the
+// stale pointer silently became the next kernel and busy cores carried straight
+// on with it. Every v7b result was produced that way: the unmodified audit binary
+// changes its nw8M result under glibc.malloc.tcache_count=0.
+// kernel_info_t growing the PCC fields broke that address reuse, and two defects
+// surfaced in the PCC trees:
+//  (a) the stale read itself -- cursor-off runs crashed or disagreed; and
+//  (b) thread-order dependence -- when a kernel's last CTAs retire on several SMs
+//      in the same parallel pass, only the SM entering the kernel_teardown
+//      critical section last NULLs its own m_kernel. The binding issue path treats
+//      NULL ("use the selected kernel") differently from a finished pointer, so the
+//      winner of the critical section leaked into the model (even cursor-on
+//      ref_contig on nw8M gave a different result on every rerun).
+// Both are fixed here by deciding the hand-over explicitly, in serial context:
+//  -gpgpu_kernel_rebind 0 (default): remember the deleted pointer (value only,
+//      never dereferenced) and, when the framework creates the next kernel, move
+//      every core still pointing at it onto that kernel -- exactly the v7b
+//      behaviour, now defined and deterministic (LIFO, as tcache reuse was).
+//      Verified bit-identical to the v7b runs of nw8M base/lptw/ptwhop0/ref_batch4
+//      (+dumped map), gc48M base, gups4M all arms; 8t==1t.
+//  -gpgpu_kernel_rebind 1: clear those pointers now; each core rebinds through
+//      select_kernel() once it is idle.
+// Assumes the trace flow creates the next kernel before any further cycle, as
+// accel_sim_framework does (window of 1). The unconditional running-kernel guard
+// in kernel_more_cta_left() stays as a second line of defence.
+void gpgpu_sim::on_kernel_deleted(const kernel_info_t *k) {
+  if (!k) return;
+  if (m_config.get_kernel_rebind() == 0) {
+    m_retired_kernels.push_back(k);   // pointer value only; never dereferenced
+    return;
+  }
+  for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++)
+    m_cluster[i]->forget_kernel(k);
+}
+
+void gpgpu_sim::on_kernel_created(kernel_info_t *nk) {
+  if (m_retired_kernels.empty()) return;
+  const kernel_info_t *old = m_retired_kernels.back();
+  m_retired_kernels.pop_back();
+  for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++)
+    m_cluster[i]->retarget_kernel(old, nk);
 }
 
 bool gpgpu_sim::get_more_cta_left() const {
@@ -1226,6 +1395,12 @@ unsigned gpgpu_sim::finished_kernel() {
 }
 
 void gpgpu_sim::set_kernel_done(kernel_info_t *kernel) {
+  if (kernel->pcc_on()) {   // PCC: per-chiplet issue summary (G1/G3 evidence)
+    for (unsigned c = 0; c < kernel->pcc_n(); c++)
+      printf("[PCC] kernel uid=%u chiplet=%u issued=%u last_issue_cycle=%llu\n",
+             kernel->get_uid(), c, kernel->pcc_issued(c),
+             kernel->pcc_last_issue(c));
+  }
   unsigned uid = kernel->get_uid();
   last_uid = uid;
   unsigned long long streamID = kernel->get_streamID();
@@ -1598,7 +1773,17 @@ void gpgpu_sim::init() {
   // produces the same result (verified stage 1: A2/A3; stage 2: B3/B4).
   {
     const char *pl = m_config.get_gmmu_placement_load();
-    const bool deferrable_mode = !(pl && pl[0] != '\0');
+    // PCC: a loaded map was produced under the legacy CTA->SM placement.
+    // Local-memory VAs are a function of the hardware thread slot
+    // (translate_local_memaddr: m_sid/tid), so a different placement touches
+    // pages the map never saw. The legacy load path inserts those immediately
+    // from the parallel pass B and trips the mutation guard (FATAL). With the
+    // per-chiplet cursor on, route them through the same deferred first-touch
+    // commit the reference run uses (serial point after pass C; the walker
+    // sees the owner next cycle). Pages already in the map are unaffected:
+    // record_first_touch() finds them and inserts nothing.
+    const bool deferrable_mode =
+        !(pl && pl[0] != '\0') || (m_config.get_cta_chiplet_cursor() != 0);
     if (deferrable_mode && m_gpu_module && m_gpu_module->get_page_table() &&
         !m_gpu_module->get_page_table()->deferred_first_touch_enabled())
       m_gpu_module->get_page_table()->enable_deferred_first_touch(
@@ -1742,21 +1927,27 @@ void gpgpu_sim::print_stats(unsigned long long streamID) {
              nodes, pages, (double)(pages * GPU_PAGE_SIZE) / (1024.0 * 1024.0),
              m_gpu_module->local_ptw_enabled() ? 1 : 0);
     }
-    // P5-2: how many times the GPU-wide page table actually changed shape.
-    // Zero is the precondition that lets chiplets walk it concurrently, so it
-    // has to be visible in the stats, not only inside the parallel-phase guard.
-    printf("[PAGE_TABLE] mutations=%llu  (0 == read-only for the whole run, "
-           "required for the parallel CORE phase)\n",
+    // P5-2: cumulative count of page-table mutations (owner-map inserts, node
+    // creation, leaf installs), INCLUDING those made while building or
+    // premapping the table before any kernel ran -- so it is non-zero in a
+    // pinned run as well (577,356 on BC 77zf). What must be zero is the delta
+    // across each parallel CORE phase; gpgpu_sim::cycle() enforces that with an
+    // abort, so a run that reaches this line had none.
+    printf("[PAGE_TABLE] mutations=%llu  (cumulative incl. build/premap; "
+           "parallel-phase delta guarded to 0)\n",
            m_gpu_module->get_page_table()->mutation_count());
-    // A1: deferred first-touch bookkeeping (reference mode). dedup counts
-    // buffered entries that inserted nothing at commit -- among them the
-    // same-cycle same-page collisions whose canonical resolution is the whole
-    // point of the deferral.
-    if (m_gpu_module->get_page_table()->deferred_first_touch_enabled())
-      printf("[REF_DEFER] commits=%llu dedup=%llu max_batch=%llu\n",
-             m_gpu_module->get_page_table()->deferred_ft_commits(),
-             m_gpu_module->get_page_table()->deferred_ft_dedups(),
-             m_gpu_module->get_page_table()->deferred_ft_max_batch());
+    // A1: deferred first-touch bookkeeping. Enabled in reference mode AND in
+    // PCC (+load) runs, where local-memory pages the map never saw must get a
+    // deterministic owner (see deferrable_mode). dedup counts buffered entries
+    // that inserted nothing at commit; new_pages = commits - dedup is the number
+    // of pages this run placed itself. In a pinned run it is 0, so
+    // commits == dedup there is expected, not a defect.
+    if (m_gpu_module->get_page_table()->deferred_first_touch_enabled()) {
+      const unsigned long long c = m_gpu_module->get_page_table()->deferred_ft_commits();
+      const unsigned long long d = m_gpu_module->get_page_table()->deferred_ft_dedups();
+      printf("[REF_DEFER] commits=%llu dedup=%llu new_pages=%llu max_batch=%llu\n",
+             c, d, c - d, m_gpu_module->get_page_table()->deferred_ft_max_batch());
+    }
     // Optional: write the first-touch placement map for a later measurement run.
     {
       const char* pd = m_config.get_gmmu_placement_dump();
@@ -1766,23 +1957,28 @@ void gpgpu_sim::print_stats(unsigned long long streamID) {
     for (unsigned c = 0; c < m_gpu_module->get_num_chiplets(); c++) {
       m_gpu_module->get_gmmu(c)->print_stats(stdout);
     }
+    // ST-3: under a fixed page-size policy (0/1/2) the other two TLB instances
+    // never see a request, yet printed 12 all-zero lines per SM per dump. Skip
+    // them. uniform_page_shift() is 0 for a mixed policy (3-5): print all three.
+    const unsigned ups = m_gpu_module->uniform_page_shift();
+    auto want_kind = [ups](unsigned shift) { return ups == 0 || ups == shift; };
     // L1 TLB statistics per SM, one TLB per page size
     for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
         for (unsigned j = 0; j < m_shader_config->n_simt_cores_per_cluster; j++) {
             shader_core_ctx* core = m_cluster[i]->get_core(j);
             if (!core) continue;
-            if (core->get_l1_tlb())     core->get_l1_tlb()->print_stats(stdout);
-            if (core->get_l1_tlb_64k()) core->get_l1_tlb_64k()->print_stats(stdout);
-            if (core->get_l1_tlb_2m())  core->get_l1_tlb_2m()->print_stats(stdout);
+            if (core->get_l1_tlb()     && want_kind(GPU_PAGE_SHIFT)) core->get_l1_tlb()->print_stats(stdout);
+            if (core->get_l1_tlb_64k() && want_kind(GPU_64K_SHIFT))  core->get_l1_tlb_64k()->print_stats(stdout);
+            if (core->get_l1_tlb_2m()  && want_kind(GPU_HUGE_SHIFT)) core->get_l1_tlb_2m()->print_stats(stdout);
             core->xlat_print_stats(stdout);   // XLATLAT: SM-level view
         }
     }
     xlatsum_gpu_print(stdout);  // 34: GPU-wide XLATSUM rows (additive tag)
     // L2 TLB statistics per chiplet, one TLB per page size
     for (unsigned c = 0; c < m_gpu_module->get_num_chiplets(); c++) {
-      m_gpu_module->get_chiplet(c)->get_l2_tlb_4k()->print_stats(stdout);
-      m_gpu_module->get_chiplet(c)->get_l2_tlb_64k()->print_stats(stdout);
-      m_gpu_module->get_chiplet(c)->get_l2_tlb_2m()->print_stats(stdout);
+      if (want_kind(GPU_PAGE_SHIFT)) m_gpu_module->get_chiplet(c)->get_l2_tlb_4k()->print_stats(stdout);
+      if (want_kind(GPU_64K_SHIFT))  m_gpu_module->get_chiplet(c)->get_l2_tlb_64k()->print_stats(stdout);
+      if (want_kind(GPU_HUGE_SHIFT)) m_gpu_module->get_chiplet(c)->get_l2_tlb_2m()->print_stats(stdout);
     }
     // (temp) diagnostics report -- P-5: only under ACCELSIM_DIAG.
     if (g_accelsim_diag) {
@@ -1816,7 +2012,8 @@ void gpgpu_sim::print_stats(unsigned long long streamID) {
       unsigned repr = m_gpu_module->get_chiplet(c)->get_cluster_global_begin();
       unsigned long long icnt_cycles = 0, gated = 0;
       m_cluster[repr]->get_popgate_stats(icnt_cycles, gated);
-      printf("[POPGATE] repr_cluster=%u chiplet=%u icnt_cycles=%llu gated=%llu (%.1f%%)\n",
+      printf("[POPGATE] repr_cluster=%u chiplet=%u icnt_cycles=%llu gated=%llu (%.1f%%) "
+             "[repr-cluster share only; lower bound since Fix-A]\n",
              repr, c, icnt_cycles, gated,
              icnt_cycles ? 100.0 * gated / icnt_cycles : 0.0);
     }
@@ -1876,6 +2073,42 @@ void gpgpu_sim::print_stats(unsigned long long streamID) {
         g_phase_timers.phase_a_ns * pct, g_phase_timers.phase_a_calls,
         g_phase_timers.phase_b_ns * pct, g_phase_timers.phase_b_calls,
         g_phase_timers.phase_c_ns * pct, g_phase_timers.phase_c_calls);
+    if (g_phase_timers.phase_b_calls) {  // D1: phase B per chiplet group (stderr only)
+      fprintf(stderr, "[PHASE_TIMING_B] chip_s=");
+      for (unsigned c = 0; c < 8; c++)
+        if (g_phase_timers.phase_b_chip_ns[c])
+          fprintf(stderr, "%s%u:%.3f", c ? "," : "", c,
+                  (double)g_phase_timers.phase_b_chip_ns[c] / 1.0e9);
+      fprintf(stderr, " runs_by_thread=");
+      for (unsigned c = 0; c < 8; c++) {
+        if (!g_phase_timers.phase_b_chip_ns[c]) continue;
+        fprintf(stderr, "%s%u:{", c ? " " : "", c);
+        bool first = true;
+        for (unsigned t = 0; t < 16; t++)
+          if (g_phase_timers.phase_b_chip_thread[c][t]) {
+            fprintf(stderr, "%st%u=%llu", first ? "" : ",", t,
+                    g_phase_timers.phase_b_chip_thread[c][t]);
+            first = false;
+          }
+        fprintf(stderr, "}");
+      }
+      fprintf(stderr, "\n");
+      // D1b
+      fprintf(stderr, "[PHASE_TIMING_B2] cyclemax=%.3fs argmax=",
+              (double)g_phase_timers.phase_b_cyclemax_ns / 1.0e9);
+      for (unsigned c = 0; c < 8; c++)
+        if (g_phase_timers.phase_b_argmax_cnt[c])
+          fprintf(stderr, "%s%u:%llu", c ? "," : "", c, g_phase_timers.phase_b_argmax_cnt[c]);
+      fprintf(stderr, " max_hist_log2us=");
+      for (unsigned b = 0; b < 24; b++)
+        if (g_phase_timers.phase_b_max_hist[b])
+          fprintf(stderr, "%s%u:%llu", b ? "," : "", b, g_phase_timers.phase_b_max_hist[b]);
+      fprintf(stderr, " body_hist_log2us=");
+      for (unsigned b = 0; b < 24; b++)
+        if (g_phase_timers.phase_b_body_hist[b])
+          fprintf(stderr, "%s%u:%llu", b ? "," : "", b, g_phase_timers.phase_b_body_hist[b]);
+      fprintf(stderr, "\n");
+    }
     // 31: coverage accounting. cycle_ns is the whole cycle() body; buckets
     // above are its parts. "uncov" is what cycle() spends outside every bucket.
     const unsigned long long bucket_sum = total_ns +
@@ -1896,6 +2129,14 @@ void gpgpu_sim::print_stats(unsigned long long streamID) {
     // chiplet-width parallel) vs handoff/handoff_ring (must stay sequential --
     // genuine chiplet-to-chiplet exchange). Percentages are of icnt_ns itself,
     // not of total, so they read directly as "how much of ICNT would move".
+    // H3: include the pop loop so the three components sum to the icnt phase.
+    fprintf(stderr,
+        "[PHASE_TIMING_ICNT_POP] mem2icnt_pop=%.3fs(n=%llu) xbar_advance=%.3fs "
+        "handoff=%.3fs  sum=%.3fs  icnt_phase=%.3fs\n",
+        g_icnt_pop_ns / 1.0e9, g_icnt_pop_calls, g_icnt_local_ns / 1.0e9,
+        g_icnt_handoff_ns / 1.0e9,
+        (g_icnt_pop_ns + g_icnt_local_ns + g_icnt_handoff_ns) / 1.0e9,
+        g_phase_timers.icnt_ns / 1.0e9);
     const unsigned long long icnt_sub_ns = g_icnt_local_ns + g_icnt_handoff_ns;
     const double icnt_pct = icnt_sub_ns ? 100.0 / (double)icnt_sub_ns : 0.0;
     fprintf(stderr,
@@ -2231,6 +2472,7 @@ void gpgpu_sim::gpu_print_stat(unsigned long long streamID) {
     total_l2_css.clear();
 
     printf("\n========= L2 cache stats =========\n");
+    flush_l2loop_idle();   // H3-3c: 건너뛴 방문의 포트 샘플을 읽기 전에 반영
     for (unsigned i = 0; i < m_memory_config->m_n_mem_sub_partition; i++) {
       m_memory_sub_partition[i]->accumulate_L2cache_stats(l2_stats);
       m_memory_sub_partition[i]->get_L2cache_sub_stats(l2_css);
@@ -2297,7 +2539,7 @@ void gpgpu_sim::gpu_print_stat(unsigned long long streamID) {
 
   // Print MCM access statistics
   if (m_gpu_module) {
-    printf("\n========= MCM Access Statistics =========\n");
+    printf("\n========= MCM Access Statistics (data packets, request+reply, PTW excluded) =========\n");
     printf("mcm_remote_accesses=%llu\n", m_gpu_module->get_remote_access_count());
     printf("mcm_local_accesses=%llu\n", m_gpu_module->get_local_access_count());
     unsigned long long total_accesses = m_gpu_module->get_remote_access_count() +
@@ -2776,18 +3018,84 @@ void gpgpu_sim::issue_block2core() {
 unsigned long long g_single_step =
     0;  // set this in gdb to single step the pipeline
 
+// H3-3: 미러 연결. 클러스터(trace_gpgpu_sim 생성자)와 인터커넥트 라우터(icnt_create)가 모두
+// 만들어진 뒤여야 하므로 첫 cycle() 에서 한 번 한다. 모든 바이트를 1 로 시작해 첫 사이클은
+// 전부 방문한다 -- 연결 이전에 쌓인 상태가 있어도 불변식(0 => 할 일 없음)이 성립한다.
+void gpgpu_sim::wire_icnt_mirrors() {
+  m_icnt_mirrors_wired = true;
+  const unsigned n_sub = m_memory_config->m_n_mem_sub_partition;
+  m_l2icnt_nonempty.assign(n_sub, 1);
+  for (unsigned i = 0; i < n_sub; i++)
+    m_memory_sub_partition[i]->set_l2icnt_mirror(&m_l2icnt_nonempty[i]);
+
+  const unsigned n_cl = m_shader_config->n_simt_clusters;
+  m_cluster_icnt_busy.assign(n_cl, 1);
+  // SST 모드는 응답이 다른 경로(sst 클러스터의 별도 FIFO)로 들어오고, intersim2 에는 출력
+  // 버퍼 훅이 없다. 두 경우 모두 건너뛰기를 끄고 원래대로 전부 방문한다.
+  m_cluster_icnt_mirror_ok = icnt_out_mirror_supported() && !m_memory_config->SST_mode;
+  if (m_cluster_icnt_mirror_ok) {
+    for (unsigned i = 0; i < n_cl; i++) {
+      assert(m_cluster[i]->get_cluster_id() == i);   // icnt_pop(m_cluster_id) 와 같은 장치 번호
+      m_cluster[i]->set_icnt_busy_mirror(&m_cluster_icnt_busy[i]);
+      icnt_set_out_mirror(i, &m_cluster_icnt_busy[i]);
+    }
+  }
+
+  // H3-3c: 서브파티션 L2 루프. 인터커넥트 출력 버퍼 훅이 필요하고(로컬 xbar), 방문마다 결과가
+  // 달라지는 선택 기능(power 누적, visualizer, SST)이 꺼져 있을 때만 건너뛴다.
+  m_l2loop_busy.assign(n_sub, 1);
+  m_l2loop_last.assign(n_sub, 0);
+  m_l2loop_mirror_ok = icnt_out_mirror_supported() && !m_memory_config->SST_mode &&
+                       !m_config.g_power_simulation_enabled && !m_config.g_visualizer_enabled;
+  if (m_l2loop_mirror_ok) {
+    for (unsigned i = 0; i < n_sub; i++) {
+      m_memory_sub_partition[i]->set_l2loop_mirror(&m_l2loop_busy[i]);
+      icnt_set_out_mirror(m_shader_config->mem2device(i), &m_l2loop_busy[i]);
+    }
+  }
+}
+
+// H3-3c: 틱 m_l2loop_tick 까지 건너뛴 방문의 포트 샘플을 모두 반영한다. 통계를 읽기 직전에 부른다.
+void gpgpu_sim::flush_l2loop_idle() {
+  if (!m_l2loop_mirror_ok) return;
+  for (unsigned i = 0; i < m_l2loop_last.size(); i++) {
+    const unsigned long long n = m_l2loop_tick - m_l2loop_last[i];
+    if (n) {
+      m_memory_sub_partition[i]->add_idle_l2loop_visits(n);
+      m_l2loop_last[i] = m_l2loop_tick;
+    }
+  }
+}
+
 void gpgpu_sim::cycle() {
   // 31: whole-body bracket. wall - sum(cycle_ns) isolates work outside cycle()
   // (trace parse at CTA issue is INSIDE, via issue_block2core -> tail bucket).
   const unsigned long long __cyc0 = g_phase_timing_on ? phase_now_ns() : 0;
   unsigned long long __pt_t0 = 0;  // set at the tail bracket; scope must outlive the CORE block
   int clock_mask = next_clock_domain();
+  // H3-3: 미러 연결은 어떤 클럭 블록보다 먼저(첫 사이클에 CORE/ICNT 가 없어도 L2 루프 전에).
+  if (!m_icnt_mirrors_wired) wire_icnt_mirrors();
 
   if (clock_mask & CORE) {
     const unsigned long long __pt_ci0 = g_phase_timing_on ? phase_now_ns() : 0;
     // shader core loading (pop from ICNT into core) follows CORE clock
-    for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++)
+    // H3-3b: 응답 FIFO 도 비고 인터커넥트 출력 버퍼도 빈 클러스터의 icnt_cycle() 은
+    // 아무 일도 하지 않는다(icnt_pop 이 NULL, 부작용 없음). 미러가 0 인 칸은 건너뛴다.
+    // g_accelsim_diag 는 방문마다 카운터를 올리므로 그때는 건너뛰지 않는다 -- 다만 미러는
+    // 계속 실제 상태로 갱신해 두어, 켜고 끄는 사이에도 불변식이 깨지지 않게 한다.
+    const bool skip_idle_clusters = m_cluster_icnt_mirror_ok && !g_accelsim_diag;
+    for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
+      if (skip_idle_clusters && !m_cluster_icnt_busy[i]) {
+#ifdef H33_MIRROR_CHECK   // build with -DH33_MIRROR_CHECK to assert the skip is a no-op
+        assert(m_cluster[i]->icnt_response_empty() && icnt_out_empty(i));
+#endif
+        continue;
+      }
       m_cluster[i]->icnt_cycle();
+      if (m_cluster_icnt_mirror_ok)
+        m_cluster_icnt_busy[i] =
+            (!m_cluster[i]->icnt_response_empty() || !icnt_out_empty(i)) ? 1 : 0;
+    }
     if (g_phase_timing_on)
       g_phase_timers.cluster_icnt_ns += phase_now_ns() - __pt_ci0;
   }
@@ -2795,7 +3103,16 @@ void gpgpu_sim::cycle() {
   if (clock_mask & ICNT) {
     const unsigned long long __pt2b = g_phase_timing_on ? phase_now_ns() : 0;
     // pop from memory controller to interconnect
+    // H3-3a: L2->icnt 큐가 빈 서브파티션은 top()==NULL(부작용 없음) -> pop() 도 빈 fifo 에서
+    // 아무것도 바꾸지 않는다(min_len 0 큐; m_request_tracker.erase(NULL) 은 no-op).
+    // 미러가 0 인 칸은 건너뛰고, 방문한 칸은 방문 직후 실제 상태로 미러를 맞춘다.
     for (unsigned i = 0; i < m_memory_config->m_n_mem_sub_partition; i++) {
+      if (!m_l2icnt_nonempty[i]) {
+#ifdef H33_MIRROR_CHECK
+        assert(m_memory_sub_partition[i]->l2icnt_queue_empty());
+#endif
+        continue;
+      }
       mem_fetch *mf = m_memory_sub_partition[i]->top();
       if (mf) {
         unsigned response_size =
@@ -2814,10 +3131,14 @@ void gpgpu_sim::cycle() {
       } else {
         m_memory_sub_partition[i]->pop();
       }
+      m_l2icnt_nonempty[i] = m_memory_sub_partition[i]->l2icnt_queue_empty() ? 0 : 1;  // H3-3a
     }
     if (g_phase_timing_on) {
-      g_phase_timers.icnt_ns += phase_now_ns() - __pt2b;
+      const unsigned long long __pt2e = phase_now_ns();
+      g_phase_timers.icnt_ns += __pt2e - __pt2b;
       g_phase_timers.icnt_calls++;
+      g_icnt_pop_ns += __pt2e - __pt2b;   // H3: mem-ctrl -> icnt pop loop
+      g_icnt_pop_calls++;
     }
   }
   partiton_replys_in_parallel += partiton_replys_in_parallel_per_cycle;
@@ -2878,7 +3199,25 @@ void gpgpu_sim::cycle() {
     }
 
     m_power_stats->pwr_mem_stat->l2_cache_stats[CURRENT_STAT_IDX].clear();
+    // H3-3c: 한가한 서브파티션(l2loop_idle && 인터커넥트 출력 버퍼 빔)의 방문은 L2 포트 샘플
+    // 1회 외에 아무것도 하지 않는다. 미러가 0 이면 건너뛰고, 다시 방문할 때(또는 통계 출력 전)
+    // 건너뛴 횟수만큼 샘플을 더한다. diag 는 방문마다 카운터를 올리므로 그때는 건너뛰지 않되
+    // 미러·틱 장부는 계속 맞춰 둔다.
+    const unsigned long long l2tick = ++m_l2loop_tick;
+    const bool skip_idle_l2 = m_l2loop_mirror_ok && !g_accelsim_diag;
     for (unsigned i = 0; i < m_memory_config->m_n_mem_sub_partition; i++) {
+      if (skip_idle_l2 && !m_l2loop_busy[i]) {
+#ifdef H33_MIRROR_CHECK
+        assert(m_memory_sub_partition[i]->l2loop_idle(SECTOR_CHUNCK_SIZE) &&
+               icnt_out_empty(m_shader_config->mem2device(i)));
+#endif
+        continue;
+      }
+      if (m_l2loop_mirror_ok) {
+        const unsigned long long skipped = l2tick - m_l2loop_last[i] - 1;
+        if (skipped) m_memory_sub_partition[i]->add_idle_l2loop_visits(skipped);
+        m_l2loop_last[i] = l2tick;
+      }
       // move memory request from interconnect into memory partition (if not
       // backed up) Note:This needs to be called in DRAM clock domain if there
       // is no L2 cache in the system In the worst case, we may need to push
@@ -2903,6 +3242,9 @@ void gpgpu_sim::cycle() {
         m_memory_sub_partition[i]->accumulate_L2cache_stats(
             m_power_stats->pwr_mem_stat->l2_cache_stats[CURRENT_STAT_IDX]);
       }
+      if (m_l2loop_mirror_ok)   // H3-3c
+        m_l2loop_busy[i] = (m_memory_sub_partition[i]->l2loop_idle(SECTOR_CHUNCK_SIZE) &&
+                            icnt_out_empty(m_shader_config->mem2device(i))) ? 0 : 1;
     }
     if (g_phase_timing_on) {
       g_phase_timers.l2gmmu_ns += phase_now_ns() - __pt1;
@@ -2917,7 +3259,9 @@ void gpgpu_sim::cycle() {
 
   if (clock_mask & ICNT) {
     const unsigned long long __pt2 = g_phase_timing_on ? phase_now_ns() : 0;
-    g_icnt_now = gpu_sim_cycle + gpu_tot_sim_cycle;  // FUNNEL_ (temp): xbar arrival timestamp
+    // FUNNEL_ (temp): xbar arrival timestamp. ST-10: only the ACCELSIM_DIAG
+    // readers (gmmu MEMLAT/FUNNEL, shader NORMREP) consume it, so stamp only then.
+    if (g_accelsim_diag) g_icnt_now = gpu_sim_cycle + gpu_tot_sim_cycle;
     icnt_transfer();
     if (g_phase_timing_on) {
       g_phase_timers.icnt_ns += phase_now_ns() - __pt2;
@@ -2947,8 +3291,24 @@ void gpgpu_sim::cycle() {
     }
     // L1 cache + shader core pipeline stages
     m_power_stats->pwr_mem_stat->core_cache_stats[CURRENT_STAT_IDX].clear();
-    // T2-PROBE: snapshot the shared guard term before the loop so a mid-loop
-    // change (set_kernel_done() clearing m_running_kernels) can be detected.
+    // H2-A (speed): get_more_cta_left() is loop-invariant here -- it takes no
+    // per-cluster input -- yet it was called inside the loop below, where the `||`
+    // short circuit re-evaluates it for every IDLE cluster. It walks all
+    // -gpgpu_max_concurrent_kernel slots (128 in the MCM configs), so a cycle with
+    // many idle SMs paid up to 256 x 128 NULL checks. Measured at ~7% of run time.
+    //
+    // Hoisting is VALUE-identical, not merely close. The only mutation of the state
+    // it reads that is reachable from pass A is set_kernel_done()'s
+    // `m_running_kernels[k] = NULL` (via register_cta_thread_exit), and that call
+    // sits behind `!kernel_more_cta_left(kernel)`. So at that point either
+    // hit_max_cta_count() is true -- and then get_more_cta_left() returns false on
+    // its own first line, before and after -- or the kernel being retired had
+    // no_more_ctas_to_run(), i.e. it was already contributing false to the OR.
+    // Dropping a slot that contributed false cannot flip the result. CTA issue and
+    // m_total_cta_launched move only in the sequential tail, after this loop joins.
+    // (This is the snapshot the old T2-PROBE comment described; that probe was
+    // removed at some point and left its comment stranded above the accumulator.)
+    const bool more_cta_left = get_more_cta_left();
     unsigned long long active_sms_this_cycle = 0;
     // P5: one chiplet per thread. Order *within* a chiplet stays sequential --
     // that is the order gpu_l2_tlb / gmmu state depends on (design doc 7-1).
@@ -3020,7 +3380,7 @@ void gpgpu_sim::cycle() {
       // Evaluate once and reuse: keeps the original short-circuit semantics of
       // "get_not_completed() || get_more_cta_left()" exactly.
       const unsigned not_completed = m_cluster[i]->get_not_completed();
-      m_cluster_ran[i] = (not_completed || get_more_cta_left()) ? 1 : 0;
+      m_cluster_ran[i] = (not_completed || more_cta_left) ? 1 : 0;   // H2-A
       if (m_cluster_ran[i]) m_cluster[i]->core_cycle_phase_a();
     }
     if (g_phase_timing_on) {
@@ -3037,14 +3397,39 @@ void gpgpu_sim::cycle() {
     // surplus threads idle here and pick the work back up in pass C.
     const unsigned long long __pt_b0 = g_phase_timing_on ? phase_now_ns() : 0;
 #pragma omp parallel for schedule(runtime) if(par_b)
-    for (unsigned ch = 0; ch < n_chiplet_groups; ch++)
-    for (unsigned ci = 0; ci < m_chiplet_cluster_order[ch].size(); ci++) {
-      const unsigned i = m_chiplet_cluster_order[ch][ci];
-      if (m_cluster_ran[i]) m_cluster[i]->core_cycle_phase_b();
+    for (unsigned ch = 0; ch < n_chiplet_groups; ch++) {
+      const unsigned long long __pt_bc0 = g_phase_timing_on ? phase_now_ns() : 0;  // D1
+      for (unsigned ci = 0; ci < m_chiplet_cluster_order[ch].size(); ci++) {
+        const unsigned i = m_chiplet_cluster_order[ch][ci];
+        if (m_cluster_ran[i]) m_cluster[i]->core_cycle_phase_b();
+      }
+      if (g_phase_timing_on && ch < 8) {  // D1: per-group time + running thread
+        const unsigned long long __pt_body = phase_now_ns() - __pt_bc0;
+        g_phase_timers.phase_b_chip_ns[ch] += __pt_body;
+        g_phase_timers.phase_b_chip_cur_ns[ch] = __pt_body;  // D1b
+#ifdef _OPENMP
+        const int tid = omp_get_thread_num();
+#else
+        const int tid = 0;
+#endif
+        if (tid >= 0 && tid < 16) g_phase_timers.phase_b_chip_thread[ch][tid]++;
+      }
     }
     if (g_phase_timing_on) {
       g_phase_timers.phase_b_ns += phase_now_ns() - __pt_b0;
       g_phase_timers.phase_b_calls++;
+      {  // D1b: per-cycle maximum over groups (serial, after the region joined)
+        unsigned long long mx = 0; unsigned am = 0;
+        for (unsigned c = 0; c < n_chiplet_groups && c < 8; c++) {
+          const unsigned long long v = g_phase_timers.phase_b_chip_cur_ns[c];
+          g_phase_timers.phase_b_body_hist[phase_log2us_bucket(v)]++;
+          if (v > mx) { mx = v; am = c; }
+          g_phase_timers.phase_b_chip_cur_ns[c] = 0;
+        }
+        g_phase_timers.phase_b_cyclemax_ns += mx;
+        g_phase_timers.phase_b_argmax_cnt[am]++;
+        g_phase_timers.phase_b_max_hist[phase_log2us_bucket(mx)]++;
+      }
     }
 
     // P11: pass C is per-SM work only, same as pass A -- flat, full thread width.
@@ -3199,9 +3584,19 @@ void gpgpu_sim::cycle() {
     int all_threads_complete = 1;
     if (m_config.gpgpu_flush_l1_cache) {
       for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
-        if (m_cluster[i]->get_not_completed() == 0)
-          m_cluster[i]->cache_invalidate();
-        else
+        if (m_cluster[i]->get_not_completed() == 0) {
+          // H2-C: tag_array::invalidate() returns immediately unless the array was
+          // touched since the last invalidate (gpu-cache.cc: `if (!is_used) return`),
+          // so the call was a no-op on almost every cluster on almost every cycle --
+          // but it still cost a walk into each core's tag_array (4.3% of run time at
+          // 256 SMs). m_l1_used mirrors that flag per cluster in one contiguous
+          // array; a zero there means is_used is false on every core of the cluster,
+          // so the skipped call could not have changed any state.
+          if (m_l1_used.empty() || m_l1_used[i]) {
+            m_cluster[i]->cache_invalidate();
+            if (!m_l1_used.empty()) m_l1_used[i] = 0;
+          }
+        } else
           all_threads_complete = 0;
       }
     }
@@ -3323,17 +3718,33 @@ void gpgpu_sim::perf_memcpy_to_gpu(size_t dst_start_addr, size_t count) {
     // counter must be size_t: a 32-bit unsigned wraps to 0 at exactly 4GiB
     // (count == 2^32), turning this loop infinite. First hit by LUD's 4GiB
     // HtoD copy; every smaller memcpy terminates and hid the bug.
+    // S2: the four 32 B sectors of one 128 B line share their sub-partition
+    // whenever no chip/bank/hash bit lies below bit 7 (checked once); decode the
+    // line once instead of once per sector. Same calls, same order, same values.
+    static const bool line_memo =
+        m_memory_config->m_address_mapping.sub_partition_fixed_within(7);
+    bool have_line = false;
+    size_t memo_line = 0;
+    unsigned memo_sub = 0;
     for (size_t counter = 0; counter < count; counter += 32) {
-      const unsigned wr_addr = dst_start_addr + counter;
-      addrdec_t raw_addr;
+      // s31: 64-bit like Accel-Sim v2.0.0 (was `const unsigned`, which cut the
+      // 64-bit destination address to its low 32 bits). Note: this address is the
+      // memcpy destination VA -- this warm-up is not translated, so the MCM
+      // experiments run with -gpgpu_perf_sim_memcpy 0 (docs/s31 section 6).
+      const size_t wr_addr = dst_start_addr + counter;
       mem_access_sector_mask_t mask;
       mask.set(wr_addr % 128 / 32);
-      m_memory_config->m_address_mapping.addrdec_tlx(wr_addr, &raw_addr);
+      if (!(line_memo && have_line && (wr_addr >> 7) == memo_line)) {
+        addrdec_t raw_addr;
+        m_memory_config->m_address_mapping.addrdec_tlx(wr_addr, &raw_addr);
+        memo_sub = raw_addr.sub_partition;
+        memo_line = wr_addr >> 7;
+        have_line = true;
+      }
       const unsigned partition_id =
-          raw_addr.sub_partition /
-          m_memory_config->m_n_sub_partition_per_memory_channel;
+          memo_sub / m_memory_config->m_n_sub_partition_per_memory_channel;
       m_memory_partition_unit[partition_id]->handle_memcpy_to_gpu(
-          wr_addr, raw_addr.sub_partition, mask);
+          wr_addr, memo_sub, mask);
     }
   }
 }

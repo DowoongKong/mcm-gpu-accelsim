@@ -98,12 +98,16 @@ memory_partition_unit::memory_partition_unit(unsigned partition_id,
 void memory_partition_unit::handle_memcpy_to_gpu(
     size_t addr, unsigned global_subpart_id, mem_access_sector_mask_t mask) {
   unsigned p = global_sub_partition_id_to_local_id(global_subpart_id);
-  std::string mystring = mask.to_string<char, std::string::traits_type,
-                                        std::string::allocator_type>();
-  MEMPART_DPRINTF(
-      "Copy Engine Request Received For Address=%zx, local_subpart=%u, "
-      "global_subpart=%u, sector_mask=%s \n",
-      addr, p, global_subpart_id, mystring.c_str());
+  // S2: build the debug string only when this trace stream is on (it was built
+  // for every 32 B of every memcpy and thrown away).
+  if (MEMPART_DTRACE(MEMORY_PARTITION_UNIT)) {
+    std::string mystring = mask.to_string<char, std::string::traits_type,
+                                          std::string::allocator_type>();
+    MEMPART_DPRINTF(
+        "Copy Engine Request Received For Address=%zx, local_subpart=%u, "
+        "global_subpart=%u, sector_mask=%s \n",
+        addr, p, global_subpart_id, mystring.c_str());
+  }
   m_sub_partition[p]->force_l2_tag_update(
       addr, m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle, mask);
 }
@@ -473,7 +477,7 @@ void memory_sub_partition::cache_cycle(unsigned cycle) {
         mf->set_reply();
         mf->set_status(IN_PARTITION_L2_TO_ICNT_QUEUE,
                        m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
-        m_L2_icnt_queue->push(mf);
+        l2icnt_push(mf);
       } else {
         if (m_config->m_L2_config.m_write_alloc_policy == FETCH_ON_WRITE) {
           mem_fetch *original_wr_mf = mf->get_original_wr_mf();
@@ -482,7 +486,7 @@ void memory_sub_partition::cache_cycle(unsigned cycle) {
           original_wr_mf->set_status(
               IN_PARTITION_L2_TO_ICNT_QUEUE,
               m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
-          m_L2_icnt_queue->push(original_wr_mf);
+          l2icnt_push(original_wr_mf);
         }
         m_request_tracker.erase(mf);
         delete mf;
@@ -505,7 +509,7 @@ void memory_sub_partition::cache_cycle(unsigned cycle) {
       if (mf->is_write() && mf->get_type() == WRITE_ACK)
         mf->set_status(IN_PARTITION_L2_TO_ICNT_QUEUE,
                        m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
-      m_L2_icnt_queue->push(mf);
+      l2icnt_push(mf);
       m_dram_L2_queue->pop();
     }
   }
@@ -545,7 +549,7 @@ void memory_sub_partition::cache_cycle(unsigned cycle) {
               mf->set_reply();
               mf->set_status(IN_PARTITION_L2_TO_ICNT_QUEUE,
                              m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
-              m_L2_icnt_queue->push(mf);
+              l2icnt_push(mf);
             }
             m_icnt_L2_queue->pop();
           } else {
@@ -565,7 +569,7 @@ void memory_sub_partition::cache_cycle(unsigned cycle) {
               mf->set_reply();
               mf->set_status(IN_PARTITION_L2_TO_ICNT_QUEUE,
                              m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
-              m_L2_icnt_queue->push(mf);
+              l2icnt_push(mf);
             }
           }
           // L2 cache accepted request
@@ -618,6 +622,32 @@ bool memory_sub_partition::dram_L2_queue_full() const {
 
 void memory_sub_partition::dram_L2_queue_push(class mem_fetch *mf) {
   m_dram_L2_queue->push(mf);
+  // H3-3c: DRAM 병렬 루프에서 호출된다. 이 서브파티션은 한 memory_partition_unit 에만
+  // 속하므로 이 바이트를 쓰는 스레드는 하나다.
+  if (m_l2loop_mirror) *m_l2loop_mirror = 1;
+}
+
+// H3-3c: cache_cycle() 을 단계별로 따라가 "샘플 1회 외 no-op" 조건을 모은다.
+//  - gpgpu_sim 루프: full(sector) 이면 gpu_stall_dramfull++ 이므로 full 이 아니어야 한다.
+//  - 단계1 L2 fill 응답: access_ready() 가 거짓.
+//  - 단계2 DRAM->L2: m_dram_L2_queue 가 빔.
+//  - L2cache->cycle(): miss 큐 비고 두 포트 한가 -> 샘플(false,false) 1회 + 보충 no-op.
+//  - 단계3 새 접근: m_icnt_L2_queue 가 빔.
+//  - 단계4 ROP: m_rop 가 빔(준비 시각이 남은 항목도 방문 대상으로 둔다).
+// m_L2_icnt_queue / m_L2_dram_queue 는 이 루프의 판정에 영향이 없다(각각 pop 루프와 DRAM 이 비운다).
+bool memory_sub_partition::l2loop_idle(unsigned sector_chunk) const {
+  if (full(sector_chunk)) return false;
+  if (!m_dram_L2_queue->empty() || !m_icnt_L2_queue->empty() || !m_rop.empty()) return false;
+  if (!m_config->m_L2_config.disabled()) {
+    if (m_L2cache->access_ready() || !m_L2cache->miss_queue_empty() ||
+        !m_L2cache->data_port_free() || !m_L2cache->fill_port_free())
+      return false;
+  }
+  return true;
+}
+
+void memory_sub_partition::add_idle_l2loop_visits(unsigned long long n) {
+  if (n && !m_config->m_L2_config.disabled()) m_L2cache->add_idle_port_samples(n);
 }
 
 void memory_sub_partition::print_cache_stat(unsigned &accesses,
@@ -702,6 +732,7 @@ unsigned memory_sub_partition::flushL2() {
   if (!m_config->m_L2_config.disabled()) {
     m_L2cache->flush();
   }
+  if (m_l2loop_mirror) *m_l2loop_mirror = 1;   // H3-3c: 보수적으로 깨운다
   return 0;  // TODO: write the flushed data to the main memory
 }
 

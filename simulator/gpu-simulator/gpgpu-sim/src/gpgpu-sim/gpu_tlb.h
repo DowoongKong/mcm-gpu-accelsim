@@ -21,6 +21,16 @@ class l1_tlb_mshr {
   // Returns true if MSHR is full for vpn (either table full or max_merge hit).
   bool full(uint64_t vpn) const;
 
+  // H3-4: probe(vpn) 와 full(vpn) 을 해시 조회 한 번으로 함께 낸다. 정의는 두 함수와
+  // 완전히 같다(in_flight == probe, is_full == full). 대기열 재검사에서 요청마다
+  // 같은 VPN 을 3번 조회하던 것을 1번으로 줄이려는 것. 상태를 바꾸지 않는다.
+  void peek(uint64_t vpn, bool &in_flight, bool &is_full) const {
+    auto it = m_entries.find(vpn);
+    in_flight = (it != m_entries.end());
+    is_full = in_flight ? (it->second.waiters.size() >= m_max_merge)
+                        : (m_entries.size() >= m_num_entries);
+  }
+
   // Add one pending request for vpn. Caller must check !full() first.
   struct l1_fill_token { uint64_t vpn; std::vector<unsigned> waiters; };
   void add(uint64_t vpn, unsigned warp_id);
@@ -54,7 +64,21 @@ class l1_tlb_mshr {
 
   unsigned size() const { return (unsigned)m_entries.size(); }
 
-  std::vector<uint64_t> get_pending_vpns() const;
+  // T10: is vpn an entry whose walk has not completed (what for_each_pending
+  // would visit)?
+  bool is_pending(uint64_t vpn) const {
+    auto it = m_entries.find(vpn);
+    return it != m_entries.end() && !it->second.ready;
+  }
+
+  // T1-c: visit every VPN whose walk has not completed, in container order --
+  // the same order the old get_pending_vpns() snapshot delivered, without the
+  // per-fill vector. f may call mark_ready() (value-only mutation); it must
+  // not add or erase entries.
+  template <class F> void for_each_pending(F f) {
+    for (auto &kv : m_entries)
+      if (!kv.second.ready) f(kv.first);
+  }
 
  private:
   unsigned m_num_entries;
@@ -206,6 +230,19 @@ class gpu_l1_tlb {
   // Index = remaining latency stage. (SMELL-10: the historical _4k suffixes on
   // these members were dropped in the audit fix pass.)
   std::vector<std::vector<lookup_slot>> m_lookup_pipe;
+  // T3: the pipe is a ring. Stage k (remaining latency) lives in
+  // m_lookup_pipe[(m_pipe_head + k) % L]; cycle() drains stage 0, clears that
+  // vector and advances m_pipe_head instead of moving L-1 vectors down every
+  // cycle. Stage contents are identical to the shifting form at every cycle.
+  unsigned m_pipe_head = 0;
+  // T15 (P4-12): number of slots in the whole ring (every stage). Slots are
+  // added only by the push in access() and removed only by the head clear in
+  // cycle(); with none in flight and no MSHR-full waiter, cycle() has nothing
+  // to do beyond its XLATLAT sampling and returns early.
+  unsigned m_pipe_live = 0;
+  std::vector<lookup_slot> &pipe_stage(unsigned k) {
+    return m_lookup_pipe[(m_pipe_head + k) % m_lookup_latency];
+  }
   // Lookup ports: cap on how many probes may sit in the pipe at once.
   // 0 = unlimited (pre-existing behaviour). m_inflight_lookup IS the
   // occupancy set, so there is no second counter to drift out of sync.
@@ -214,14 +251,25 @@ class gpu_l1_tlb {
   unsigned m_concurrent_max = 0;
   unsigned m_l2_req_q_max = 0;
   std::unordered_set<uint64_t> m_inflight_lookup;  // rid: prevent re-injection (re-poll idempotent)
-  std::unordered_map<uint64_t, result_t> m_resolved;  // rid -> MISS / MSHR_HIT (awaiting fill)
+  // L1FWD: a resolved request also carries the PTE handed to it -- at resolve
+  // time for an array hit, at fill time for an MSHR waiter -- so it can be
+  // consumed even if the shared array evicts the page before the warp's replay
+  // (hardware delivers the fill response to each waiting request).
+  struct resolved_t { result_t r; bool has_pte; gpu_pte_t pte; };
+  std::unordered_map<uint64_t, resolved_t> m_resolved;  // rid -> verdict (+ PTE once delivered)
+  unsigned long long m_fwd_delivered = 0;  // L1FWD: consumptions served from the delivered PTE
 
   unsigned long long m_hits;
   unsigned long long m_misses;
   unsigned long long m_mshr_hits;
-  unsigned long long m_mshr_merge_full   = 0;  // entry merge cap hit (waiters >= max_merge)
-  unsigned long long m_mshr_entries_full = 0;  // MSHR table full (no free entry for a new VPN)
-  unsigned long long m_resv_fail_cycles  = 0;  // total cycles requests stayed blocked (both kinds)
+  // MSHR-full accounting. Since 36a these are BLOCKED-CYCLE counts split by
+  // cause, not event counts: the wake path adds every skipped cycle and the
+  // immediate-fail path adds one per attempt, so on every STAT line
+  //   merge_full + entries_full == resv_fail_cycles
+  // holds exactly (checked on BC 77zf and spmv344M logs, 11,440/11,440 lines).
+  unsigned long long m_mshr_merge_full   = 0;  // cycles blocked by the per-entry merge cap
+  unsigned long long m_mshr_entries_full = 0;  // cycles blocked by a full MSHR table (new VPN)
+  unsigned long long m_resv_fail_cycles  = 0;  // sum of the two (kept for log compatibility)
   std::unordered_map<uint64_t, uint64_t> m_resv_fail_start;  // rid -> first cycle it hit MSHR-full
   // m_resv_fail_events removed -- it equals merge_full + entries_full now
 
@@ -250,7 +298,8 @@ class gpu_l1_tlb {
   }
   int find_way(unsigned sidx, uint64_t vpn) const;
   int lru_victim(unsigned sidx) const;
-  bool resolve_lookup(const lookup_slot &s, uint64_t cur);
+  // H3-4: false 로 돌아올 때(상태 변경 없음) *in_flight_out 에 probe(vpn) 값을 돌려준다.
+  bool resolve_lookup(const lookup_slot &s, uint64_t cur, bool *in_flight_out = NULL);
 
   // 44-3: next_poll = the L2 probe-gate expiry for this entry (0 = poll now).
   // While the gate is open the L2 answer is LOOKUP_PENDING with no state
@@ -259,8 +308,13 @@ class gpu_l1_tlb {
   // is a pure function of the L2 (array, MSHR) state, so re-poll only when the
   // L2 state epoch moves. wait_merge remembers which counter the frozen
   // verdict was charging (merge cap vs table full) for exact synthesis.
+  // T12..T14: frozen-verdict snapshot taken at the MSHR_FULL verdict;
+  // wait_epoch == 0 means not frozen (1 for a table-full waiter, ep_consume()
+  // for a merge-cap waiter). wait_ep2 = ep_set_idx(set) (fills into the set
+  // and MSHR inserts of a vpn of the set), wait_ep3 = the vpn's L2 set index.
   struct l1_tlb_req { uint64_t vpn; unsigned warp_id; uint64_t enqueue_cycle;
-                      uint64_t next_poll; uint64_t wait_epoch; bool wait_merge; };
+                      uint64_t next_poll; uint64_t wait_epoch; bool wait_merge;
+                      uint64_t wait_ep2; uint64_t wait_ep3; };
   std::deque<l1_tlb_req> m_l2_req_queue;   // cache: m_miss_queue
   std::vector<unsigned>  m_hit_wakeup;     // P5: parked warps resolved to HIT
 
@@ -272,6 +326,28 @@ class gpu_l1_tlb {
   l2_req_iter l2_req_begin() { return m_l2_req_queue.begin(); }
   l2_req_iter l2_req_end()   { return m_l2_req_queue.end(); }
   l2_req_iter l2_req_erase(l2_req_iter it) { return m_l2_req_queue.erase(it); }
+  // T16 (P4-13): memo of the last complete walk over m_l2_req_queue by
+  // ldst_unit::cycle_b. Armed only when that walk visited every entry (no
+  // link-budget stop) and left every entry asleep: gated (cur < next_poll) or
+  // MSHR-full-frozen with its skip condition true. Entry state changes only
+  // inside the walk, and the queue only grows outside it (resolve_lookup's
+  // push, counted by m_l2_req_enq), so while the memo's premises hold the
+  // next walk would visit the same entries in the same states, make no L2
+  // call and only charge the per-entry skip counters -- cycle_b charges those
+  // in one batch instead.
+  struct walk_memo_t {
+    bool armed = false;
+    unsigned n_gated = 0, n_merge = 0, n_table = 0;
+    uint64_t min_next_poll = 0;            // over the gated entries
+    uint64_t ep_set_any = 0, ep_consume = 0;  // L2 snapshots at arm time
+    uint64_t enq_seq = 0;                  // m_l2_req_enq at arm time
+  };
+  walk_memo_t &walk_memo() { return m_walk_memo; }
+  uint64_t l2_req_enq_seq() const { return m_l2_req_enq; }
+ private:
+  walk_memo_t m_walk_memo;                 // T16
+  uint64_t m_l2_req_enq = 0;               // T16: counts every m_l2_req_queue push_back
+ public:
 };
 
 //  L2 TLB MSHR entry
@@ -313,9 +389,12 @@ class gpu_l2_tlb {
 
   // 44-3: ready_out (optional) reports the probe-gate expiry cycle when the
   // answer is LOOKUP_PENDING, so the drain loop can skip re-polls until then.
+  // was_probing_out (T1-a): true when this rid was already inside its probe
+  // window at entry -- identical to is_probing(), taken from the find() the
+  // gate check performs anyway.
   result_t access(uint64_t va, unsigned cluster_id,
                   gpu_pte_t& out_pte, uint64_t current_cycle,
-                  uint64_t* ready_out = NULL);
+                  uint64_t* ready_out = NULL, bool* was_probing_out = NULL);
 
   // XLATLAT: L2-side boundaries for one (cluster, vpn) request.
   //   mark_pwq_enq : the GMMU accepted it into the PWQ (t5)
@@ -342,6 +421,22 @@ class gpu_l2_tlb {
   // If pte_ready and cluster_id is in pending_clusters: fills out_pte, removes
   // cluster_id (frees entry when list empties), returns true.
   bool query_completed(uint64_t vpn, unsigned cluster_id, gpu_pte_t& out_pte);
+  // T10 (P4-9): the set of VPNs for which query_completed(vpn, cluster_id)
+  // would return true right now (entry pte_ready and cluster_id in its
+  // pending list). Kept exact at the only places that condition changes:
+  // fill() (true for every pending cluster), resolve()'s merge into an
+  // already-ready entry (true for the merging cluster), query_completed() and
+  // remove_from_mshr() (false once the cluster is gone). An SM's completion
+  // poll reads its own list instead of probing every pending L1 MSHR entry.
+  // Stale members (condition true, but the SM no longer has that VPN pending)
+  // are kept: the poller filters them by its L1 MSHR state every time.
+  std::vector<uint64_t> &ready_for(unsigned cluster_id) {
+    if (cluster_id >= m_ready_by_cluster.size())
+      m_ready_by_cluster.resize(cluster_id + 1);
+    return m_ready_by_cluster[cluster_id];
+  }
+  // P4_CHECK: side-effect-free form of the query_completed() condition.
+  bool completable(uint64_t vpn_val, unsigned cluster_id) const;
 
   // Removes cluster_id from MSHR entry for vpn.
   // Used by l2_tlb_request() to roll back when GMMU PWQ is full.
@@ -379,12 +474,20 @@ class gpu_l2_tlb {
   void tick(uint64_t current_cycle);
 
   void print_stats(FILE* f = stdout) const;
+  // -gpgpu_l2_tlb_set_hash: must be called before the first access (no entries yet).
+  void set_set_hash(unsigned mode);
 
  private:
   unsigned m_num_sets;
   unsigned m_assoc;
   unsigned m_chiplet_id;
   unsigned m_page_shift;
+  // Set index function (-gpgpu_l2_tlb_set_hash): 0 = vpn % sets, 1 = XOR-fold (see set_idx()).
+  unsigned m_set_hash = 0;
+  unsigned m_set_bits = 0;   // log2(m_num_sets), valid when m_num_sets is a power of two
+  // Per-set usage (ACCELSIM_TLB_SETSTAT=1 prints them): verdicts and array fills per set.
+  std::vector<unsigned long long> m_set_lookups;
+  std::vector<unsigned long long> m_set_fills;
   // Lookup ports. A port is held from injection until the request leaves the
   // lookup stage; an MSHR-full retry has not left it yet, so it keeps its slot.
   // 0 = unlimited, which is the behaviour that existed before this option.
@@ -398,13 +501,37 @@ class gpu_l2_tlb {
 
   std::vector<std::vector<l1_tlb_entry_t>> m_sets;  // reuse L1 entry type
   std::unordered_map<uint64_t, l2_mshr_entry_t> m_mshr;
-  std::unordered_map<uint64_t, uint64_t> m_lookup_ready;  // keyed by req_key(cluster,vpn)
+  // T10: see ready_for(). Indexed by global cluster id; each list is a set.
+  std::vector<std::vector<uint64_t>> m_ready_by_cluster;
+  void ready_add(unsigned cluster_id, uint64_t vpn_val) {
+    std::vector<uint64_t> &v = ready_for(cluster_id);
+    for (size_t k = 0; k < v.size(); k++)
+      if (v[k] == vpn_val) return;
+    v.push_back(vpn_val);
+  }
+  void ready_del(unsigned cluster_id, uint64_t vpn_val) {
+    std::vector<uint64_t> &v = ready_for(cluster_id);
+    for (size_t k = 0; k < v.size(); k++)
+      if (v[k] == vpn_val) {
+        v[k] = v.back();
+        v.pop_back();
+        return;
+      }
+  }
+  // Probe-latency gate per request, keyed by req_key(cluster,vpn). ready = the
+  // cycle the probe may resolve; blocked = an MSHR-full start has already been
+  // recorded in m_resv_fail_start (T1-b: a re-verdict skips the emplace and
+  // re-arms in place). Invariant: key set == m_probing.
+  struct gate_t { uint64_t ready; bool blocked; };
+  std::unordered_map<uint64_t, gate_t> m_lookup_ready;
 
   unsigned long long m_hits;
   unsigned long long m_misses;
   unsigned long long m_mshr_hits;
-  unsigned long long m_mshr_merge_full   = 0;  // pending_clusters >= max_merge (entry merge cap)
-  unsigned long long m_mshr_entries_full = 0;  // MSHR table full (new VPN, no free entry)
+  // MSHR-full accounting, same semantics as gpu_l1_tlb: BLOCKED-CYCLE counts
+  // split by cause (36a), so merge_full + entries_full == resv_fail_cycles.
+  unsigned long long m_mshr_merge_full   = 0;  // cycles blocked by the merge cap (pending_clusters >= max_merge)
+  unsigned long long m_mshr_entries_full = 0;  // cycles blocked by a full MSHR table (new VPN)
   // Reservation-fail accounting, mirroring gpu_l1_tlb. The L2 had none even
   // though its probe latency (80) makes an MSHR-full stall far costlier.
   // XLATDBG: which gate branch each access() took.
@@ -415,10 +542,31 @@ class gpu_l2_tlb {
   // is open. The original counted one LOOKUP_PENDING per reached entry per
   // cycle; the skip path reproduces exactly that count here.
   void note_gate_pending() { m_gate_pending++; }
+  void note_gate_pending_n(unsigned n) { m_gate_pending += n; }  // T16
   // 44-4: state epoch for the MSHR_FULL retry gate. Bumped by every mutation
   // that can change a resolve() verdict or its fail type: fill (array + MSHR),
   // MSHR entry insert/erase, and pending_clusters growth/consumption.
-  uint64_t mshr_epoch() const { return m_mshr_epoch; }
+  // T12/T13 (P4-11): a frozen (MSHR_FULL) request skips its re-poll while its
+  // verdict is provably unchanged. resolve() reads: the array set of its vpn
+  // (written only by fill), the MSHR entry of its vpn (insert / consume /
+  // erase) and the MSHR size. Hence:
+  //   table-full waiter (vpn absent): verdict stays MSHR_FULL(table) while
+  //     table_full() holds NOW and its set's epoch stands still -- that epoch
+  //     moves on a fill into the set and on an MSHR insert of any vpn of the
+  //     set (T14: covers "its vpn now exists" conservatively, one load; the
+  //     T13 insert log cost a scan per frozen entry per cycle). The freed slot
+  //     is refilled by the first waiter of the same cycle, so every later
+  //     waiter of that cycle skips.
+  //   merge-cap waiter (vpn present): ep_consume (its entry may have shrunk
+  //     or gone) and its set's epoch.
+  // A merge (pending_clusters growth) flips neither verdict.
+  bool table_full() const { return m_mshr.size() >= m_mshr_entries; }
+  uint64_t ep_consume() const { return m_ep_consume; }
+  unsigned set_of(uint64_t vpn_val) const { return set_idx(vpn_val); }
+  uint64_t ep_set_idx(unsigned sidx) const { return m_ep_set[sidx]; }
+  // P4_CHECK: the MSHR_FULL verdict resolve() would give now, without
+  // mutating anything (array probe, then the two MSHR checks in that order).
+  bool full_verdict(uint64_t vpn_val, bool *merge) const;
   bool last_full_merge() const { return m_last_full_merge; }
   // One skipped reached-cycle == one original retry: it charged gate_expire
   // plus the (frozen) fail-type counter inside resolve().
@@ -426,8 +574,17 @@ class gpu_l2_tlb {
     m_gate_expire++;
     if (merge) m_mshr_merge_full++; else m_mshr_entries_full++;
   }
+  void note_mshr_full_skip_n(unsigned n_merge, unsigned n_table) {  // T16
+    m_gate_expire += n_merge + n_table;
+    m_mshr_merge_full += n_merge;
+    m_mshr_entries_full += n_table;
+  }
+  // T16: moves whenever any m_ep_set[] entry moves (fill or MSHR insert).
+  uint64_t ep_set_any() const { return m_ep_set_any; }
  private:
-  uint64_t m_mshr_epoch = 1;
+  uint64_t m_ep_consume = 1;         // T12
+  std::vector<uint64_t> m_ep_set;    // T12/T14: per set, fills + inserts
+  uint64_t m_ep_set_any = 1;         // T16
   uint64_t m_fill_seq = 0;   // P-1: see fill_seq()
   bool m_last_full_merge = false;
 
@@ -441,7 +598,19 @@ class gpu_l2_tlb {
 
 
   uint64_t vpn(uint64_t va)      const { return va >> m_page_shift; }
-  unsigned set_idx(uint64_t vpn) const { return vpn % m_num_sets; }
+  // Set index. Mode 0 keeps the pre-existing modulo: only the low log2(sets) VPN bits
+  // pick the set, so a stream whose pages are 2^s pages apart reaches sets/2^s sets.
+  // Mode 1 folds the whole VPN in log2(sets)-bit chunks and XORs them (set bit k =
+  // VPN bit k ^ bit k+b ^ bit k+2b ...): consecutive pages still map to consecutive
+  // sets, while the higher chunks spread power-of-two strides over all sets. This is
+  // the XOR-fold form measured on real NVIDIA L2/L3 TLBs (Nayak'21: L3 XOR-7; NDSS'26
+  // A10; RTX 3090 probe in regular_exp/scripts/tlb_probe).
+  unsigned set_idx(uint64_t vpn) const {
+    if (m_set_hash == 0) return vpn % m_num_sets;
+    unsigned s = 0;
+    for (uint64_t v = vpn; v != 0; v >>= m_set_bits) s ^= (unsigned)(v & (m_num_sets - 1));
+    return s;
+  }
   static uint64_t req_key(unsigned cluster_id, uint64_t vpn) {  // add
     return (vpn << 12) | (cluster_id & 0xFFF);                  // cluster_id < 4096
   }

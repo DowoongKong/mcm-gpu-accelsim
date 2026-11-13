@@ -166,6 +166,11 @@ class gmmu {
   unsigned long long m_local_steps;    // NEW: child_mf sent to local chiplet DRAM
   unsigned long long m_remote_steps;   // NEW: child_mf sent to remote chiplet DRAM
   unsigned long long m_pwc_hits;       // NEW: levels skipped due to PWC hit
+  // Per-level PWC accounting (levels 0..2 = PML4/PDP/PD; the leaf is never cached).
+  // A 4 KB walk probes every intermediate level top-down, so lookups[k] equals the
+  // number of walks that reached level k; hits sum to m_pwc_hits.
+  unsigned long long m_pwc_lookups_lvl[3] = {0, 0, 0};
+  unsigned long long m_pwc_hits_lvl[3]    = {0, 0, 0};
   // MEMLAT_ (temp): PT-read step target sub-partition histograms (all / remote-only)
   std::map<unsigned, unsigned long long> m_memlat_subpart_hist;
   std::map<unsigned, unsigned long long> m_memlat_remote_subpart_hist;

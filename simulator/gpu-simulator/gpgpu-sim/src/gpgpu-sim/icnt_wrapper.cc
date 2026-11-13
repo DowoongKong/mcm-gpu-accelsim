@@ -175,6 +175,11 @@ void icnt_reg_options(class OptionParser* opp) {
   option_parser_register(opp, "-icnt_ring_hop_latency", OPT_UINT32,
                          &g_inct_config.ring_hop_latency,
                          "ring per-hop latency in cycles (paper: 32)", "32");
+  option_parser_register(opp, "-icnt_ptw_ring_hop_latency", OPT_INT32,
+                         &g_inct_config.ring_hop_latency_ptw,
+                         "ring per-hop latency in cycles for page-table-walk packets "
+                         "(TLB_FILL_ACC/REPLY); -1 = same as -icnt_ring_hop_latency",
+                         "-1");
   option_parser_register(opp, "-icnt_ring_link_width", OPT_UINT32,
                          &g_inct_config.ring_link_width,
                          "ring flits drained per cycle per link (BW = width*flit*freq)", "1");
@@ -235,3 +240,12 @@ void icnt_configure_chiplets(unsigned n_chiplets,
 bool icnt_ring_enabled() {
   return g_network_mode == LOCAL_XBAR && g_inct_config.use_ring != 0;
 }
+
+// H3-3b (speed): see icnt_wrapper.h
+bool icnt_out_mirror_supported() {
+  return g_network_mode == LOCAL_XBAR && g_localicnt_interface != NULL;
+}
+void icnt_set_out_mirror(unsigned out, unsigned char *slot) {
+  g_localicnt_interface->SetOutMirror(out, slot);
+}
+bool icnt_out_empty(unsigned out) { return g_localicnt_interface->OutEmpty(out); }

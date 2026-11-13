@@ -38,6 +38,10 @@
 #include "local_interconnect.h"
 #include "mem_fetch.h"
 
+// Name of a ring packet class for the RING* diagnostic rows. Index matches
+// RingPkt::cls (0 = ordinary data traffic, 1 = page-table walk read/reply).
+static const char* ring_cls_name(unsigned cls) { return cls ? "ptw" : "data"; }
+
 // FUNNEL_ (temp): current gpu cycle, set by gpgpu_sim::cycle() before icnt_transfer().
 // Used to stamp a TLB reply's arrival at its destination cluster out_buffer so the
 // reply-icnt latency (B) can be split into transit vs last-hop pop-wait.
@@ -69,7 +73,7 @@ unsigned long long g_normrep_mtx_cnt[8][8]     = {{0}};
 xbar_router::xbar_router(unsigned router_id, enum Interconnect_type m_type,
                          unsigned n_shader, unsigned n_mem,
                          const struct inct_config& m_localinct_config,
-                         unsigned n_icp, bool inter_via_ring) {
+                         unsigned n_icp, bool inter_via_ring, bool both_dirs) {
   m_id = router_id;
   router_type = m_type;
   _n_mem = n_mem;
@@ -82,6 +86,7 @@ xbar_router::xbar_router(unsigned router_id, enum Interconnect_type m_type,
   grant_cycles_count = m_localinct_config.grant_cycles;
   in_buffers.resize(total_nodes);
   out_buffers.resize(total_nodes);
+  m_out_mirror.assign(total_nodes, nullptr);   // H3-3b
   m_icp_voq.resize(total_nodes);          // Fix B: per-output ICP ingress VOQ
   m_icp_voq_flits = 0;
   m_icp_voq_rr.assign(total_nodes, 0);
@@ -98,6 +103,25 @@ xbar_router::xbar_router(unsigned router_id, enum Interconnect_type m_type,
     active_in_buffers = n_mem;
     active_out_buffers = n_shader;
   }
+
+  // H1-A: destination-candidate outputs (see the member comment for the proof that
+  // the skipped outputs cannot change any state or counter). A single-subnet build
+  // carries both directions on one router, so nothing may be skipped there.
+  m_out_cand.clear();
+  if (both_dirs) {
+    for (unsigned o = 0; o < total_nodes; ++o) m_out_cand.push_back(o);
+  } else if (router_type == REQ_NET) {
+    for (unsigned o = _n_shader; o < _n_shader + _n_mem; ++o) m_out_cand.push_back(o);
+    if (_n_icp) m_out_cand.push_back(icp_index());
+  } else {
+    for (unsigned o = 0; o < _n_shader; ++o) m_out_cand.push_back(o);
+    if (_n_icp) m_out_cand.push_back(icp_index());
+  }
+  // H1-B: pending-input counts, one slot per possible destination index.
+  m_out_pending.assign(total_nodes, 0u);
+  // H1-D: conflict-count marks, one slot per possible destination index.
+  m_seen_stamp.assign(total_nodes, 0ull);
+  m_seen_cur = 0ull;
 
   cycles = 0;
   conflicts = 0;
@@ -130,6 +154,12 @@ void xbar_router::Push(unsigned input_deviceID, unsigned output_deviceID,
       || mf->get_type() == TLB_FILL_REPLY)
     flits = mf->get_num_flits(false, is_local);
 
+  // H1-A: the candidate set is the premise of the grant-loop skip. Checked only in
+  // the debug build -- is_out_candidate() is a linear scan and Push() is hot.
+#ifdef XBAR_CAND_CHECK
+  assert(is_out_candidate(output_deviceID) &&
+         "H1-A: packet addressed to a non-candidate output");
+#endif
   in_buffers[input_deviceID].push(Packet(data, output_deviceID, flits));
   // Shared statistic bumped from every source node during the CORE phase.
 #pragma omp atomic
@@ -243,8 +273,9 @@ void xbar_router::RR_Advance() {
         if (issued[_packet.output_deviceID] < m_port_width) {
           // FUNNEL_ (temp): see iSLIP_Advance — stamp any packet's out_buffer arrival.
           mem_fetch* _rmf = static_cast<mem_fetch*>(_packet.data);
-          if (_rmf) _rmf->set_icnt_receive_time((unsigned)g_icnt_now);
+          if (g_accelsim_diag && _rmf) _rmf->set_icnt_receive_time((unsigned)g_icnt_now);  // ST-10: DIAG-only readers
           out_buffers[_packet.output_deviceID].push(_packet);
+          mark_out(_packet.output_deviceID);   // H3-3b
           in_buffers[node_id].pop();
           issued[_packet.output_deviceID]++;
           reqs++;
@@ -288,21 +319,18 @@ void xbar_router::RR_Advance() {
   }
 
   // collect some stats about buffer util
+  // Every node is an INPUT on this router (clusters inject in REQ_NET, mems in
+  // REPLY_NET), so this loop must stay over all of them -- only the atomics go
+  // (H1-C), folded into one add each since integer addition is associative.
+  unsigned long long _in_u = 0, _out_u = 0;
   for (unsigned i = 0; i < total_nodes; ++i) {
-    {  // TSan: shared xbar counter, bumped from every SM
-    #pragma omp atomic
-      in_buffer_util += in_buffers[i].size();
-    }
-    {  // TSan: shared xbar counter, bumped from every SM
-    #pragma omp atomic
-      out_buffer_util += out_buffers[i].size();
-    }
+    _in_u  += in_buffers[i].size();
+    _out_u += out_buffers[i].size();
   }
+  in_buffer_util  += _in_u;
+  out_buffer_util += _out_u;
 
-  {  // TSan: shared xbar counter, bumped from every SM
-  #pragma omp atomic
-    cycles++;
-  }
+  cycles++;   // H1-C: router-private counter
 }
 
 // iSLIP algorithm
@@ -310,42 +338,40 @@ void xbar_router::RR_Advance() {
 // IEEE/ACM transactions on networking 2 (1999): 188-201.
 // https://www.cs.rutgers.edu/~sn624/552-F18/papers/islip.pdf
 void xbar_router::iSLIP_Advance() {
-  vector<unsigned> node_tmp;
   bool active = false;
 
   unsigned conflict_sub = 0;
   unsigned reqs = 0;
 
   // calcaulte how many conflicts are there for stats
+  // H1-D: the old form kept the destinations seen so far in a heap-allocated vector
+  // and ran std::find over it per input (O(N^2) worst case, one malloc per cycle per
+  // router). A per-cycle stamp gives the same verdict -- "first input to name this
+  // destination" vs "a later one" -- in O(1) per input with no allocation.
+  ++m_seen_cur;
+  // H1-B: rebuild the pending-input counts in the same pass (no extra walk).
+  std::fill(m_out_pending.begin(), m_out_pending.end(), 0u);
   for (unsigned i = 0; i < total_nodes; ++i) {
     if (!in_buffers[i].empty()) {
-      Packet _packet_tmp = in_buffers[i].front();
-      if (!node_tmp.empty()) {
-        if (std::find(node_tmp.begin(), node_tmp.end(),
-                      _packet_tmp.output_deviceID) != node_tmp.end()) {
-          conflict_sub++;
-        } else
-          node_tmp.push_back(_packet_tmp.output_deviceID);
-      } else {
-        node_tmp.push_back(_packet_tmp.output_deviceID);
-      }
+      const unsigned _tgt = in_buffers[i].front().output_deviceID;
+      m_out_pending[_tgt]++;                       // H1-B
+      if (m_seen_stamp[_tgt] == m_seen_cur)
+        conflict_sub++;
+      else
+        m_seen_stamp[_tgt] = m_seen_cur;
       active = true;
     }
   }
 
-  {  // TSan: shared xbar counter, bumped from every SM
-  #pragma omp atomic
-    conflicts += conflict_sub;
-  }
+  // H1-C: these counters are written ONLY inside Advance()/iSLIP_Advance()/
+  // RR_Advance(), and LocalInterconnect::Advance() gives one router to exactly one
+  // thread (the parallel loop is over net[subnet][chiplet], all private state), so
+  // they are not shared and need no atomic. in_buffer_full is the one exception --
+  // Has_Buffer_In() is called by every SM thread -- and it keeps its atomic.
+  conflicts += conflict_sub;
   if (active) {
-    {  // TSan: shared xbar counter, bumped from every SM
-    #pragma omp atomic
-      conflicts_util += conflict_sub;
-    }
-    {  // TSan: shared xbar counter, bumped from every SM
-    #pragma omp atomic
-      cycles_util++;
-    }
+    conflicts_util += conflict_sub;
+    cycles_util++;
   }
   // 37: when no input flit exists anywhere and the ICP VOQ is empty, the
   // grant loop below cannot grant, and every piece of iSLIP state it owns
@@ -355,19 +381,31 @@ void xbar_router::iSLIP_Advance() {
   // O(outputs x port_width x inputs) scan. Tail stats below run unchanged.
   if (!active && m_icp_voq_flits == 0) {
     unsigned obf = 0;
-    for (unsigned i = 0; i < total_nodes; ++i)
-      if (!Has_Buffer_Out(i, 1)) obf++;
-    if (obf) {
-      #pragma omp atomic
-      out_buffer_full += obf;
-    }
+    // H1-A: a non-candidate output's out_buffer is never pushed to, so it is always
+    // empty and Has_Buffer_Out() is always true for it -- it could never be counted.
+    for (unsigned oi = 0; oi < m_out_cand.size(); ++oi)
+      if (!Has_Buffer_Out(m_out_cand[oi], 1)) obf++;
+    if (obf) out_buffer_full += obf;   // H1-C: router-private counter
   } else {
   // do iSLIP. Each OUTPUT port may grant up to m_port_width flits per cycle (spanning
   // packets/inputs) -> per-port BW = m_port_width * flit_size * icnt_freq.
-  for (unsigned i = 0; i < total_nodes; ++i) {
+  for (unsigned oi = 0; oi < m_out_cand.size(); ++oi) {
+   const unsigned i = m_out_cand[oi];   // H1-A: skipped outputs can never be granted
    for (unsigned w = 0; w < m_port_width; ++w) {
     bool _did_grant = false;
     if (Has_Buffer_Out(i, 1)) {
+      // H1-B: no input's front is addressed to this output and its ICP VOQ is empty,
+      // so both passes below would fail and fall through to the break -- and that
+      // path touches nothing (next_node[i] and m_icp_voq_rr[i] move only on a grant,
+      // out_buffer_full only when Has_Buffer_Out fails, which it did not). Skipping
+      // is therefore state- and counter-identical to running the scan.
+      if (m_out_pending[i] == 0 && m_icp_voq[i].empty()) {
+#ifdef XBAR_CAND_CHECK   // H1-B: no input front may be addressed to i
+        for (unsigned _j = 0; _j < total_nodes; ++_j)
+          assert(in_buffers[_j].empty() || in_buffers[_j].front().output_deviceID != i);
+#endif
+        break;
+      }
       // Fix B: RR-alternate ICP VOQ[i] vs local inputs (starvation-free). pass 0 =
       // preferred source (toggled per grant), pass 1 = fallback to the other.
       bool _voq_first = (m_icp_voq_rr[i] & 1u);
@@ -381,10 +419,11 @@ void xbar_router::iSLIP_Advance() {
             m_icp_voq_flits--;                          // shared budget
             if (_vp.remaining_flits == 0) {
               mem_fetch* _rmf = static_cast<mem_fetch*>(_vp.data);
-              if (_rmf) _rmf->set_icnt_receive_time((unsigned)g_icnt_now);
+              if (g_accelsim_diag && _rmf) _rmf->set_icnt_receive_time((unsigned)g_icnt_now);  // ST-10: DIAG-only readers
               Packet _done = _vp;
               _done.remaining_flits = _done.orig_flits;  // BUG-9 fix: egress
               out_buffers[i].push(_done);                // occupancy = pkt size
+              mark_out(i);                               // H3-3b
               m_icp_voq[i].pop();
             }
             reqs++;
@@ -400,11 +439,19 @@ void xbar_router::iSLIP_Advance() {
                 in_buffers[node_id].dec_front_flits();   // 44-1: keeps the running total
                 if (_packet.remaining_flits == 0) {
                   mem_fetch* _rmf = static_cast<mem_fetch*>(_packet.data);
-                  if (_rmf) _rmf->set_icnt_receive_time((unsigned)g_icnt_now);
+                  if (g_accelsim_diag && _rmf) _rmf->set_icnt_receive_time((unsigned)g_icnt_now);  // ST-10: DIAG-only readers
                   Packet _done = _packet;
                   _done.remaining_flits = _done.orig_flits;  // BUG-9 fix:
                   out_buffers[_packet.output_deviceID].push(_done);  // full size
+                  mark_out(_packet.output_deviceID);                 // H3-3b
                   in_buffers[node_id].pop();
+                  // H1-B: this input's front just changed. The packet that left was
+                  // addressed to `i` (that is why it was granted), so drop one from
+                  // i's count and credit the new front, if any. Keeps the counts
+                  // exact for the remaining outputs of this same cycle.
+                  m_out_pending[i]--;
+                  if (!in_buffers[node_id].empty())
+                    m_out_pending[in_buffers[node_id].front().output_deviceID]++;
                 }
                 if (grant_cycles_count == 1)
                   next_node[i] = (++node_id % total_nodes);
@@ -418,22 +465,14 @@ void xbar_router::iSLIP_Advance() {
       }
       if (_did_grant) m_icp_voq_rr[i]++;   // advance RR turn on a grant
     } else
-      {  // TSan: shared xbar counter, bumped from every SM
-      #pragma omp atomic
-        out_buffer_full++;
-      }
+      out_buffer_full++;      // H1-C: router-private counter
     if (!_did_grant) break;   // out buffer full or no packet for this output -> stop
    }
   }
 
   }  // 37: end of skip-else
 
-  if (active) {
-    {  // TSan: shared xbar counter, bumped from every SM
-    #pragma omp atomic
-      reqs_util += reqs;
-    }
-  }
+  if (active) reqs_util += reqs;   // H1-C: router-private counter
 
   if (verbose)
     printf("%d : cycle %llu : grant_cycles = %d\n", m_id, cycles, grant_cycles);
@@ -449,21 +488,18 @@ void xbar_router::iSLIP_Advance() {
   }
 
   // collect some stats about buffer util
+  // Every node is an INPUT on this router (clusters inject in REQ_NET, mems in
+  // REPLY_NET), so this loop must stay over all of them -- only the atomics go
+  // (H1-C), folded into one add each since integer addition is associative.
+  unsigned long long _in_u = 0, _out_u = 0;
   for (unsigned i = 0; i < total_nodes; ++i) {
-    {  // TSan: shared xbar counter, bumped from every SM
-    #pragma omp atomic
-      in_buffer_util += in_buffers[i].size();
-    }
-    {  // TSan: shared xbar counter, bumped from every SM
-    #pragma omp atomic
-      out_buffer_util += out_buffers[i].size();
-    }
+    _in_u  += in_buffers[i].size();
+    _out_u += out_buffers[i].size();
   }
+  in_buffer_util  += _in_u;
+  out_buffer_util += _out_u;
 
-  {  // TSan: shared xbar counter, bumped from every SM
-  #pragma omp atomic
-    cycles++;
-  }
+  cycles++;   // H1-C: router-private counter
 }
 
 bool xbar_router::Busy() const {
@@ -520,14 +556,24 @@ void LocalInterconnect::CreateInterconnect(unsigned m_n_shader, unsigned m_n_mem
     for (unsigned ch = 0; ch < m_n_chiplets; ++ch) {
       net[s][ch] = new xbar_router(ch, static_cast<Interconnect_type>(s),
                                    m_n_local_cluster[ch], m_n_local_mem[ch],
-                                   m_inct_config, n_icp, m_use_ring);  // P3: inter_via_ring
+                                   m_inct_config, n_icp, m_use_ring,  // P3: inter_via_ring
+                                   /*both_dirs=*/(n_subnets == 1));   // H1-A
     }
   }
   if (m_use_ring) {
     m_ring.assign(n_subnets, nullptr);
+    // A negative -icnt_ptw_ring_hop_latency means "same as the data class", which keeps
+    // the default byte-identical to the single-latency ring.
+    const int      ptw_cfg = m_inct_config.ring_hop_latency_ptw;
+    const unsigned ptw_hop = (ptw_cfg < 0) ? m_inct_config.ring_hop_latency
+                                           : (unsigned)ptw_cfg;
+    printf("[ICNT] ring hop latency: data=%u ptw=%u cycles%s\n",
+           m_inct_config.ring_hop_latency, ptw_hop,
+           (ptw_cfg < 0) ? " (ptw inherited)" : "");
     for (unsigned s = 0; s < n_subnets; ++s)
       m_ring[s] = new ring_net(m_n_chiplets, m_inct_config.ring_buf,
                                m_inct_config.ring_hop_latency,
+                               ptw_hop,
                                m_inct_config.ring_link_width);   // P4: BW
     // RINGINJ_ (temp): [subnet][chiplet] source-side egress accounting.
     m_rinj_egress_busy.assign(n_subnets, std::vector<unsigned long long>(m_n_chiplets, 0));
@@ -554,6 +600,18 @@ void LocalInterconnect::Push(unsigned in, unsigned out, void* data, unsigned int
     assert(net[subnet][src_ch]->Has_Buffer_In(m_local_idx[in], size));
     net[subnet][src_ch]->Push(m_local_idx[in], net[subnet][src_ch]->icp_index(), data, size);
   }
+}
+
+// H3-3b: Pop() 과 똑같이 소비자 쪽 규칙으로 서브넷·칩렛·로컬 인덱스를 고른다.
+void LocalInterconnect::SetOutMirror(unsigned out, unsigned char *slot) {
+  unsigned subnet = (out < n_shader) ? REPLY_NET : REQ_NET;
+  if (n_subnets == 1) subnet = 0;
+  net[subnet][m_dev_chiplet[out]]->set_out_mirror(m_local_idx[out], slot);
+}
+bool LocalInterconnect::OutEmpty(unsigned out) const {
+  unsigned subnet = (out < n_shader) ? REPLY_NET : REQ_NET;
+  if (n_subnets == 1) subnet = 0;
+  return net[subnet][m_dev_chiplet[out]]->out_empty(m_local_idx[out]);
 }
 
 void* LocalInterconnect::Pop(unsigned out) {
@@ -654,7 +712,13 @@ void LocalInterconnect::handoff_ring() {
         unsigned dch   = m_dev_chiplet[final_dev];
         // Ring link width = inter flit size (NOT the local xbar's local size).
         unsigned flits = mf->get_num_flits(s == REQ_NET, /*is_local=*/false);
-        if (!ring->inject(ch, dch, final_dev, data, flits)) { stalled = true; break; }  // link full
+        // Page-table-walk packets are tagged by the GMMU (gmmu.cc sets TLB_FILL_ACC) and
+        // keep that type on the reply leg, so both directions land in class 1.
+        const bool is_ptw = (mf->get_type() == TLB_FILL_ACC ||
+                             mf->get_type() == TLB_FILL_REPLY);
+        if (!ring->inject(ch, dch, final_dev, data, flits, is_ptw ? 1u : 0u)) {
+          stalled = true; break;   // link full
+        }
         (void) src->Pop(egress);
         if (g_accelsim_diag) m_rinj_ok[s][ch]++;  // RINGINJ_ (temp, P-5 gated)
       }
@@ -733,10 +797,25 @@ void LocalInterconnect::DisplayStats() const {
     for (unsigned s = 0; s < m_ring.size(); ++s) {
       if (!m_ring[s]) continue;
       const char* tag = (s == REQ_NET) ? "Req" : "Reply";
-      unsigned long long cnt = m_ring[s]->ringlat_cnt;
+      // Combined row first (unchanged format, so older logs stay comparable), then
+      // one row per packet class. class=data must not move when only the page-table
+      // walk latency is changed; that row is the evidence for "data traffic untouched".
+      unsigned long long cnt = 0, sum = 0, mx = 0;
+      for (unsigned k = 0; k < ring_net::RING_CLS; ++k) {
+        cnt += m_ring[s]->ringlat_cnt[k];
+        sum += m_ring[s]->ringlat_sum[k];
+        if (m_ring[s]->ringlat_max[k] > mx) mx = m_ring[s]->ringlat_max[k];
+      }
       printf("[RINGLAT] %s_ring pkts=%llu avg_ring_cycles=%.2f max_ring_cycles=%llu\n",
-             tag, cnt, cnt ? (double)m_ring[s]->ringlat_sum / cnt : 0.0,
-             m_ring[s]->ringlat_max);
+             tag, cnt, cnt ? (double)sum / cnt : 0.0, mx);
+      for (unsigned k = 0; k < ring_net::RING_CLS; ++k) {
+        unsigned long long c = m_ring[s]->ringlat_cnt[k];
+        printf("[RINGLAT] %s_ring class=%s pkts=%llu avg_ring_cycles=%.2f "
+               "max_ring_cycles=%llu\n",
+               tag, ring_cls_name(k), c,
+               c ? (double)m_ring[s]->ringlat_sum[k] / c : 0.0,
+               m_ring[s]->ringlat_max[k]);
+      }
     }
     // RINGINJ_ (temp): source-side ring egress accounting per (subnet, src chiplet).
     // egress_busy%% high + stall%% high  -> ring-link BW saturated at that source.
@@ -747,13 +826,51 @@ void LocalInterconnect::DisplayStats() const {
       const char* tag = (s == REQ_NET) ? "Req" : "Reply";
       unsigned N = m_ring[s]->ring_N();
       for (unsigned c = 0; c < N; ++c) {
-        unsigned long long n = m_ring[s]->ringlat_src_cnt[c];
-        double tot = n ? (double)m_ring[s]->ringlat_src_sum[c] / n : 0.0;
-        double bw  = n ? (double)m_ring[s]->bkt_bw_sum[c] / n : 0.0;
-        double ej  = n ? (double)m_ring[s]->bkt_ej_sum[c] / n : 0.0;
+        // Combined row (unchanged format), then one row per packet class. `wire` is
+        // derived by subtraction, so mixing classes with different hop latencies
+        // makes the combined `wire` a blend that answers no question on its own.
+        unsigned long long n = 0, rs = 0, bs = 0, es = 0;
+        for (unsigned k = 0; k < ring_net::RING_CLS; ++k) {
+          n  += m_ring[s]->ringlat_src_cnt[k][c];
+          rs += m_ring[s]->ringlat_src_sum[k][c];
+          bs += m_ring[s]->bkt_bw_sum[k][c];
+          es += m_ring[s]->bkt_ej_sum[k][c];
+        }
+        double tot = n ? (double)rs / n : 0.0;
+        double bw  = n ? (double)bs / n : 0.0;
+        double ej  = n ? (double)es / n : 0.0;
         double wire = tot - bw - ej;   // legit hop latency = total - bw - ejwait
         printf("[RINGSRC] %-5s src_chiplet=%u ring_avg=%.1f  (bw=%.1f wire=%.1f "
                "ejwait=%.1f) [n=%llu]\n", tag, c, tot, bw, wire, ej, n);
+        for (unsigned k = 0; k < ring_net::RING_CLS; ++k) {
+          unsigned long long nk = m_ring[s]->ringlat_src_cnt[k][c];
+          double tk = nk ? (double)m_ring[s]->ringlat_src_sum[k][c] / nk : 0.0;
+          double bk = nk ? (double)m_ring[s]->bkt_bw_sum[k][c] / nk : 0.0;
+          double ek = nk ? (double)m_ring[s]->bkt_ej_sum[k][c] / nk : 0.0;
+          printf("[RINGSRC] %-5s class=%s src_chiplet=%u ring_avg=%.1f  (bw=%.1f "
+                 "wire=%.1f ejwait=%.1f) [n=%llu]\n",
+                 tag, ring_cls_name(k), c, tk, bk, tk - bk - ek, ek, nk);
+        }
+      }
+    }
+    // XLATDBG_ (temp): self-check for the per-class hop latency. `expected` is the
+    // configured value (an independent source: the config literal), `min` is measured
+    // directly from wire entry to delivery. They must be equal; anything else means
+    // the wire stage is not applying the configured latency to that class.
+    for (unsigned s = 0; s < m_ring.size(); ++s) {
+      if (!m_ring[s]) continue;
+      const char* tag = (s == REQ_NET) ? "Req" : "Reply";
+      for (unsigned k = 0; k < ring_net::RING_CLS; ++k) {
+        unsigned long long n = m_ring[s]->xlatdbg_wire_cnt[k];
+        printf("[XLATDBG_WIRE] %-5s class=%s hops=%llu expected=%u min=%llu "
+               "avg=%.2f max=%llu %s\n",
+               tag, ring_cls_name(k), n, m_ring[s]->hop_lat_cfg(k),
+               n ? m_ring[s]->xlatdbg_wire_min[k] : 0ULL,
+               n ? (double)m_ring[s]->xlatdbg_wire_sum[k] / n : 0.0,
+               m_ring[s]->xlatdbg_wire_max[k],
+               (n == 0) ? "NO_TRAFFIC"
+                        : ((m_ring[s]->xlatdbg_wire_min[k] ==
+                            m_ring[s]->hop_lat_cfg(k)) ? "OK" : "MISMATCH"));
       }
     }
     printf("[RINGINJ] handoff_advances=%llu\n", m_rinj_advances);

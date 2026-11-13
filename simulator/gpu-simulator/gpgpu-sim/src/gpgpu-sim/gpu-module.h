@@ -10,6 +10,8 @@
 #include <queue>
 #include <cstdint>
 #include <unordered_map>  // page table node maps
+#include <algorithm>   // s30: sort / binary_search in chiplet::finalize_exact_reservations
+#include <functional>  // s30: std::greater
 
 // #define LOG_TLB
 // #define LOG_PAGE_TABLE
@@ -234,6 +236,11 @@ class gpu_page_table {
   bool dump_placement(const char* path) const;
   bool load_placement(const char* path);
   void premap_from_placement();
+  // s30 (-gmmu_placement_exact 1): like premap_from_placement() but every data
+  // page, PT node and the root sit at the PFN recorded in a v3 map. Aborts on any
+  // inconsistency instead of falling back to re-derived PFNs.
+  void premap_exact();
+  bool placement_has_pfns() const { return m_placement_has_pfns; }
   bool placement_frozen() const { return m_placement_frozen; }
 
   // First-touch placement: record the owning chiplet of a VA at its FIRST
@@ -285,6 +292,14 @@ class gpu_page_table {
   std::unordered_map<uint64_t, unsigned> m_pd_owner;    // key: pml4<<9 | pdp
   std::unordered_map<uint64_t, unsigned> m_pt_owner;    // key: pml4<<18 | pdp<<9 | pd
   std::unordered_map<uint64_t, unsigned> m_data_owner;  // key: vpn
+  // s30: PFNs read from a v3 placement map (load_placement); used only by premap_exact().
+  std::unordered_map<uint64_t, uint64_t> m_file_data_pfn;  // key: vpn
+  std::unordered_map<uint64_t, uint64_t> m_file_pdp_pfn;   // key: pml4_idx
+  std::unordered_map<uint64_t, uint64_t> m_file_pd_pfn;    // key: pml4<<9 | pdp
+  std::unordered_map<uint64_t, uint64_t> m_file_pt_pfn;    // key: pml4<<18 | pdp<<9 | pd
+  uint64_t m_file_root_pfn = (uint64_t)-1;
+  bool     m_placement_has_pfns = false;   // every N line carried a PFN and an R line was read
+  pt_node_t* make_node_at(uint64_t pfn);   // s30: node at a given frame, no PMM call
 
   // Allocate a new PT node page from chiplet_id's PMM.
   // Returns nullptr if PMM is exhausted.
@@ -407,6 +422,46 @@ class chiplet {
     return aligned;
   }
   void free_page(uint64_t pfn) { m_recycled.push_back(pfn); }
+  // s30 (-gmmu_placement_exact): record frames [pfn, pfn + n) to be taken at exactly
+  // these numbers. Nothing is handed out until finalize_exact_reservations().
+  // Returns false when the run leaves this chiplet's frame range.
+  bool reserve_exact(uint64_t pfn, uint64_t n) {
+    if (pfn < m_pfn_begin || pfn + n > m_pfn_end) return false;
+    for (uint64_t k = 0; k < n; k++) m_exact_frames.push_back(pfn + k);
+    return true;
+  }
+  // Takes every recorded frame out of the allocator: the bump cursor moves past the
+  // highest one and every frame below it that is neither handed out before nor
+  // recorded goes to m_recycled, so a later 4KB allocation can never collide with a
+  // replayed frame. Returns false on a duplicate or on a frame already handed out
+  // (e.g. the root, which the constructor allocates before the map is read).
+  bool finalize_exact_reservations() {
+    if (m_exact_frames.empty()) return true;
+    std::sort(m_exact_frames.begin(), m_exact_frames.end());
+    for (size_t i = 1; i < m_exact_frames.size(); i++)
+      if (m_exact_frames[i] == m_exact_frames[i - 1]) return false;
+    std::vector<uint64_t> recycled_sorted(m_recycled.begin(), m_recycled.end());
+    std::sort(recycled_sorted.begin(), recycled_sorted.end());
+    for (uint64_t f : m_exact_frames)
+      if (f < m_pfn_next && !std::binary_search(recycled_sorted.begin(), recycled_sorted.end(), f))
+        return false;   // already handed out
+    std::vector<uint64_t> keep;   // old recycled frames that are not replayed
+    for (uint64_t f : recycled_sorted)
+      if (!std::binary_search(m_exact_frames.begin(), m_exact_frames.end(), f)) keep.push_back(f);
+    const uint64_t top = m_exact_frames.back() + 1;
+    for (uint64_t f = m_pfn_next; f < top; f++)   // holes between cursor and the top frame
+      if (!std::binary_search(m_exact_frames.begin(), m_exact_frames.end(), f)) keep.push_back(f);
+    if (top > m_pfn_next) m_pfn_next = top;
+    // alloc_page() pops from the back: keep ascending order of reuse = descending vector.
+    std::sort(keep.begin(), keep.end(), std::greater<uint64_t>());
+    m_recycled.swap(keep);
+    m_exact_count = m_exact_frames.size();
+    m_exact_frames.clear();
+    return true;
+  }
+  size_t exact_frames_taken() const { return m_exact_count; }
+  uint64_t pfn_begin() const { return m_pfn_begin; }
+  uint64_t pfn_end() const { return m_pfn_end; }
   size_t free_page_count() const {
     return (size_t)(m_pfn_end - m_pfn_next) + m_recycled.size();
   }
@@ -447,6 +502,8 @@ class chiplet {
   // fragments recycled from huge-page alignment.
   uint64_t m_pfn_begin = 0, m_pfn_end = 0, m_pfn_next = 0;
   std::vector<uint64_t> m_recycled;
+  std::vector<uint64_t> m_exact_frames;   // s30: frames recorded by reserve_exact()
+  size_t m_exact_count = 0;               // s30: frames taken by the last finalize
 
   // Per-chiplet L2 TLBs, owned by gpu_module, set in init() (P5). One per page size.
   gpu_l2_tlb* m_l2_tlb_4k  = nullptr;
@@ -518,8 +575,12 @@ class gpu_module {
   }
 
   // Get access statistics
-  unsigned long long get_remote_access_count() const { return m_remote_access_count; }
-  unsigned long long get_local_access_count() const { return m_local_access_count; }
+  // H3-2: 값은 "공유 폴백 카운터 + 모든 스레드 슬롯"의 합. unsigned 64bit 덧셈이라
+  // 더하는 순서와 스레드 분할에 무관하게 결과가 정확히 같다(결합·교환법칙, 오버플로
+  // 없음: 실측 최대 ~7.3e7 << 1.8e19). 시뮬레이션 중에는 읽지 않고 통계 출력에서만
+  // 호출된다(gpu-sim.cc mcm_* 출력 3곳이 유일한 호출자).
+  unsigned long long get_remote_access_count() const { return acc_total(0); }
+  unsigned long long get_local_access_count() const { return acc_total(1); }
 
   // Getters
   chiplet* get_chiplet(unsigned i) const { return m_chiplets[i]; }
@@ -551,6 +612,10 @@ class gpu_module {
   // Allocates n_frames physically contiguous, n_frames-aligned 4KB frames.
   // Used for huge pages (2MB = GPU_HUGE_FRAMES). Returns -1 if unavailable.
   uint64_t pmm_alloc_contiguous(unsigned chiplet_id, uint64_t n_frames);
+  // s30: exact-PFN replay (see chiplet::reserve_exact / finalize_exact_reservations).
+  bool     pmm_reserve_exact(unsigned chiplet_id, uint64_t pfn, uint64_t n_frames);
+  bool     pmm_finalize_exact(unsigned chiplet_id);
+  size_t   pmm_exact_frames_taken(unsigned chiplet_id) const;
 
   // Page table interface.
   // Walk the page table for va. Returns the leaf PTE, or nullptr on page fault.
@@ -647,8 +712,40 @@ class gpu_module {
   
   // Stats file and counters for MCM access logging
   FILE* m_stats_file;
+  // H3-2: 아래 두 개는 이제 "폴백" 누산기다. 슬롯을 못 쓰는 경우(스레드 번호가
+  // 슬롯 범위를 벗어남 / OpenMP 없이 빌드 / 슬롯 0개)에만 예전처럼 atomic 으로
+  // 올린다. 정상 경로는 m_acc_counts 의 스레드별 슬롯.
   unsigned long long m_remote_access_count;
   unsigned long long m_local_access_count;
+
+  // ---- H3-2: MCM access 카운터의 스레드별 슬롯 ----------------------------
+  // 왜: icnt_deliver() 는 SM->mem 요청 경로에서 매 패킷 호출되고, 예전에는 공유
+  //     스칼라 2개에 #pragma omp atomic 을 걸었다. 같은 캐시라인을 모든 코어가
+  //     번갈아 소유하게 되어 증가 1회가 8스레드에서 ~36ns(측정) 들었다.
+  //     스레드마다 자기 라인을 쓰면 ~2.3ns 로 떨어진다.
+  // 정확성: 슬롯 증가도 atomic 으로 한다. 경쟁이 없는 lock xadd 는 비용이
+  //     사실상 0(측정: 평범한 증가와 동일한 2.3ns)이면서, "슬롯 하나에는 한
+  //     스레드만 쓴다"는 논증에 전혀 기대지 않게 해준다. 중첩 병렬 영역이
+  //     생기든, OpenMP 밖의 pthread 가 끼어들든, 스레드 번호가 겹치든
+  //     카운트는 원자적으로 더해지므로 절대 유실되지 않는다.
+  // 간격: 슬롯 하나가 64B(캐시라인) 를 차지하게 stride 8 -> false sharing 없음.
+  enum { ACC_SLOT_STRIDE = 8, ACC_KINDS = 2 };  // [slot*8 + kind], kind 0=remote 1=local
+  unsigned m_acc_slots;                      // 슬롯 개수(0 이면 폴백만 사용)
+  std::vector<unsigned long long> m_acc_counts;  // 크기 = m_acc_slots * 8
+
+  // 통계 합산. 병렬 구간에서는 호출되지 않는다(출력 시점에만).
+  unsigned long long acc_total(unsigned kind) const {
+    unsigned long long t = (kind == 0) ? m_remote_access_count : m_local_access_count;
+    for (unsigned s = 0; s < m_acc_slots; ++s)
+      t += m_acc_counts[(size_t)s * ACC_SLOT_STRIDE + kind];
+    return t;
+  }
+
+  // 증가. kind 0=remote, 1=local. 정의는 gpu-module.cc 에 둔다(본문이 _OPENMP
+  // 에 따라 달라지므로, -fopenmp 없이 이 헤더를 읽는 TU -- abstract_hardware_model.h
+  // 를 타고 들어오는 trace-driven 쪽 -- 와 정의가 갈리지 않게 하려는 것. 호출은
+  // 런당 ~60만 회뿐이라 인라인 여부는 측정에 영향이 없다).
+  void bump_access_count(unsigned kind);
   
   // Current kernel's LASP configuration
   const lasp::kernel_lasp_config_t* m_current_lasp_config;

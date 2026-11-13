@@ -65,6 +65,10 @@ extern unsigned g_network_mode;
 enum network_mode { INTERSIM = 1, LOCAL_XBAR = 2, N_NETWORK_MODE };
 
 void icnt_wrapper_init();
+// H3-3b (speed): 로컬 xbar 인터커넥트일 때만 쓸 수 있는 출력 버퍼 미러 훅.
+bool icnt_out_mirror_supported();
+void icnt_set_out_mirror(unsigned out, unsigned char *slot);
+bool icnt_out_empty(unsigned out);
 void icnt_reg_options(class OptionParser* opp);
 
 // Phase 1 (inter-chiplet split): inject the device->chiplet owner maps into the

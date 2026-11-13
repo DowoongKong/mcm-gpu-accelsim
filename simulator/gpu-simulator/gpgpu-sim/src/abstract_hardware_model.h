@@ -267,7 +267,8 @@ class kernel_info_t {
   dim3 get_cta_dim() const { return m_block_dim; }
 
   void increment_cta_id() {
-    increment_x_then_y_then_z(m_next_cta, m_grid_dim);
+    if (m_pcc_on) pcc_advance();   // PCC: advance the home chiplet's cursor
+    else increment_x_then_y_then_z(m_next_cta, m_grid_dim);
     m_next_tid.x = 0;
     m_next_tid.y = 0;
     m_next_tid.z = 0;
@@ -278,9 +279,28 @@ class kernel_info_t {
            m_grid_dim.x * m_grid_dim.y * m_next_cta.z;
   }
   bool no_more_ctas_to_run() const {
+    if (m_pcc_on) return pcc_all_exhausted();   // PCC: every chiplet cursor done
     return (m_next_cta.x >= m_grid_dim.x || m_next_cta.y >= m_grid_dim.y ||
             m_next_cta.z >= m_grid_dim.z);
   }
+
+  // PCC (per-chiplet CTA cursors, docs/cta_chiplet_cursor.ko.md). The home
+  // chiplet of a CTA is a pure function of its linear id (same rule the
+  // cluster issue path applied); each chiplet walks its own CTAs in ascending
+  // id order, so WHEN a CTA is issued no longer depends on other chiplets.
+  // m_next_cta keeps meaning "the CTA being issued right now": valid between
+  // pcc_select() and the last thread init (which calls increment_cta_id()).
+  bool     pcc_on() const { return m_pcc_on; }
+  unsigned pcc_n() const { return m_pcc_n; }
+  void     pcc_init(unsigned n_chiplets, bool static_binding);
+  unsigned pcc_home(unsigned lin) const;
+  bool     pcc_has_cta(unsigned c) const {
+    return m_pcc_on && c < m_pcc_n && m_pcc_cur[c] < m_pcc_total;
+  }
+  void     pcc_select(unsigned c);
+  unsigned pcc_issued(unsigned c) const { return m_pcc_issued[c]; }
+  unsigned long long pcc_last_issue(unsigned c) const { return m_pcc_last_issue[c]; }
+  void     pcc_note_issue_cycle(unsigned c, unsigned long long cyc) { m_pcc_last_issue[c] = cyc; }
 
   void increment_thread_id() {
     increment_x_then_y_then_z(m_next_tid, m_block_dim);
@@ -383,6 +403,19 @@ class kernel_info_t {
   
   // LASP configuration for CTA scheduling
   lasp::kernel_lasp_config_t m_lasp_config;
+
+  // PCC state (see pcc_* above)
+  void     pcc_advance();
+  bool     pcc_all_exhausted() const;
+  unsigned pcc_lin(const dim3 &d) const;
+  dim3     pcc_dim3(unsigned lin) const;
+  bool     m_pcc_on;
+  bool     m_pcc_static;                 // STATIC_BINDING rule (lin % n) vs LASP rule
+  unsigned m_pcc_n, m_pcc_total;
+  unsigned m_pcc_remaining;              // CTAs not yet issued (all chiplets); 0 = exhausted
+  std::vector<unsigned> m_pcc_cur;       // next linear CTA id per chiplet (== total: exhausted)
+  std::vector<unsigned> m_pcc_issued;
+  std::vector<unsigned long long> m_pcc_last_issue;
 };
 
 class core_config {
@@ -1471,6 +1504,7 @@ class register_set {
   void move_in(warp_inst_t *&src) {
     warp_inst_t **free = get_free();
     move_warp(*free, src);
+    m_occupied++;  // T6
   }
   // void copy_in( warp_inst_t* src ){
   //   src->copy_contents_to(*get_free());
@@ -1484,11 +1518,13 @@ class register_set {
       free = get_free(sub_core_model, reg_id);
     }
     move_warp(*free, src);
+    m_occupied++;  // T6
   }
 
   void move_out_to(warp_inst_t *&dest) {
     warp_inst_t **ready = get_ready();
     move_warp(dest, *ready);
+    m_occupied--;  // T6
   }
   void move_out_to(bool sub_core_model, unsigned reg_id, warp_inst_t *&dest) {
     if (!sub_core_model) {
@@ -1497,6 +1533,7 @@ class register_set {
     warp_inst_t **ready = get_ready(sub_core_model, reg_id);
     assert(ready != NULL);
     move_warp(dest, *ready);
+    m_occupied--;  // T6
   }
 
   warp_inst_t **get_ready() {
@@ -1556,9 +1593,30 @@ class register_set {
 
   unsigned get_size() { return regs.size(); }
 
+  // T6 (P4-5): number of non-empty slots. Maintained by every path that fills
+  // or empties a slot: move_in / move_out_to above, plus the two sites that
+  // touch a slot directly (shader_core_ctx::issue_warp copies into a free
+  // ID_OC slot -> note_external_fill; shader_core_ctx::writeback clears an
+  // EX_WB slot in place -> note_external_clear). Lets a hot caller answer
+  // "is anything here?" with one load instead of dereferencing each slot.
+  bool any_occupied() const { return m_occupied != 0; }
+  void note_external_fill() { m_occupied++; }
+  void note_external_clear() {
+    assert(m_occupied > 0);
+    m_occupied--;
+  }
+  // Self-check (P4_CHECK builds): recount the slots.
+  bool occupancy_consistent() const {
+    unsigned c = 0;
+    for (unsigned i = 0; i < regs.size(); i++)
+      if (!regs[i]->empty()) c++;
+    return c == m_occupied;
+  }
+
  private:
   std::vector<warp_inst_t *> regs;
   const char *m_name;
+  unsigned m_occupied = 0;  // T6
 };
 
 #endif  // #ifdef __cplusplus

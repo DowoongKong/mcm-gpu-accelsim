@@ -6,6 +6,7 @@
 #include "gpu-sim.h"  // full definition of memory_config (needed for gpgpu_ctx member access)
 #include "icnt_wrapper.h"  // icnt_has_buffer declaration
 #include "gpu_tlb.h"   // gpu_l2_tlb full definition for l2_tlb->fill()
+#include "l2miss_log.h"  // L2MISSLOG (s29): gated miss/walk timeline
 
 // P-5: (temp) diagnostic-counter gate, defined in gpu-sim.cc.
 extern const bool g_accelsim_diag;
@@ -27,6 +28,18 @@ extern const bool g_accelsim_diag;
 static bool accelsim_log_gmmu() {
   static const bool on = (getenv("ACCELSIM_LOG_GMMU") != NULL);
   return on;
+}
+
+// L2MISSLOG (s29): one file for the whole run, opened on first use. A
+// function-local static initializes exactly once even when the first callers
+// are the parallel pass-B chiplet threads (C++11 magic statics); fprintf()
+// itself is locked per call, so lines never interleave.
+FILE* l2miss_log_file() {
+  static FILE* const f = []() -> FILE* {
+    const char* p = getenv("ACCELSIM_L2MISS_LOG");
+    return (p && p[0] != '\0') ? fopen(p, "w") : NULL;
+  }();
+  return f;
 }
 
 
@@ -187,8 +200,10 @@ void gmmu::pt_walk(mem_fetch* parent_mf, int level, uint64_t table_pa,
   // For 2MB that means levels 0 and 1, since level 2 is the leaf.
   if (level < leaf_level) {
     uint64_t cached_pa;
+    m_pwc_lookups_lvl[level]++;
     if (pwc_lookup(va, level, cached_pa)) {
       m_pwc_hits++;
+      m_pwc_hits_lvl[level]++;
       {  // XLATLAT: a PWC hit costs no memory read; count it as a skipped level.
         auto w = m_walk_start_cycles.find(parent_mf);
         if (w != m_walk_start_cycles.end()) w->second.n_pwc_hit++;
@@ -305,6 +320,8 @@ void gmmu::pt_walk(mem_fetch* parent_mf, int level, uint64_t table_pa,
     if (w != m_walk_start_cycles.end()) {
       w->second.n_steps++;
       if (is_remote) w->second.n_remote++;
+      w->second.t_step_issue  = current_cycle;  // L2MISSLOG (s29)
+      w->second.last_entry_pa = entry_pa;
     }
   }
   // MEMLAT_ (temp): which memory sub-partition each PT-read step targets, split
@@ -333,6 +350,16 @@ void gmmu::done_tlb_req(mem_fetch* child_mf, uint64_t current_cycle) {
   int       level     = child_mf->get_tlb_depth();
   mem_fetch* parent_mf = child_mf->get_parent_mf();
   uint64_t  va        = parent_mf->get_va();
+  {  // L2MISSLOG (s29): memory-step latency, issue (pt_walk) -> reply arrival here
+    auto w = m_walk_start_cycles.find(parent_mf);
+    if (w != m_walk_start_cycles.end() && w->second.t_step_issue != 0 &&
+        current_cycle >= w->second.t_step_issue) {
+      const uint64_t lat = current_cycle - w->second.t_step_issue;
+      w->second.step_lat_sum += (uint32_t)lat;
+      if (lat > w->second.step_lat_max) w->second.step_lat_max = (uint32_t)lat;
+      w->second.t_step_issue = 0;
+    }
+  }
   // Leaf level for this VA's page size: 3 (PT) for 4KB, 2 (PD) for 2MB.
   const int leaf_level = pt_leaf_level(m_mod->page_shift_for_va(va));
 
@@ -376,6 +403,10 @@ void gmmu::done_tlb_req(mem_fetch* child_mf, uint64_t current_cycle) {
       // ensure_node() returns the OWNER's copy; re-query for this chiplet's.
       next_table_pa = m_pt->get_node_base_pa(va, level + 1, m_chiplet_id);
       m_fault_count++;
+      {  // L2MISSLOG (s29): this walk created a node/leaf (reference mode)
+        auto wf = m_walk_start_cycles.find(parent_mf);
+        if (wf != m_walk_start_cycles.end()) wf->second.n_fault++;
+      }
       if (accelsim_log_gmmu()) {
       printf("[GMMU_FAULT] chiplet=%u va=0x%llx level=%d->%d node absent,"
              " created on chiplet=%u pa=0x%llx\n",
@@ -404,6 +435,10 @@ void gmmu::done_tlb_req(mem_fetch* child_mf, uint64_t current_cycle) {
       unsigned chiplet_id = m_pt->first_touch_data_owner(va);
       m_pt->map_leaf(va, chiplet_id);
       m_fault_count++;
+      {  // L2MISSLOG (s29): this walk created a node/leaf (reference mode)
+        auto wf = m_walk_start_cycles.find(parent_mf);
+        if (wf != m_walk_start_cycles.end()) wf->second.n_fault++;
+      }
       if (accelsim_log_gmmu()) {
       printf("[GMMU_FAULT] chiplet=%u va=0x%llx level=%d leaf absent,"
              " data page allocated on chiplet=%u\n",
@@ -463,6 +498,19 @@ void gmmu::complete_walk(mem_fetch* parent_mf, uint64_t current_cycle) {
          m_chiplet_id, cluster_id,
          (unsigned long long)va, (unsigned long long)pa,
          (unsigned long long)m_total_cycles);
+  }
+
+  if (FILE* lf = l2miss_log_file()) {  // L2MISSLOG (s29): one line per completed walk
+    fprintf(lf, "C %llu %u 0x%llx %llu %llu %u %u %u %u %u %u %u 0x%llx 0x%llx\n",
+            (unsigned long long)current_cycle, m_chiplet_id,
+            (unsigned long long)page_vpn(va, pshift),
+            (unsigned long long)(have_wr ? wr.t_pwq_enq : 0),
+            (unsigned long long)(have_wr ? wr.t_walk_start : 0),
+            have_wr ? (unsigned)wr.n_steps : 0u, have_wr ? (unsigned)wr.n_remote : 0u,
+            have_wr ? (unsigned)wr.n_pwc_hit : 0u, have_wr ? (unsigned)wr.n_fault : 0u,
+            have_wr ? (unsigned)wr.icnt_bp : 0u, have_wr ? wr.step_lat_sum : 0u,
+            have_wr ? wr.step_lat_max : 0u,
+            (unsigned long long)(have_wr ? wr.last_entry_pa : 0), (unsigned long long)pa);
   }
 
   // Remove from active walk tracking and free phantom parent_mf.
@@ -568,6 +616,15 @@ void gmmu::print_stats(FILE* f) const {
   fprintf(f, "  local steps      : %llu\n", m_local_steps);
   fprintf(f, "  remote steps     : %llu\n", m_remote_steps);
   fprintf(f, "  PWC hits         : %llu\n", m_pwc_hits);
+  {
+    // Per-level breakdown of the line above (lookups = walks that reached the level).
+    static const char* lvl_name[3] = {"PML4", "PDP", "PD"};
+    for (int k = 0; k < 3; ++k) {
+      unsigned long long lk = m_pwc_lookups_lvl[k], hk = m_pwc_hits_lvl[k];
+      fprintf(f, "  PWC L%d (%-4s)    : lookups=%llu hits=%llu hit_rate=%.4f%%\n",
+              k, lvl_name[k], lk, hk, lk ? 100.0 * (double)hk / (double)lk : 0.0);
+    }
+  }
   // MEMLAT_/FUNNEL_ (temp) report -- P-5: only under ACCELSIM_DIAG (the
   // counters are gated too; without the flag these rows would all be zero).
   if (g_accelsim_diag) {

@@ -42,7 +42,10 @@ enum partition_index_function {
   IPOLY,
   PAE,
   RANDOM,
-  CUSTOM
+  CUSTOM,
+  // 6 is IPOLY_MODULO in Accel-Sim 2.0. It is left unused here so that a config
+  // written for that simulator cannot silently select a different function.
+  CHIPLET_IPOLY = 7  // IPOLY over the sub-partitions of one chiplet; chiplet kept
 };
 
 struct addrdec_t {
@@ -66,6 +69,18 @@ class linear_to_raw_address_translation {
   // accessors
   void addrdec_tlx(new_addr_type addr, addrdec_t *tlx) const;
   new_addr_type partition_address(new_addr_type addr) const;
+  // S2 (llm_exp/docs/s31_sim_speed_review_llm.ko.md): true when addrdec_tlx()'s
+  // sub_partition cannot change inside an aligned 2^line_bits-byte block, i.e. no
+  // chip or bank bit and no hash input lies below line_bits, and no RNG is used.
+  bool sub_partition_fixed_within(unsigned line_bits) const {
+    if (memory_partition_indexing == RANDOM) return false;
+    if (ADDR_CHIP_S >= 0 && (unsigned)ADDR_CHIP_S < line_bits) return false;
+    const new_addr_type low = ((new_addr_type)1 << line_bits) - 1;
+    return ((addrdec_mask[CHIP] | addrdec_mask[BK]) & low) == 0;
+  }
+  // CHIPLET_IPOLY: gpu_module checks hash_chiplets() against -gpgpu_n_chiplets.
+  bool chiplet_hash_on() const { return memory_partition_indexing == CHIPLET_IPOLY; }
+  unsigned hash_chiplets() const { return m_hash_chiplets; }
 
  private:
   void addrdec_parseoption(const char *option);
@@ -91,6 +106,11 @@ class linear_to_raw_address_translation {
   unsigned log2channel;
   unsigned log2sub_partition;
   unsigned nextPowerOf2_m_n_channel;
+
+  // CHIPLET_IPOLY: number of chiplets whose sub-partition ranges the hash keeps
+  // apart (-gpgpu_mem_hash_chiplets), and sub-partitions per chiplet (set in init).
+  unsigned m_hash_chiplets;
+  unsigned m_slices_per_chiplet;
 };
 
 #endif

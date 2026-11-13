@@ -195,6 +195,7 @@ class shd_warp_t {
     assert(m_active_threads.test(lane));
     m_active_threads.reset(lane);
     n_completed++;
+    note_fetch_event();  // T4: functional_done() may flip
   }
   bool test_active(unsigned lane) { return m_active_threads.test(lane); }
 
@@ -243,12 +244,14 @@ class shd_warp_t {
       m_ibuffer[i].m_inst = NULL;
       m_ibuffer[i].m_valid = false;
     }
+    note_fetch_event();  // T4: ibuffer_empty() may flip
   }
   const warp_inst_t *ibuffer_next_inst() { return m_ibuffer[m_next].m_inst; }
   bool ibuffer_next_valid() { return m_ibuffer[m_next].m_valid; }
   void ibuffer_free() {
     m_ibuffer[m_next].m_inst = NULL;
     m_ibuffer[m_next].m_valid = false;
+    note_fetch_event();  // T4: ibuffer_empty() may flip
   }
   void ibuffer_step() { m_next = (m_next + 1) % IBUFFER_SIZE; }
 
@@ -261,6 +264,7 @@ class shd_warp_t {
   void dec_store_req() {
     assert(m_stores_outstanding > 0);
     m_stores_outstanding--;
+    note_fetch_event();  // T4: stores_done() may flip
   }
 
   unsigned num_inst_in_buffer() const {
@@ -279,6 +283,7 @@ class shd_warp_t {
   void dec_inst_in_pipeline() {
     assert(m_inst_in_pipeline > 0);
     m_inst_in_pipeline--;
+    note_fetch_event();  // T4: inst_in_pipeline() may flip
   }
 
   unsigned long long get_streamID() const { return m_streamID; }
@@ -290,6 +295,11 @@ class shd_warp_t {
   class shader_core_ctx *get_shader() {
     return m_shader;
   }
+  // T4 (P4-4): every warp-state change that can flip a fetch()-scan verdict
+  // (retire: functional_done/stores_done/inst_in_pipeline; fetch: ibuffer
+  // emptiness) and is NOT already in the issue/scoreboard epochs reports here.
+  // Defined out of line in shader.cc (shader_core_ctx is incomplete here).
+  void note_fetch_event();
 
  private:
   static const unsigned IBUFFER_SIZE = 2;
@@ -681,7 +691,32 @@ class opndcoll_rfu_t {  // operand collector based register file unit
   // modifiers
   bool writeback(warp_inst_t &warp);
 
+  // T5 (P4-3): with every collector unit free and no input port holding a
+  // ready instruction, step() is a no-op except for the arbiter's round-robin
+  // rotation (see arbiter_t::advance_rr) and the per-bank allocation reset:
+  // dispatch_ready_cu() finds no ready CU (and find_ready() leaves its own
+  // rr pointer alone when nothing is ready), allocate_reads() sees empty bank
+  // queues (they are filled only for allocated CUs and drained before a CU can
+  // dispatch), allocate_cu() has nothing to allocate, and the two register-file
+  // statistics are touched only on activity.
+  // T7 (P4-6): the predicate above is answered from two pieces of state kept
+  // exact by construction -- m_busy_cus (collector units with m_free == false;
+  // the two flips live in collector_unit_t::allocate / dispatch and report
+  // here) and register_set::any_occupied() on the distinct input sets
+  // (m_in_sets, built once in init()). Defined in shader.cc so the P4_CHECK
+  // cross-check against the original scan compiles in exactly one TU.
+  bool idle();
+  void cu_allocated() { m_busy_cus++; }
+  void cu_dispatched() {
+    assert(m_busy_cus > 0);
+    m_busy_cus--;
+  }
   void step() {
+    if (idle()) {            // T5
+      m_arbiter.advance_rr();
+      process_banks();
+      return;
+    }
     dispatch_ready_cu();
     allocate_reads();
     for (unsigned p = 0; p < m_in_ports.size(); p++) allocate_cu(p);
@@ -925,6 +960,10 @@ class opndcoll_rfu_t {  // operand collector based register file unit
     void reset_alloction() {
       for (unsigned b = 0; b < m_num_banks; b++) m_allocated_bank[b].reset();
     }
+    // T5 (P4-3): allocate_reads() rotates the priority diagonal on EVERY call
+    // (`_pri = (_pri + 1) % _outputs; m_last_cu = _pri;`), requests or not.
+    // An idle step reproduces that rotation and nothing else.
+    void advance_rr() { m_last_cu = (m_last_cu + 1) % m_num_collectors; }
 
    private:
     unsigned m_num_banks;
@@ -1074,6 +1113,10 @@ class opndcoll_rfu_t {  // operand collector based register file unit
       cu_sets_t;
   cu_sets_t m_cus;
   std::vector<dispatch_unit_t> m_dispatch_units;
+  // T7: see idle(). m_in_sets = the distinct register_set pointers reachable
+  // through m_in_ports[*].m_in[*] (ports of different schedulers share sets).
+  unsigned m_busy_cus = 0;
+  std::vector<register_set *> m_in_sets;
 
   // typedef std::map<warp_inst_t**/*port*/,dispatch_unit_t> port_to_du_t;
   // port_to_du_t                     m_dispatch_units;
@@ -1543,7 +1586,64 @@ class ldst_unit : public pipelined_simd_unit {
   // XLATLAT: how much of the SM's memory issue capacity translation is holding.
   void xlat_print_stats(FILE* fp, unsigned sid) const;
  private:
-  std::unordered_map<unsigned, std::deque<warp_inst_t>> m_xlat_parked;
+  // T9 (P4-8): the per-warp containers below used to be unordered_map / set
+  // keyed by warp id. Every use is a point operation on a key below
+  // max_warps_per_shader, so they are arrays now; map membership (an entry
+  // may exist with an empty deque, exactly as before) is kept explicitly.
+  // Only the deadlock diagnostic dump iterates, now in warp-id order.
+  class xlat_parked_t {
+   public:
+    void init(unsigned n) {
+      m_q.assign(n, std::deque<warp_inst_t>());
+      m_present.assign(n, 0);
+      m_n = 0;
+    }
+    bool has(unsigned w) const {
+      assert(w < m_present.size());
+      return m_present[w] != 0;
+    }
+    std::deque<warp_inst_t> *find(unsigned w) {
+      assert(w < m_present.size());
+      return m_present[w] ? &m_q[w] : NULL;
+    }
+    std::deque<warp_inst_t> &at_or_insert(unsigned w) {  // map operator[]
+      assert(w < m_present.size());
+      if (!m_present[w]) {
+        m_present[w] = 1;
+        m_n++;
+      }
+      return m_q[w];
+    }
+    void erase(unsigned w) {
+      assert(w < m_present.size() && m_present[w]);
+      m_present[w] = 0;
+      m_n--;
+      m_q[w].clear();
+    }
+    const std::deque<warp_inst_t> &at(unsigned w) const { return m_q[w]; }
+    unsigned slots() const { return m_q.size(); }
+    size_t size() const { return m_n; }
+    bool empty() const { return m_n == 0; }
+   private:
+    std::vector<std::deque<warp_inst_t>> m_q;
+    std::vector<char> m_present;
+    unsigned m_n = 0;
+  };
+  // Warp-id sets as byte arrays; the two helpers return what
+  // unordered_set::insert().second and (bool)erase() returned.
+  static bool wset_insert(std::vector<char> &s, unsigned w) {
+    assert(w < s.size());
+    if (s[w]) return false;
+    s[w] = 1;
+    return true;
+  }
+  static bool wset_erase(std::vector<char> &s, unsigned w) {
+    assert(w < s.size());
+    if (!s[w]) return false;
+    s[w] = 0;
+    return true;
+  }
+  xlat_parked_t m_xlat_parked;
   std::deque<unsigned> m_xlat_replay_q;                     // ready to replay
   // SAFETY-NET order queue (Option 3 + V7a). FIFO of parked warp ids so the
   // backstop serves the longest-parked warp first (unordered_map bucket order
@@ -1552,7 +1652,7 @@ class ldst_unit : public pipelined_simd_unit {
   // below -- bounds memory by warp count (the pre-V7a queue grew per park
   // event without bound, speed-audit V7).
   std::deque<unsigned> m_xlat_park_order;
-  std::unordered_set<unsigned> m_xlat_in_park_order;  // V7a dedup for the queue
+  std::vector<char> m_xlat_in_park_order;  // V7a dedup for the queue (T9: byte array)
 
   // D-PROBE (measurement only; never read by the model). The replay-first path
   // and the SAFETY NET share the same "m_dispatch_reg->empty()" gate, so a
@@ -1574,7 +1674,7 @@ class ldst_unit : public pipelined_simd_unit {
   unsigned           m_xlatlat_parked_max = 0;
   unsigned long long m_xlatlat_stalled_cycles = 0; // dispatch idle AND warps parked
   unsigned long long m_xlatlat_mem_issue_cycles = 0;  // a memory access was routed
-  std::unordered_set<unsigned> m_xlat_wake_pending;           // wakeup arrived while warp was unparked
+  std::vector<char> m_xlat_wake_pending;    // wakeup arrived while warp was unparked (T9: byte array)
   bool m_dispatch_parked = false;                             // park signal
   bool m_decouple_tlb = false;
   // per-warp translation table for the CURRENT outstanding mem instruction:
@@ -1586,12 +1686,37 @@ class ldst_unit : public pipelined_simd_unit {
   // the instruction uid it belonged to}. While the epoch stands still the whole
   // scan is a pure re-read answering any_pending again, so it is skipped.
   // Erased when the instruction drains (with its xlat tables) or on a new uid.
-  std::unordered_map<unsigned, std::pair<uint64_t, unsigned>> m_xlat_probe_memo;
+  struct xlat_memo_t {  // T9: array slot; valid == "entry present" in the old map
+    bool valid;
+    uint64_t epoch;
+    unsigned uid;
+  };
+  std::vector<xlat_memo_t> m_xlat_probe_memo;
+  // 44-5 memo, factored (T2) so memory_cycle() and the cycle_c SAFETY NET test
+  // the SAME predicate. xlat_l1_ports_off(): memo is only valid when no L1 TLB
+  // models lookup ports. xlat_memo_match(): this instruction's last full scan
+  // still stands (same uid, no L1 epoch movement). xlat_memo_hit(): the full
+  // condition under which memory_cycle() would park the instruction again
+  // without touching any state -- its preconditions mirror memory_cycle()'s
+  // early returns exactly.
+  bool xlat_l1_ports_off() const {
+    return (m_l1_tlb_4k->ports() == 0) &&
+           (!m_l1_tlb_64k || m_l1_tlb_64k->ports() == 0) &&
+           (!m_l1_tlb_2m  || m_l1_tlb_2m->ports()  == 0);
+  }
+  bool xlat_memo_match(const warp_inst_t &inst) const {
+    const unsigned w = inst.warp_id();
+    assert(w < m_xlat_probe_memo.size());
+    const xlat_memo_t &m = m_xlat_probe_memo[w];  // T9: array lookup
+    return m.valid && m.uid == inst.get_uid() && m.epoch == l1_xlat_epoch_sum();
+  }
+  bool xlat_memo_hit(const warp_inst_t &inst) const;
   // P-1 (speed-audit V3 fix): last L2 fill_seq() this unit's completion poll
   // observed, one per (4k, 64k, 2m) TLB pair. The pending-VPN scan in cycle_b
   // runs only when the matching L2 TLB filled since -- a skipped scan would
   // have consumed nothing (query_completed() is mutation-free when false and
-  // get_pending_vpns() is const), so the consumption ORDER is untouched and
+  // the pending scan -- for_each_pending(), T1-c -- only reads the MSHR), so
+  // the consumption ORDER is untouched and
   // digests are bit-identical; only the mostly-false per-cycle polling goes.
   uint64_t m_l2_fill_seen[3] = {0, 0, 0};
   uint64_t l1_xlat_epoch_sum() const {
@@ -1628,6 +1753,11 @@ class ldst_unit : public pipelined_simd_unit {
   unsigned long long m_last_inst_gpu_tot_sim_cycle;
 
   std::vector<std::deque<mem_fetch *>> l1_latency_queue;
+  // T8 (P4-7): non-NULL entries per bank. An entry enters at the tail slot in
+  // process_memory_access_queue_l1cache(), leaves when L1_latency_queue_cycle()
+  // sets slot 0 to NULL (HIT, or MISS/HIT_RESERVED); the per-cycle shift only
+  // moves entries. A bank with count 0 has nothing to test or shift.
+  std::vector<unsigned> m_l1q_count;
   void L1_latency_queue_cycle();
 };
 
@@ -2291,6 +2421,9 @@ class shader_core_ctx : public core_t {
       return 0;
   }
   kernel_info_t *get_kernel() { return m_kernel; }
+  // KERNEL HAND-OVER (2026-09-13): see gpgpu_sim::on_kernel_deleted().
+  void forget_kernel(const kernel_info_t *k) { if (m_kernel == k) m_kernel = NULL; }
+  void retarget_kernel(const kernel_info_t *from, kernel_info_t *to) { if (m_kernel == from) m_kernel = to; }
   unsigned get_sid() const { return m_sid; }
 
   // used by functional simulation:
@@ -2326,8 +2459,22 @@ class shader_core_ctx : public core_t {
   // ibuffer flush). Scoreboard releases live in Scoreboard::release_epoch().
   uint64_t p4_issue_epoch() const { return m_p4_issue_epoch; }
   void p4_note_issue_event() { m_p4_issue_epoch++; }
+  // T4 (P4-4): fetch()-scan memo. The scan's per-warp verdicts (retire:
+  // hardware_done && !pendingWrites && !done_exit; fetch: !functional_done &&
+  // !imiss_pending && ibuffer_empty) are a pure function of state that only
+  // changes through (a) the issue epoch (ibuffer fill, barrier/atomic/LDGSTS
+  // release, park clear, warp init), (b) Scoreboard::release_epoch(), and
+  // (c) m_fetch_epoch, bumped by shd_warp_t::note_fetch_event() from the
+  // mutators the first two do not cover (ibuffer free/flush, store ack,
+  // in-pipeline decrement, thread completion). A scan that neither retired
+  // nor fetched changes nothing, so it can be skipped until the key moves.
+  // The L1I-ready branch clears a warp's imiss_pending -> it disarms the memo.
+  void p4_note_fetch_event() { m_fetch_epoch++; }
  private:
   uint64_t m_p4_issue_epoch = 0;
+  uint64_t m_fetch_epoch = 0;
+  bool     m_fetch_memo_armed = false;
+  uint64_t m_fetch_memo_key = 0;
  public:
   void store_ack(class mem_fetch *mf);
   bool warp_waiting_at_mem_barrier(unsigned warp_id);
@@ -2772,6 +2919,12 @@ class shader_core_ctx : public core_t {
   // zero and the per-cycle 512-bit shifts are no-ops (skipped).
   unsigned m_result_bus_active = 0;
   std::vector<std::bitset<MAX_ALU_LATENCY> *> m_result_bus;
+  // T6 (P4-5): bit n set <=> m_fu[n] (n < N-1, i.e. not the ldst unit) was
+  // not pipe_idle() at the end of its last execute_a body run. A non-ldst
+  // unit's pipeline state changes only inside that body, so the bit is exact
+  // between runs. execute_a skips the body when the bit is clear and the
+  // unit's issue register set has no occupant.
+  unsigned long long m_fu_busy_mask = 0;
 
   // used for local address mapping with single kernel launch
   unsigned kernel_max_cta_per_shader;
@@ -2850,6 +3003,15 @@ class simt_core_cluster {
   unsigned issue_block2core();
   void cache_flush();
   void cache_invalidate();
+  // KERNEL HAND-OVER: see gpgpu_sim::on_kernel_deleted().
+  void forget_kernel(const kernel_info_t *k) {
+    for (unsigned i = 0; i < m_config->n_simt_cores_per_cluster; i++)
+      m_core[i]->forget_kernel(k);
+  }
+  void retarget_kernel(const kernel_info_t *from, kernel_info_t *to) {
+    for (unsigned i = 0; i < m_config->n_simt_cores_per_cluster; i++)
+      m_core[i]->retarget_kernel(from, to);
+  }
   bool icnt_injection_buffer_full(unsigned size, bool write);
   void icnt_inject_request_packet(class mem_fetch *mf);
   void update_icnt_stats(class mem_fetch *mf);
@@ -2860,6 +3022,7 @@ class simt_core_cluster {
   }
   void push_response_fifo(class mem_fetch *mf) {
     m_response_fifo.push_back(mf);
+    if (m_icnt_busy_mirror) *m_icnt_busy_mirror = 1;   // H3-3b
   }
 
   void get_pdom_stack_top_info(unsigned sid, unsigned tid, unsigned *pc,
@@ -2897,11 +3060,17 @@ class simt_core_cluster {
     gated = m_popgate_gated;
   }
   unsigned get_cluster_id() const { return m_cluster_id; }
+  // H3-3b (speed): "icnt_cycle() 에 할 일이 있을 수 있음" 미러 바이트. 응답 FIFO 에
+  // 넣는 경로(push_response_fifo)와 인터커넥트가 이 클러스터의 출력 버퍼에 넣는 경로가
+  // 1 로 켠다. 끄는 것은 gpgpu_sim 의 cluster icnt 루프가 방문 직후 실제 상태로 한다.
+  void set_icnt_busy_mirror(unsigned char *slot) { m_icnt_busy_mirror = slot; }
+  bool icnt_response_empty() const { return m_response_fifo.empty(); }
 
  protected:
   unsigned m_cluster_id;
   gpgpu_sim *m_gpu;
   gpu_module *m_gpu_module;
+  unsigned char *m_icnt_busy_mirror = nullptr;   // H3-3b
   const shader_core_config *m_config;
   shader_core_stats *m_stats;
   // POPGATE_ (temp): confirm TLB-fill replies starve because icnt_pop is gated by

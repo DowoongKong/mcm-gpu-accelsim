@@ -984,6 +984,9 @@ class tag_array {
   void add_pending_line(mem_fetch *mf);
   void remove_pending_line(mem_fetch *mf);
   void inc_dirty() { m_dirty++; }
+  // H2-C: install the per-cluster touched-mirror byte (see m_used_mirror). Called
+  // once, right after the owning cache is constructed.
+  void set_used_mirror(unsigned char *p) { m_used_mirror = p; }
 
  protected:
   // This constructor is intended for use only from derived classes that wish to
@@ -1016,6 +1019,13 @@ class tag_array {
   int m_type_id;  // what kind of cache is this (normal, texture, constant)
 
   bool is_used;  // a flag if the whole cache has ever been accessed before
+  // H2-C (speed): optional pointer to a per-cluster "this L1 was touched" byte that
+  // gpgpu_sim owns in one contiguous array. Written ONLY on the false->true
+  // transition of is_used, so the hot access path pays one predictable not-taken
+  // branch. The per-cycle L1-flush sweep then reads that array instead of walking
+  // into all 256 cores' tag_array objects -- calls that early-return on !is_used and
+  // were still 4.3% of run time, all of it cache misses.
+  unsigned char *m_used_mirror = NULL;
 
   typedef tr1_hash_map<new_addr_type, unsigned> line_table;
   line_table pending_lines;
@@ -1239,6 +1249,9 @@ class cache_stats {
   void get_sub_stats_pw(struct cache_sub_stats_pw &css) const;
 
   void sample_cache_port_utility(bool data_port_busy, bool fill_port_busy);
+  // H3-3c: 두 포트가 모두 한가한 사이클 n 번의 샘플을 한꺼번에 반영한다.
+  // sample_cache_port_utility(false, false) 를 n 번 부른 것과 정확히 같다.
+  void add_idle_port_samples(unsigned long long n) { m_cache_port_available_cycles += n; }
 
  private:
   bool check_valid(int type, int status) const;
@@ -1327,6 +1340,8 @@ class baseline_cache : public cache_t {
   // flash invalidate all entries in cache
   void flush() { m_tag_array->flush(); }
   void invalidate() { m_tag_array->invalidate(); }
+  // H2-C: pass-through for the per-cluster touched mirror.
+  void set_used_mirror(unsigned char *p) { m_tag_array->set_used_mirror(p); }
   void print(FILE *fp, unsigned &accesses, unsigned &misses) const;
   void display_state(FILE *fp) const;
 
@@ -1356,6 +1371,10 @@ class baseline_cache : public cache_t {
   bool fill_port_free() const {
     return m_bandwidth_management.fill_port_free();
   }
+  // H3-3c: cycle() 이 통계 샘플 한 번 외에 아무것도 하지 않는 상태인가
+  // (miss 큐 비고 두 포트 한가 -> 보충도 no-op, 샘플은 (false,false)).
+  bool miss_queue_empty() const { return m_miss_queue.empty(); }
+  void add_idle_port_samples(unsigned long long n) { m_stats.add_idle_port_samples(n); }
   void inc_aggregated_stats(cache_request_status status,
                             cache_request_status cache_status, mem_fetch *mf,
                             enum cache_gpu_level level);

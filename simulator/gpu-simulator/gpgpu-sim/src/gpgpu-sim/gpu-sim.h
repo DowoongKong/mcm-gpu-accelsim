@@ -575,9 +575,12 @@ class gpgpu_sim_config : public power_config,
   const char* get_gmmu_placement_dump() const { return gmmu_placement_dump; }
   const char* get_gmmu_placement_load() const { return gmmu_placement_load; }
   bool get_gmmu_local_ptw() const { return gmmu_local_ptw; }
+  // s30: replay the placement map's PFNs (data, PT nodes, root) instead of only its owners.
+  bool get_gmmu_placement_exact() const { return gmmu_placement_exact; }
   unsigned get_l2_tlb_ports() const { return m_shader_config.gpgpu_l2_tlb_ports; }
   unsigned get_l2_tlb_sets()         const { return m_l2_tlb_sets; }
   unsigned get_l2_tlb_assoc()        const { return m_l2_tlb_assoc; }
+  unsigned get_l2_tlb_set_hash()     const { return m_l2_tlb_set_hash; }
   unsigned get_l2_tlb_mshr_entries() const { return m_l2_tlb_mshr_entries; }
   unsigned get_l2_tlb_mshr_max_merge() const { return m_l2_tlb_mshr_max_merge; }
   unsigned get_l2_tlb_lookup_latency() const { return m_l2_tlb_lookup_latency; }
@@ -654,7 +657,11 @@ class gpgpu_sim_config : public power_config,
   // manually (oracle locality table stand-in for the paper's compiler pass).
   unsigned m_lasp_policy;      // -gpgpu_lasp_policy: 0=off 1=row 2=col 3=chunk
   unsigned m_lasp_chunk_size;  // -gpgpu_lasp_chunk_size for policy=3
+  unsigned m_cta_chiplet_cursor;  // -gpgpu_cta_chiplet_cursor: 1 = per-chiplet CTA cursors (PCC)
+  unsigned m_kernel_rebind;       // -gpgpu_kernel_rebind: 0 = v7b hand-over (default), 1 = rebind when idle
  public:
+  unsigned get_cta_chiplet_cursor() const { return m_cta_chiplet_cursor; }
+  unsigned get_kernel_rebind() const { return m_kernel_rebind; }
   unsigned get_cta_sched_policy() const { return m_cta_sched_policy; }
   unsigned get_lasp_policy() const { return m_lasp_policy; }
   unsigned get_lasp_chunk_size() const { return m_lasp_chunk_size; }
@@ -679,10 +686,12 @@ class gpgpu_sim_config : public power_config,
   // home chiplet, so remote *data* accesses cost exactly what they did before.
   // 0 = baseline (one distributed page table).
   bool gmmu_local_ptw;
+  bool gmmu_placement_exact;  // s30: replay map PFNs exactly (needs a v3 map)
 
   // Per-chiplet L2 TLB geometry, one group per page size (4KB/64KB/2MB).
   unsigned m_l2_tlb_sets;          // set by -gpgpu_l2_tlb_sets
   unsigned m_l2_tlb_assoc;         // set by -gpgpu_l2_tlb_assoc
+  unsigned m_l2_tlb_set_hash;      // set by -gpgpu_l2_tlb_set_hash (0 = modulo, 1 = XOR-fold)
   unsigned m_l2_tlb_mshr_entries;  // set by -gpgpu_l2_tlb_mshr_entries
   unsigned m_l2_tlb_mshr_max_merge;  // set by -gpgpu_l2_tlb_mshr_max_merge
   unsigned m_l2_tlb_lookup_latency;  // set by -gpgpu_l2_tlb_lookup_latency
@@ -804,6 +813,13 @@ class gpgpu_sim : public gpgpu_t {
   unsigned threads_per_core() const;
   bool get_more_cta_left() const;
   bool kernel_more_cta_left(kernel_info_t *kernel) const;
+  // KERNEL HAND-OVER (2026-09-13): called by the trace framework right before it
+  // deletes a finished kernel, from the serial main loop (no cycle() is running).
+  // See gpu-sim.cc for why.
+  void on_kernel_deleted(const kernel_info_t *k);
+  // Called by the trace framework right after it creates a kernel (serial main loop).
+  void on_kernel_created(kernel_info_t *nk);
+  std::vector<const kernel_info_t *> m_retired_kernels;   // -gpgpu_kernel_rebind 0 only
   bool hit_max_cta_count() const;
   kernel_info_t *select_kernel();
   PowerscalingCoefficients *get_scaling_coeffs();
@@ -913,6 +929,40 @@ class gpgpu_sim : public gpgpu_t {
   // packs bits, and neighbouring clusters written by different threads would
   // then share a word.
   std::vector<char> m_cluster_ran;
+  // H2-C (speed): per-cluster "some core's L1D was touched since the last
+  // invalidate" mirror, written by tag_array::access() through the pointer handed
+  // out by l1_used_mirror_slot(). Sized once, on the first slot request, and never
+  // resized afterwards -- the caches hold raw pointers into it.
+  std::vector<unsigned char> m_l1_used;
+  // H3-3 (speed): 256폭 직렬 스캔을 "할 일이 있을 수 있는 칸"만 도는 미러 바이트.
+  // 첫 cycle() 에서 한 번 크기를 잡고(전부 1) 이후 크기를 바꾸지 않는다 -- 객체들이
+  // 원시 포인터를 들고 있다. 불변식: 바이트가 0 이면 그 칸의 방문은 아무 일도 하지 않는다.
+  std::vector<unsigned char> m_l2icnt_nonempty;   // [sub-partition] mem->icnt pop 루프
+  std::vector<unsigned char> m_cluster_icnt_busy; // [cluster] cluster icnt_cycle 루프
+  bool m_icnt_mirrors_wired = false;
+  bool m_cluster_icnt_mirror_ok = false;          // 로컬 xbar + 비 SST 일 때만
+  void wire_icnt_mirrors();
+  // H3-3c: 서브파티션 L2 루프. 건너뛴 방문의 유일한 부수효과(L2 포트 샘플)는 방문 재개 시와
+  // 통계 출력 직전에 한꺼번에 반영한다(flush_l2loop_idle).
+  std::vector<unsigned char> m_l2loop_busy;       // [sub-partition]
+  std::vector<unsigned long long> m_l2loop_last;  // 마지막으로 실제 방문한 루프 틱
+  unsigned long long m_l2loop_tick = 0;           // 실행된 L2 루프 수
+  bool m_l2loop_mirror_ok = false;
+  void flush_l2loop_idle();
+
+ public:
+  // H2-C: the byte this core's L1D must set when it is first touched. Cluster
+  // granularity, because cache_invalidate() (the only consumer) invalidates a whole
+  // cluster at once.
+  unsigned char *l1_used_mirror_slot(unsigned sid) {
+    if (m_l1_used.empty())
+      m_l1_used.assign(m_shader_config->n_simt_clusters, 0);
+    const unsigned c = m_shader_config->sid_to_cluster(sid);
+    assert(c < m_l1_used.size());
+    return &m_l1_used[c];
+  }
+
+ protected:   // restore the section this block was inserted into (was protected)
 
   unsigned m_last_cluster_issue;
   // 39: issue-scan gating. Scan verdict is a pure function of (core occupancy,

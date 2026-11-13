@@ -1,4 +1,8 @@
 #include "gpu_tlb.h"
+#include <cstdlib>   // getenv, abort (set-hash option)
+// ST-5/7/8: diagnostic-only rows (PORT, per-SM XLATHIST, XLATLITTLE) print only
+// under ACCELSIM_DIAG. Defined in gpu-sim.cc (same gate as the (temp) families).
+extern const bool g_accelsim_diag;
 #include <cassert>
 #include <cstdio>
 #include <algorithm>
@@ -76,13 +80,6 @@ void l1_tlb_mshr::evict(uint64_t vpn) {
   m_entries.erase(vpn);
 }
 
-std::vector<uint64_t> l1_tlb_mshr::get_pending_vpns() const {
-  std::vector<uint64_t> result;
-  for (auto &kv : m_entries)
-    if (!kv.second.ready)
-      result.push_back(kv.first);
-  return result;
-}
 
 //  gpu_l1_tlb 
 
@@ -141,9 +138,29 @@ gpu_l1_tlb::result_t gpu_l1_tlb::access(uint64_t va, unsigned warp_id,
       // A MISS/MSHR_HIT that has since been filled was already counted in
       // resolve_lookup() (m_misses++ / m_mshr_hits++); counting its completing
       // retry as a hit double-counts every miss and inflates hit_rate.
-      if (rit->second == HIT) m_hits++;
+      if (rit->second.r == HIT) m_hits++;
       m_resolved.erase(rit);
       // XLATLAT: t9. The PTE is now in the warp's hands, so the request is over.
+      auto xr = m_xlat_rec.find(rid);
+      if (xr != m_xlat_rec.end()) {
+        xr->second.t_done = cur;
+        xlat_close(rid, xr->second, cur);  // folds and erases
+      }
+      return HIT;
+    }
+    // L1FWD: the page was evicted from the shared array before this warp's
+    // replay, but its PTE was delivered to this request (resolve-time array hit,
+    // or the fill that answered its MSHR entry). Consume it instead of
+    // re-fetching: a request then completes once per resolution, so the
+    // fill/evict race can no longer starve it. Before this, a warp needing more
+    // pages than the 32-entry array holds, with fills arriving faster than its
+    // replay turn, re-fetched forever (Transpose 4096 with a 4x+ L2 TLB,
+    // regular_exp/docs/hypothesis2_l2tlb_sweep.ko.md 7.1-7.5).
+    if (rit->second.has_pte) {
+      out_pte = rit->second.pte;
+      if (rit->second.r == HIT) m_hits++;  // same counting rule as the array path
+      m_resolved.erase(rit);
+      m_fwd_delivered++;
       auto xr = m_xlat_rec.find(rid);
       if (xr != m_xlat_rec.end()) {
         xr->second.t_done = cur;
@@ -161,7 +178,7 @@ gpu_l1_tlb::result_t gpu_l1_tlb::access(uint64_t va, unsigned warp_id,
     // evicted from the array, and the same VPN is being re-fetched by an
     // in-flight MSHR entry, so wait on that fill like any shared-VPN requester.
     if (m_mshr.probe(vpn_val)) {
-      rit->second = MSHR_HIT;
+      rit->second.r = MSHR_HIT;
       return MSHR_HIT;
     }
     // array miss AND not in flight => the cached classification is STALE:
@@ -170,6 +187,9 @@ gpu_l1_tlb::result_t gpu_l1_tlb::access(uint64_t va, unsigned warp_id,
     // Drop the stale entry and fall through to re-issue a fresh lookup, so the
     // page is re-fetched (L2 hit or re-walk). Otherwise access() returns a stale
     // MSHR_HIT forever and the warp parks on this VPN indefinitely (deadlock).
+    // L1FWD: a filled request always has_pte, so this is reached only if its MSHR
+    // entry went away without a fill (l1_tlb_mshr::evict); the re-fetch stays as
+    // the fallback for that case.
     m_resolved.erase(rit);
   }
   // (2) Lookup already in the pipe (this request injected): wait, no re-inject.
@@ -189,7 +209,8 @@ gpu_l1_tlb::result_t gpu_l1_tlb::access(uint64_t va, unsigned warp_id,
   m_inflight_lookup.insert(rid);
   if (m_inflight_lookup.size() > m_concurrent_max)
     m_concurrent_max = (unsigned)m_inflight_lookup.size();
-  m_lookup_pipe[m_lookup_latency - 1].push_back({true, rid, vpn_val, warp_id});
+  pipe_stage(m_lookup_latency - 1).push_back({true, rid, vpn_val, warp_id});  // T3: ring tail
+  m_pipe_live++;  // T15
   // XLATLAT: t1, and t0 as well when the port was free on the first call (the
   // common case -- nothing else can consume a cycle before the injection).
   // Reaching here a second time means block (1) found a stale classification and
@@ -229,6 +250,11 @@ void gpu_l1_tlb::fill(uint64_t vpn, const gpu_pte_t &pte,
   const std::vector<unsigned> *waiters = m_mshr.waiters_of(vpn);
   if (waiters) {
     for (unsigned w : *waiters) {
+      // L1FWD: the fill response carries the PTE to every waiting request, so a
+      // waiter no longer depends on the page surviving in the array until its
+      // replay. Before the XLATLAT `continue` so waiters without a record get it too.
+      auto rv = m_resolved.find(req_key(w, vpn));
+      if (rv != m_resolved.end()) { rv->second.pte = pte; rv->second.has_pte = true; }
       auto r = m_xlat_rec.find(req_key(w, vpn));
       if (r == m_xlat_rec.end()) continue;
       if (r->second.t_fill == 0) r->second.t_fill = current_cycle;
@@ -252,6 +278,20 @@ void gpu_l1_tlb::cycle(uint64_t cur) {
   const unsigned live = (unsigned)m_xlat_rec.size();
   m_xlat_inflight_sum += live;
   if (live > m_xlat_inflight_max) m_xlat_inflight_max = live;
+  // T15 (P4-12): with no slot anywhere in the ring and no MSHR-full waiter,
+  // every statement below is a no-op: the head stage is empty, nothing can be
+  // blocked, the clear is empty and the wait-queue block is skipped. The ring
+  // head need not advance either -- push (head + latency - 1) and drain (head)
+  // are relative to it, so an all-empty ring drains a later push after the
+  // same latency - 1 advances wherever the head sits. state_fingerprint()
+  // mixes only stage sizes.
+  if (m_pipe_live == 0 && m_mshr_wait_q.empty()) {
+#ifdef P4_CHECK
+    for (const auto &st : m_lookup_pipe)
+      assert(st.empty() && "P4_CHECK(T15): pipe_live 0 but a stage holds a slot");
+#endif
+    return;
+  }
 
   std::vector<mshr_wait_ent> this_cycle_blocked;  // 36a: see ORDER note below
   // 36a helper: shared success bookkeeping (identical to the old resolved path).
@@ -268,16 +308,18 @@ void gpu_l1_tlb::cycle(uint64_t cur) {
       m_resv_fail_start.erase(it);
     }
   };
-  for (lookup_slot &head : m_lookup_pipe[0]) {
+  for (lookup_slot &head : pipe_stage(0)) {   // T3: ring head
     if (!head.valid) continue;
-    bool resolved = resolve_lookup(head, cur);
+    bool in_flight = false;
+    bool resolved = resolve_lookup(head, cur, &in_flight);
     if (resolved) {
       on_resolved(head);
     } else {
       // 36a: park on the MSHR wait queue instead of re-injecting. Fail type
       // is re-derived cheaply (state is unchanged since the verdict).
+      // H3-4: resolve_lookup 이 false 판정에 쓴 probe 값을 그대로 받는다(재조회 없음).
       this_cycle_blocked.push_back(
-          {head, cur, cur, m_mshr.probe(head.vpn)});
+          {head, cur, cur, in_flight});
       m_resv_fail_start.emplace(head.rid, cur);
     }
   }
@@ -289,9 +331,18 @@ void gpu_l1_tlb::cycle(uint64_t cur) {
   // group, keeping its internal order.
   for (auto it = this_cycle_blocked.rbegin(); it != this_cycle_blocked.rend(); ++it)
     m_mshr_wait_q.push_front(*it);
-  for (unsigned s = 0; s + 1 < m_lookup_latency; ++s)
-    m_lookup_pipe[s] = std::move(m_lookup_pipe[s + 1]);
-  m_lookup_pipe[m_lookup_latency - 1].clear();
+  // T3: advance the ring. The drained head becomes the (empty) new tail, which
+  // is exactly what shifting every stage down and clearing the last one did.
+  m_pipe_live -= (unsigned)pipe_stage(0).size();  // T15
+  pipe_stage(0).clear();
+  m_pipe_head = (m_pipe_head + 1) % m_lookup_latency;
+#ifdef P4_CHECK
+  {
+    unsigned n = 0;
+    for (const auto &st : m_lookup_pipe) n += (unsigned)st.size();
+    assert(n == m_pipe_live && "P4_CHECK(T15): pipe_live drift");
+  }
+#endif
   // Q6 fix (kept): an MSHR-full is not a failed probe; the blocked request
   // retries without re-paying m_lookup_latency. 36a changes only WHEN the
   // retry runs: the resolve verdict is a pure function of (array, MSHR)
@@ -315,11 +366,12 @@ void gpu_l1_tlb::cycle(uint64_t cur) {
           if (w.merge_cap) m_mshr_merge_full += skipped;
           else             m_mshr_entries_full += skipped;
         }
-        if (resolve_lookup(w.s, cur)) {
+        bool in_flight = false;
+        if (resolve_lookup(w.s, cur, &in_flight)) {
           on_resolved(w.s);
         } else {
           w.last_attempt = cur;
-          w.merge_cap = m_mshr.probe(w.s.vpn);
+          w.merge_cap = in_flight;   // H3-4: == m_mshr.probe(w.s.vpn), 상태 불변이라 재조회 불필요
           keep.push_back(w);
         }
       }
@@ -345,18 +397,21 @@ bool gpu_l1_tlb::pop_hit_wakeup(unsigned &warp_id) {
 
 // Reached once per request when its lookup reaches the pipe head.
 // Returns false only when the MSHR is full (cycle() re-injects to retry).
-bool gpu_l1_tlb::resolve_lookup(const lookup_slot &s, uint64_t cur) {
+bool gpu_l1_tlb::resolve_lookup(const lookup_slot &s, uint64_t cur, bool *in_flight_out) {
   unsigned sidx = set_idx(s.vpn);
   // XLATLAT: t2 for every branch below that returns true -- the probe reached the
   // pipe head and the request left the lookup stage. An MSHR-full re-inject
   // (return false) has NOT left it, so it must not be stamped.
-  auto xr = m_xlat_rec.find(s.rid);
+  // H3-4: m_xlat_rec 조회는 기록을 실제로 쓰는 성공 분기 안에서만 한다. 대기열에서
+  // 재검사되는 요청은 대부분 false(MSHR-full)로 끝나 조회 결과를 쓰지 않았다. 이 함수는
+  // m_xlat_rec 를 바꾸지 않으므로 어느 시점에 찾아도 같은 원소를 얻는다.
   int way = find_way(sidx, s.vpn);
   if (way >= 0) {                              // array hit
     m_sets[sidx][way].lru_time = cur;
-    m_resolved[s.rid] = HIT;                   // m_hits counted by access() block (1)
+    m_resolved[s.rid] = {HIT, true, m_sets[sidx][way].pte};  // m_hits counted by access() block (1); L1FWD: PTE handed over now
     m_resolve_epoch++;                         // 44-5: not covered by fill/MSHR epochs
     m_hit_wakeup.push_back(s.warp_id);      // P5: wake parked warp (no MSHR entry)
+    auto xr = m_xlat_rec.find(s.rid);
     if (xr != m_xlat_rec.end()) {
       xr->second.t_l1_resolve = cur;
       // The page is already in the array, so there is nothing to wait for: t8
@@ -366,33 +421,45 @@ bool gpu_l1_tlb::resolve_lookup(const lookup_slot &s, uint64_t cur) {
     }
     return true;
   }
-  if (m_mshr.probe(s.vpn)) {                    // VPN already in flight
-    if (m_mshr.full(s.vpn)) {                   // entry merge cap (waiters >= max_merge)
-      m_mshr_merge_full++; return false;        // re-inject; retry until a slot frees / fill lands
+  // H3-4: probe(vpn) + full(vpn) 을 한 번에. 둘 사이에 MSHR 변경이 없었으므로 동일.
+  bool in_flight, mshr_full;
+  m_mshr.peek(s.vpn, in_flight, mshr_full);
+  if (in_flight) {                              // VPN already in flight
+    if (mshr_full) {                            // entry merge cap (waiters >= max_merge)
+      m_mshr_merge_full++;                      // re-inject; retry until a slot frees / fill lands
+      if (in_flight_out) *in_flight_out = true;
+      return false;
     }
     m_mshr.add(s.vpn, s.warp_id);
-    m_resolved[s.rid] = MSHR_HIT; m_mshr_hits++;
+    m_resolved[s.rid] = {MSHR_HIT, false, gpu_pte_t{}}; m_mshr_hits++;  // L1FWD: PTE arrives with the fill
+    auto xr = m_xlat_rec.find(s.rid);
     if (xr != m_xlat_rec.end()) {
       xr->second.t_l1_resolve = cur;
       xr->second.bucket = XLAT_B_L1_MERGE;
     }
     return true;
   }
-  if (m_mshr.full(s.vpn)) {                      // table full (new VPN, no free entry)
-    m_mshr_entries_full++; return false;
+  if (mshr_full) {                               // table full (new VPN, no free entry)
+    m_mshr_entries_full++;
+    if (in_flight_out) *in_flight_out = false;
+    return false;
   }
   m_mshr.add(s.vpn, s.warp_id);                 // add at miss time (capacity-gated)
-  if (xr != m_xlat_rec.end()) {
-    xr->second.t_l1_resolve = cur;
-    xr->second.bucket = XLAT_B_PTW;
+  {
+    auto xr = m_xlat_rec.find(s.rid);
+    if (xr != m_xlat_rec.end()) {
+      xr->second.t_l1_resolve = cur;
+      xr->second.bucket = XLAT_B_PTW;
+    }
   }
-  m_l2_req_queue.push_back({s.vpn, s.warp_id, cur, 0, 0, false});  // hand off to L2 fifo (44-3/4: poll now)
+  m_l2_req_queue.push_back({s.vpn, s.warp_id, cur, 0, 0, false, 0, 0});  // hand off to L2 fifo (44-3/4: poll now)
+  m_l2_req_enq++;  // T16
   if (m_l2_req_queue.size() > m_l2_req_q_max)
     m_l2_req_q_max = (unsigned)m_l2_req_queue.size();
   m_misses++;
   // Subsequent polls of this same (warp,vpn) request return MSHR_HIT: its
   // L2 request is in flight and the fill will complete it.
-  m_resolved[s.rid] = MSHR_HIT;
+  m_resolved[s.rid] = {MSHR_HIT, false, gpu_pte_t{}};  // L1FWD: PTE arrives with the fill
   return true;
 }
 
@@ -437,6 +504,8 @@ void xlatsum_gpu_print(FILE *f) {
     xlat_sum_t all;
     for (unsigned o = 0; o < XLAT_B_NUM; o++) {
       g_xlatsum[k][o].print(f, kinds[k], "GPU", xlat_bucket_name(o));
+      // ST-7: GPU-wide S6/S7 shape (replaces the per-SM XLATHIST rows).
+      g_xlatsum[k][o].print_hist(f, kinds[k], "GPU", xlat_bucket_name(o));
       all.add(g_xlatsum[k][o]);
       g_xlatsum[k][o] = xlat_sum_t();
     }
@@ -448,6 +517,10 @@ void gpu_l1_tlb::print_stats(FILE *f) const {
   unsigned long long total = m_hits + m_misses;
   // Tag follows the page size this instance was built for, so 4k and 2m stats
   // stay distinguishable in the log.
+  // hit_rate = hits / (hits + misses) is the ARRAY hit rate: merged requests
+  // (mshr_hits) are in neither term, so it is not "fraction of requests that
+  // did not walk". No script consumes it; a redefinition is deferred
+  // (OPEN_QUESTIONS.ko.md, hit_rate) because it changes a digest A-class line.
   fprintf(f, "[L1_TLB_%s_STAT] SM=%u hits=%llu misses=%llu mshr_hits=%llu "
              "merge_full=%llu entries_full=%llu resv_fail_cycles=%llu "
              "hit_rate=%.2f%%\n",
@@ -455,11 +528,20 @@ void gpu_l1_tlb::print_stats(FILE *f) const {
           m_sm_id, m_hits, m_misses, m_mshr_hits,
           m_mshr_merge_full, m_mshr_entries_full, m_resv_fail_cycles,
           total ? 100.0 * m_hits / total : 0.0);
+  // L1FWD: printed only when the delivered-PTE path was used, so the logs of runs
+  // that never needed it stay byte-identical.
+  if (m_fwd_delivered)
+    fprintf(f, "[L1_TLB_%s_FWD] SM=%u evicted_before_consume_delivered=%llu\n",
+            page_kind_tag(m_page_shift), m_sm_id, m_fwd_delivered);
   // Which resource actually limits translation throughput: ports, the L1->L2
   // queue, or something downstream. port_busy==0 means the port cap never bound.
-  fprintf(f, "[L1_TLB_%s_PORT] SM=%u ports=%u port_busy=%llu concurrent_max=%u l2_req_q_max=%u\n",
-          page_kind_tag(m_page_shift), m_sm_id, m_n_ports,
-          m_port_busy_stalls, m_concurrent_max, m_l2_req_q_max);
+  // ST-5: every experiment config runs with ports=0 (unbounded), so port_busy is
+  // identically 0 and no script reads this row. Print it only when the port cap
+  // is real or diagnostics are on.
+  if (m_n_ports != 0 || g_accelsim_diag)
+    fprintf(f, "[L1_TLB_%s_PORT] SM=%u ports=%u port_busy=%llu concurrent_max=%u l2_req_q_max=%u\n",
+            page_kind_tag(m_page_shift), m_sm_id, m_n_ports,
+            m_port_busy_stalls, m_concurrent_max, m_l2_req_q_max);
   // XLATLAT: per-request breakdown. `resid` must be 0; any other value means the
   // segments do not tile [t_issue, t_done] and the whole breakdown is void.
   // `smid` is the not-yet-split middle (L2 + PWQ + PTW + fill delivery).
@@ -491,15 +573,20 @@ void gpu_l1_tlb::print_stats(FILE *f) const {
               a.remote / w, a.pwc_hit / w, a.icnt_bp / w);
       // Shape of S6 and S7. Bin k >= 1 covers [2^(k-1), 2^k) cycles; only
       // non-empty bins are printed.
-      fprintf(f, "[L1_TLB_%s_XLATHIST] SM=%u out=%s kind=s6_pwqwait n=%llu",
-              page_kind_tag(m_page_shift), m_sm_id, xlat_bucket_name(o),
-              a.n_walk);
-      xlat_hist_print(f, a.hist_s6);
-      fprintf(f, "\n[L1_TLB_%s_XLATHIST] SM=%u out=%s kind=s7_walk n=%llu",
-              page_kind_tag(m_page_shift), m_sm_id, xlat_bucket_name(o),
-              a.n_walk);
-      xlat_hist_print(f, a.hist_s7);
-      fprintf(f, "\n");
+      // ST-7: the per-SM rows (SM x outcome x 2, ~1k lines per dump) had no
+      // reader; the GPU-wide fold printed by xlatsum_gpu_print() keeps the
+      // distribution. Per-SM detail is a diagnostic now.
+      if (g_accelsim_diag) {
+        fprintf(f, "[L1_TLB_%s_XLATHIST] SM=%u out=%s kind=s6_pwqwait n=%llu",
+                page_kind_tag(m_page_shift), m_sm_id, xlat_bucket_name(o),
+                a.n_walk);
+        xlat_hist_print(f, a.hist_s6);
+        fprintf(f, "\n[L1_TLB_%s_XLATHIST] SM=%u out=%s kind=s7_walk n=%llu",
+                page_kind_tag(m_page_shift), m_sm_id, xlat_bucket_name(o),
+                a.n_walk);
+        xlat_hist_print(f, a.hist_s7);
+        fprintf(f, "\n");
+      }
     }
   }
   fprintf(f, "[L1_TLB_%s_XLATLAT] SM=%u dropped=%llu inflight_at_end=%zu\n",
@@ -520,7 +607,10 @@ void gpu_l1_tlb::print_stats(FILE *f) const {
   // Little's Law: N (outstanding), X (throughput), W (mean latency). N == X*W is
   // an identity, so a mismatch means a boundary was mismeasured. Reported so the
   // check can be done from the log without re-deriving anything.
-  {
+  // ST-8: N_avg duplicates [LDST_XLATLAT] parked_avg and XW == N_avg by
+  // construction; the boundary check this row was written for passed on every
+  // log inspected, so it is a diagnostic row now.
+  if (g_accelsim_diag) {
     unsigned long long done = 0, wsum = 0;
     for (unsigned o = 0; o < XLAT_B_NUM; o++) {
       done += m_xlat_acc[o].n;
@@ -548,6 +638,30 @@ gpu_l2_tlb::gpu_l2_tlb(unsigned num_sets, unsigned assoc,
       m_hits(0), m_misses(0), m_mshr_hits(0) {
   m_sets.resize(num_sets,
                 std::vector<l1_tlb_entry_t>(assoc, {false, 0, {0}, 0}));
+  m_ep_set.assign(num_sets, 1);  // T12/T14
+  m_set_lookups.assign(num_sets, 0);
+  m_set_fills.assign(num_sets, 0);
+  m_set_bits = 0;
+  while ((1u << m_set_bits) < num_sets) m_set_bits++;
+}
+
+void gpu_l2_tlb::set_set_hash(unsigned mode) {
+  m_set_hash = mode;
+  if (mode != 0 && (m_num_sets & (m_num_sets - 1)) != 0) {
+    fprintf(stderr, "gpu_l2_tlb: -gpgpu_l2_tlb_set_hash needs a power-of-two set count (got %u)\n", m_num_sets);
+    abort();
+  }
+}
+
+bool gpu_l2_tlb::full_verdict(uint64_t vpn_val, bool *merge) const {  // T12
+  if (find_way(set_idx(vpn_val), vpn_val) >= 0) return false;
+  auto it = m_mshr.find(vpn_val);
+  if (it != m_mshr.end()) {
+    *merge = true;
+    return it->second.pending_clusters.size() >= m_mshr_max_merge;
+  }
+  *merge = false;
+  return m_mshr.size() >= m_mshr_entries;
 }
 
 int gpu_l2_tlb::find_way(unsigned sidx, uint64_t vpn_val) const {
@@ -567,21 +681,28 @@ int gpu_l2_tlb::lru_victim(unsigned sidx) const {
 
 gpu_l2_tlb::result_t gpu_l2_tlb::access(uint64_t va, unsigned cluster_id,
                                         gpu_pte_t& out_pte, uint64_t cur,
-                                        uint64_t* ready_out) {
+                                        uint64_t* ready_out,
+                                        bool* was_probing_out) {
   uint64_t vpn_val = vpn(va);
   unsigned sidx    = set_idx(vpn_val);
   uint64_t rid     = req_key(cluster_id, vpn_val);
 
   // (1) Inside this request's OWN probe-latency window (keyed by rid, not vpn).
   auto git = m_lookup_ready.find(rid);
+  // T1-a: keys(m_lookup_ready) == m_probing at every point (both inserted at
+  // (3), both erased on a non-FULL verdict, both kept on MSHR_FULL), so this
+  // find already answers the caller's former is_probing() question.
+  if (was_probing_out) *was_probing_out = (git != m_lookup_ready.end());
   if (git != m_lookup_ready.end()) {
-    if (cur < git->second) {
+    if (cur < git->second.ready) {
       m_gate_pending++;
-      if (ready_out) *ready_out = git->second;  // 44-3: let the caller sleep until expiry
+      if (ready_out) *ready_out = git->second.ready;  // 44-3: let the caller sleep until expiry
       return LOOKUP_PENDING;
     }
     m_gate_expire++;
-    m_lookup_ready.erase(git);                        // probe latency elapsed
+    // resolve() never touches m_lookup_ready, so `git` stays valid across it.
+    // T1-b: the erase moved below the verdict -- an MSHR-full re-verdict keeps
+    // its gate entry and re-arms it in place instead of erase + re-insert.
     result_t r = resolve(vpn_val, sidx, cluster_id, out_pte, cur);
     // Account the time a request stays blocked on an MSHR-full, mirroring
     // gpu_l1_tlb.
@@ -589,13 +710,19 @@ gpu_l2_tlb::result_t gpu_l2_tlb::access(uint64_t va, unsigned cluster_id,
       // Still inside the lookup stage (only the MSHR slot is missing), so the
       // port is NOT released -- mirrors the L1, where an MSHR-full retry keeps
       // its pipe slot.
-      m_resv_fail_start.emplace(rid, cur);
+      // T1-b: record the first blocked cycle once. emplace() never overwrote an
+      // existing start, so skipping it on later re-verdicts is identical.
+      if (!git->second.blocked) {
+        m_resv_fail_start.emplace(rid, cur);
+        git->second.blocked = true;
+      }
       // Q6 fix: re-arm the gate as ALREADY EXPIRED so the next poll retries the
       // MSHR allocation immediately, instead of paying m_lookup_latency (80)
       // again for a probe that already succeeded. Without this the request is
       // re-gated and the stall is amplified 80x per retry.
-      m_lookup_ready[rid] = cur;
+      git->second.ready = cur;
     } else {
+      m_lookup_ready.erase(git);                      // probe latency elapsed
       m_probing.erase(rid);                           // left the lookup stage
       auto fit = m_resv_fail_start.find(rid);
       if (fit != m_resv_fail_start.end()) {
@@ -630,7 +757,8 @@ gpu_l2_tlb::result_t gpu_l2_tlb::access(uint64_t va, unsigned cluster_id,
   m_probing.insert(rid);
   if (m_probing.size() > m_concurrent_max)
     m_concurrent_max = (unsigned)m_probing.size();
-  m_lookup_ready[rid] = cur + m_lookup_latency;
+  XLAT_HOT_ASSERT(m_resv_fail_start.count(rid) == 0);  // T1-b: a fresh gate has no blocked start
+  m_lookup_ready[rid] = gate_t{cur + m_lookup_latency, false};
   {
     // XLATLAT: t3. Arming again for a request that already had a verdict means a
     // PWQ-full rollback threw away its gate and port (gpu-module.cc), so the
@@ -672,6 +800,7 @@ gpu_l2_tlb::resolve(uint64_t vpn_val, unsigned sidx, unsigned cluster_id,
     m_sets[sidx][way].lru_time = cur;
     out_pte = m_sets[sidx][way].pte;
     m_hits++;
+    m_set_lookups[sidx]++;
     return HIT;
   }
   auto mit = m_mshr.find(vpn_val);
@@ -682,8 +811,11 @@ gpu_l2_tlb::resolve(uint64_t vpn_val, unsigned sidx, unsigned cluster_id,
       return MSHR_FULL;                             // merge cap; re-poll (re-gates)
     }
     mit->second.pending_clusters.push_back(cluster_id);
-    m_mshr_epoch++;  // 44-4: merge growth can flip a same-vpn verdict to merge-cap
+    if (mit->second.pte_ready) ready_add(cluster_id, vpn_val);  // T10: merge into a ready entry
+    // T12: growth cannot flip a frozen verdict (a capped entry stays capped,
+    // an absent vpn stays absent), so no typed epoch moves here.
     m_mshr_hits++;
+    m_set_lookups[sidx]++;
     return MSHR_HIT;
   }
   if (m_mshr.size() >= m_mshr_entries) {            // MSHR table full
@@ -691,24 +823,28 @@ gpu_l2_tlb::resolve(uint64_t vpn_val, unsigned sidx, unsigned cluster_id,
     m_last_full_merge = false;                      // 44-4: fail type for skip synthesis
     return MSHR_FULL;                               // re-poll (re-gates)
   }
-  m_mshr_epoch++;  // 44-4: entry insert changes membership and table occupancy
+  m_ep_set[sidx]++;  // T14 (44-4): a vpn of this set now exists in the MSHR
+  m_ep_set_any++;    // T16
   l2_mshr_entry_t& e = m_mshr[vpn_val];             // first miss for this vpn
   e.pending_clusters.push_back(cluster_id);
   e.pte_ready = false;
   e.pte.raw   = 0;
   m_misses++;
+  m_set_lookups[sidx]++;
   return MISS;
 }
 
 void gpu_l2_tlb::fill(uint64_t vpn_val, const gpu_pte_t& pte,
                        uint64_t current_cycle, const xlat_walk_t* walk) {
-  m_mshr_epoch++;  // 44-4: array contents + pte_ready change verdicts
   m_fill_seq++;    // P-1: wake the pollers (see fill_seq())
   // Insert into TLB array with LRU replacement.
   unsigned sidx = set_idx(vpn_val);
+  m_ep_set[sidx]++;  // T12 (44-4): this set's array contents changed
+  m_ep_set_any++;    // T16
   int      way  = find_way(sidx, vpn_val);
   if (way < 0) way = lru_victim(sidx);
   m_sets[sidx][way] = {true, vpn_val, pte, current_cycle};
+  m_set_fills[sidx]++;
 
   // Mark MSHR entry ready if one exists (created on MISS path).
   // HIT path never creates MSHR entries, so this may be a no-op.
@@ -716,6 +852,7 @@ void gpu_l2_tlb::fill(uint64_t vpn_val, const gpu_pte_t& pte,
   if (it != m_mshr.end()) {
     it->second.pte_ready = true;
     it->second.pte       = pte;
+    for (unsigned cl : it->second.pending_clusters) ready_add(cl, vpn_val);  // T10
 
     // XLATLAT: the walk's scalars belong to every cluster queued on this VPN --
     // they all waited on the same walk. This is where the requester is known;
@@ -746,9 +883,19 @@ bool gpu_l2_tlb::query_completed(uint64_t vpn_val, unsigned cluster_id,
 
   out_pte = it->second.pte;
   clusters.erase(cit);
-  if (clusters.empty()) m_mshr.erase(it);  // all SMs consumed; free entry
-  m_mshr_epoch++;  // 44-4: consumption shrinks a merge count / frees a slot
+  // T10: the condition is false once no occurrence of cluster_id remains.
+  if (std::find(clusters.begin(), clusters.end(), cluster_id) == clusters.end())
+    ready_del(cluster_id, vpn_val);
+  m_ep_consume++;  // T12 (44-4): a merge count shrank
+  if (clusters.empty()) m_mshr.erase(it);  // all SMs consumed; free entry (T13: table_full() reads size live)
   return true;
+}
+
+bool gpu_l2_tlb::completable(uint64_t vpn_val, unsigned cluster_id) const {  // T10
+  auto it = m_mshr.find(vpn_val);
+  if (it == m_mshr.end() || !it->second.pte_ready) return false;
+  const auto& clusters = it->second.pending_clusters;
+  return std::find(clusters.begin(), clusters.end(), cluster_id) != clusters.end();
 }
 
 void gpu_l2_tlb::remove_from_mshr(uint64_t vpn_val, unsigned cluster_id) {
@@ -756,8 +903,9 @@ void gpu_l2_tlb::remove_from_mshr(uint64_t vpn_val, unsigned cluster_id) {
   if (it == m_mshr.end()) return;
   auto& c = it->second.pending_clusters;
   c.erase(std::remove(c.begin(), c.end(), cluster_id), c.end());
-  if (c.empty()) m_mshr.erase(it);
-  m_mshr_epoch++;  // 44-4: rollback shrinks a merge count / frees a slot
+  ready_del(cluster_id, vpn_val);  // T10: every occurrence is gone
+  m_ep_consume++;  // T12 (44-4): a merge count shrank
+  if (c.empty()) m_mshr.erase(it);  // T13: table_full() reads size live
 }
 
 void gpu_l2_tlb::tick(uint64_t /*current_cycle*/) {
@@ -767,6 +915,8 @@ void gpu_l2_tlb::tick(uint64_t /*current_cycle*/) {
 void gpu_l2_tlb::print_stats(FILE* f) const {
   unsigned long long total = m_hits + m_misses;
   // Tag follows the page size this instance was built for (see gpu_l1_tlb).
+  // hit_rate: array hit rate, hits / (hits + misses); merges excluded (see the
+  // L1 note). No consumer.
   fprintf(f,
           "[L2_TLB_%s_STAT] chiplet=%u hits=%llu misses=%llu "
           "mshr_hits=%llu merge_full=%llu entries_full=%llu "
@@ -776,9 +926,33 @@ void gpu_l2_tlb::print_stats(FILE* f) const {
           m_mshr_hits, m_mshr_merge_full, m_mshr_entries_full,
           m_resv_fail_cycles,
           total ? 100.0 * m_hits / total : 0.0);
-  fprintf(f, "[L2_TLB_%s_PORT] chiplet=%u ports=%u port_busy=%llu concurrent_max=%u\n",
-          page_kind_tag(m_page_shift), m_chiplet_id, m_n_ports,
-          m_port_busy_stalls, m_concurrent_max);
+  // ST-5: see gpu_l1_tlb::print_stats -- port rows only with a real port cap
+  // or under ACCELSIM_DIAG.
+  if (m_n_ports != 0 || g_accelsim_diag)
+    fprintf(f, "[L2_TLB_%s_PORT] chiplet=%u ports=%u port_busy=%llu concurrent_max=%u\n",
+            page_kind_tag(m_page_shift), m_chiplet_id, m_n_ports,
+            m_port_busy_stalls, m_concurrent_max);
+  // Per-set usage, only on request (ACCELSIM_TLB_SETSTAT=1) so default logs and their
+  // digests are unchanged. sets_used counts sets with >= 1 fill; the fill list shows
+  // the distribution (modulo + 2^s-page strides leaves sets/2^s of them at 0).
+  static const bool setstat = (getenv("ACCELSIM_TLB_SETSTAT") != NULL);
+  if (setstat) {
+    unsigned used_l = 0, used_f = 0; unsigned long long lmin = ~0ULL, lmax = 0, fmin = ~0ULL, fmax = 0, ftot = 0;
+    for (unsigned s = 0; s < m_num_sets; s++) {
+      if (m_set_lookups[s]) used_l++;
+      if (m_set_fills[s]) used_f++;
+      lmin = m_set_lookups[s] < lmin ? m_set_lookups[s] : lmin; lmax = m_set_lookups[s] > lmax ? m_set_lookups[s] : lmax;
+      fmin = m_set_fills[s] < fmin ? m_set_fills[s] : fmin; fmax = m_set_fills[s] > fmax ? m_set_fills[s] : fmax;
+      ftot += m_set_fills[s];
+    }
+    fprintf(f, "[L2_TLB_%s_SETS] chiplet=%u hash=%u sets=%u sets_with_lookups=%u sets_with_fills=%u "
+               "lookups_per_set_min=%llu max=%llu fills_per_set_min=%llu max=%llu fills_total=%llu\n",
+            page_kind_tag(m_page_shift), m_chiplet_id, m_set_hash, m_num_sets, used_l, used_f,
+            lmin, lmax, fmin, fmax, ftot);
+    fprintf(f, "[L2_TLB_%s_SETFILLS] chiplet=%u", page_kind_tag(m_page_shift), m_chiplet_id);
+    for (unsigned s = 0; s < m_num_sets; s++) fprintf(f, " %llu", m_set_fills[s]);
+    fprintf(f, "\n");
+  }
 }
 
 // XLATDBG: the decoupled L1 TLB's in-flight bookkeeping. A request sits in
@@ -835,8 +1009,8 @@ void gpu_l2_tlb::xlatdbg_probe(FILE* fp, uint64_t vpn, unsigned cluster_id,
   const char* gate = "no_gate";
   unsigned long long ready_at = 0;
   if (rit != m_lookup_ready.end()) {
-    ready_at = (unsigned long long)rit->second;
-    gate = (cur < rit->second) ? "LOOKUP_PENDING" : "gate_expired";
+    ready_at = (unsigned long long)rit->second.ready;
+    gate = (cur < rit->second.ready) ? "LOOKUP_PENDING" : "gate_expired";
   }
   auto mit = m_mshr.find(vpn);
   const char* mshr_state = "absent";

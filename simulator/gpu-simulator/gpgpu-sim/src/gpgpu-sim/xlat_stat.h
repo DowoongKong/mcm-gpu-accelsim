@@ -66,6 +66,14 @@ struct xlat_walk_t {
   uint8_t  n_remote  = 0;     // of those, the ones that crossed a chiplet
   uint8_t  n_pwc_hit = 0;     // levels served by the page walk cache
   uint16_t icnt_bp   = 0;     // cycles lost to icnt input backpressure retries
+  // L2MISSLOG (s29): per-walk memory-step timing and the fault flag. Written by
+  // the GMMU, read only by the gated log line in gmmu::complete_walk(); no
+  // statistic or decision consumes them.
+  uint8_t  n_fault       = 0;  // PT nodes / leaf this walk created (reference mode only)
+  uint32_t step_lat_sum  = 0;  // issue -> reply cycles, summed over the memory steps
+  uint32_t step_lat_max  = 0;  // the slowest single memory step
+  uint64_t t_step_issue  = 0;  // issue cycle of the step currently in memory (0 = none)
+  uint64_t last_entry_pa = 0;  // PA of the last page-table entry read from memory
 };
 
 // Downstream (L2 + GMMU) boundaries for ONE (cluster, vpn) request. Produced by
@@ -252,23 +260,54 @@ static inline bool xlat_rec_complete(const xlat_req_rec_t &r) {
 //   s6/s7/s8 (/n)   pwq_wait / walk_svc / fill_return
 //   smid unsplit    merge_wait      waiting on someone else's walk
 //   s0 / s9         reissue / replay_wait
+//   l1rf - min(..)  l1_mshr_full_reissue   MSHR-full retry cycles that fall in an
+//                   earlier re-issue epoch, i.e. inside `reissue`, not inside the
+//                   last epoch's probe. Reported so nothing is dropped; it is NOT
+//                   added to wait again (that was the BUG-2 double count).
 // Identity: avg == svc + wait (guaranteed by the residual==0 tiling).
+// NOTE: the printed components sum to wait only after subtracting
+// l1_mshr_full_reissue from l1_mshr_full (and likewise for l2), because
+// l1_mshr_full keeps its original meaning (all epochs) for log compatibility.
 struct xlat_sum_t {
   unsigned long long n = 0;
   // raw sums (request-weighted), folded straight from xlat_accum_t
   unsigned long long total=0, s0=0, s1=0, s2=0, smid=0, s3=0, s4=0, s5=0,
                      rest=0, s6=0, s7=0, s8=0, s9=0, l1rf=0, l2rf=0;
+  // ST-7: GPU-wide shape of the two queueing-model quantities, folded from the
+  // per-SM hist_s6/hist_s7 that used to be printed per SM. n_walk is the bin
+  // total, exactly as in xlat_accum_t.
+  unsigned long long n_walk = 0;
+  unsigned long long hist_s6[XLAT_HIST_BINS] = {};
+  unsigned long long hist_s7[XLAT_HIST_BINS] = {};
   void add(const xlat_accum_t &a) {
     n += a.n; total += a.total; s0 += a.s0; s1 += a.s1; s2 += a.s2;
     smid += a.smid; s3 += a.s3; s4 += a.s4; s5 += a.s5; rest += a.rest;
     s6 += a.s6; s7 += a.s7; s8 += a.s8; s9 += a.s9;
     l1rf += a.l1_resv_fail; l2rf += a.l2_resv_fail;
+    n_walk += a.n_walk;
+    for (unsigned i = 0; i < XLAT_HIST_BINS; i++) {
+      hist_s6[i] += a.hist_s6[i]; hist_s7[i] += a.hist_s7[i];
+    }
   }
   void add(const xlat_sum_t &o) {
     n += o.n; total += o.total; s0 += o.s0; s1 += o.s1; s2 += o.s2;
     smid += o.smid; s3 += o.s3; s4 += o.s4; s5 += o.s5; rest += o.rest;
     s6 += o.s6; s7 += o.s7; s8 += o.s8; s9 += o.s9;
     l1rf += o.l1rf; l2rf += o.l2rf;
+    n_walk += o.n_walk;
+    for (unsigned i = 0; i < XLAT_HIST_BINS; i++) {
+      hist_s6[i] += o.hist_s6[i]; hist_s7[i] += o.hist_s7[i];
+    }
+  }
+  // ST-7: the S6 (PWQ wait) and S7 (walk service) distributions for this
+  // aggregate. Skipped when nothing walked. Bins as in xlat_hist_bin().
+  void print_hist(FILE *f, const char *kind, const char *head, const char *out) const {
+    if (!n_walk) return;
+    fprintf(f, "[XLATHIST] %s kind=%s out=%s hist=s6_pwqwait n=%llu", head, kind, out, n_walk);
+    xlat_hist_print(f, hist_s6);
+    fprintf(f, "\n[XLATHIST] %s kind=%s out=%s hist=s7_walk n=%llu", head, kind, out, n_walk);
+    xlat_hist_print(f, hist_s7);
+    fprintf(f, "\n");
   }
   // One row. head = e.g. "SM=12" or "GPU", out = bucket name or "ALL".
   void print(FILE *f, const char *kind, const char *head, const char *out) const {
@@ -288,22 +327,32 @@ struct xlat_sum_t {
     // (merged L2 requests waiting on the owner's walk) is wait, not service.
     const double rest_unwalked = (double)(rest - (s6 + s7 + s8)) / N;
     const double svc = l1_probe + l2_probe + walk_svc;
-    // Algebra check: svc + wait == total/N exactly, because the fixed probes
-    // are s2-l1rf and s4-l2rf, and merge_wait/rest_unwalked are the unsplit
-    // remainders of smid and rest. Every raw term appears exactly once.
+    // l1rf accumulates MSHR-full retry cycles over EVERY re-issue epoch, while s2
+    // spans only the last epoch, so l1rf can exceed s2. The excess happened during
+    // the earlier epochs, whose wall time is s0 -- and wait already counts s0 in
+    // full. Adding the unclamped l1rf here would therefore count the excess twice
+    // and break the identity below (observed: PTW bucket off by up to 1.9%). Use
+    // the same clamped value the probe split used, and report the excess under its
+    // own key rather than dropping it.
+    const double l1rf_reissue = (double)(l1rf - l1rf_in_s2) / N;
+    const double l2rf_reissue = (double)(l2rf - l2rf_in_s4) / N;
+    // Algebra check: svc + wait == total/N exactly. s2 splits into
+    // (s2 - l1rf_in_s2) + l1rf_in_s2 and s4 likewise; merge_wait/rest_unwalked are
+    // the unsplit remainders of smid and rest; every raw term appears exactly once.
     const double wait =
-        (double)(s0 + s1 + l1rf + s3 + l2rf + s5 + s6 + s8 + s9) / N +
+        (double)(s0 + s1 + l1rf_in_s2 + s3 + l2rf_in_s4 + s5 + s6 + s8 + s9) / N +
         merge_wait + rest_unwalked;
     fprintf(f,
       "[XLATSUM] %s kind=%s out=%s n=%llu avg=%.1f svc=%.1f wait=%.1f | "
       "l1_enter_wait=%.1f l1_probe=%.1f l1_mshr_full=%.1f merge_wait=%.1f "
       "link_l1l2=%.1f l2_probe=%.1f l2_mshr_full=%.1f pwq_admit=%.1f "
       "pwq_wait=%.1f walk_svc=%.1f fill_return=%.1f rest_merged=%.1f "
-      "reissue=%.1f replay_wait=%.1f\n",
+      "reissue=%.1f replay_wait=%.1f l1_mshr_full_reissue=%.1f "
+      "l2_mshr_full_reissue=%.1f\n",
       head, kind, out, n, (double)total / N, svc, wait,
       (double)s1 / N, l1_probe, (double)l1rf / N, merge_wait,
       (double)s3 / N, l2_probe, (double)l2rf / N, (double)s5 / N,
       pwq_wait, walk_svc, fill_return, rest_unwalked,
-      (double)s0 / N, (double)s9 / N);
+      (double)s0 / N, (double)s9 / N, l1rf_reissue, l2rf_reissue);
   }
 };
