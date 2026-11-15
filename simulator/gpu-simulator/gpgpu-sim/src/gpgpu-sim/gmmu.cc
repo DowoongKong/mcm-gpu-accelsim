@@ -1,14 +1,14 @@
 #include <cstdlib>   // getenv (verification log gate)
 #include "gmmu.h"
 #include "gpu-module.h"  // gpu_page_table, va_alloc_t, gpu_pte_t, GPU_PAGE_SHIFT, GPU_PAGE_SIZE
-#include "mem_fetch.h"  // NEW: for child_mf creation (P3-1)
-#include "shader.h"     // NEW: for READ_PACKET_SIZE (P3-1)
+#include "mem_fetch.h"  // child mem_fetch for PT reads
+#include "shader.h"     // READ_PACKET_SIZE
 #include "gpu-sim.h"  // full definition of memory_config (needed for gpgpu_ctx member access)
 #include "icnt_wrapper.h"  // icnt_has_buffer declaration
 #include "gpu_tlb.h"   // gpu_l2_tlb full definition for l2_tlb->fill()
-#include "l2miss_log.h"  // L2MISSLOG (s29): gated miss/walk timeline
+#include "l2miss_log.h"  // walk timeline log (ACCELSIM_L2MISS_LOG)
 
-// P-5: (temp) diagnostic-counter gate, defined in gpu-sim.cc.
+// Diagnostic-counter switch (ACCELSIM_DIAG), defined in gpu-sim.cc.
 extern const bool g_accelsim_diag;
 
 // Verification logging: per-walk event lines, OFF unless ACCELSIM_LOG_GMMU is set.
@@ -16,7 +16,7 @@ extern const bool g_accelsim_diag;
 // and verification runs (recompute walks / local-remote steps / occupancy
 // from the log and cross-check the GMMU_STAT counters).
 
-// 44-2: pure consistency checks on hot paths. Compiled in only with
+// Consistency checks on hot paths. Compiled in only with
 // -DXLAT_DEBUG_CHECKS; the default build skips them (the checks re-walk the
 // page table / re-hash the MSHR and cost real time at high walk rates).
 #ifdef XLAT_DEBUG_CHECKS
@@ -30,7 +30,7 @@ static bool accelsim_log_gmmu() {
   return on;
 }
 
-// L2MISSLOG (s29): one file for the whole run, opened on first use. A
+// Walk timeline log (ACCELSIM_L2MISS_LOG): one file for the whole run, opened on first use. A
 // function-local static initializes exactly once even when the first callers
 // are the parallel pass-B chiplet threads (C++11 magic statics); fprintf()
 // itself is locked per call, so lines never interleave.
@@ -48,7 +48,7 @@ gmmu::gmmu(unsigned chiplet_id, unsigned n_ptw, unsigned pwq_depth,
            gpu_page_table*                pt,
            const std::vector<unsigned>*   cluster_to_chiplet_map,
            const std::vector<va_alloc_t>* va_alloc_list,
-           gpu_module*                    mod)  // NEW
+           gpu_module*                    mod)
     : m_chiplet_id(chiplet_id),
       m_n_ptw(n_ptw),
       m_pwq_max_depth(pwq_depth),
@@ -56,7 +56,7 @@ gmmu::gmmu(unsigned chiplet_id, unsigned n_ptw, unsigned pwq_depth,
       m_pt(pt),
       m_cluster_to_chiplet_map(cluster_to_chiplet_map),
       m_va_alloc_list(va_alloc_list),
-      m_mod(mod),            // NEW
+      m_mod(mod),
       m_translate_requests(0),
       m_fault_count(0),
       m_ptw_time_sum(0),
@@ -68,16 +68,16 @@ gmmu::gmmu(unsigned chiplet_id, unsigned n_ptw, unsigned pwq_depth,
       m_pwq_queuing_delay_sum(0),
       m_pwq_dequeue_count(0),
       m_pwq_max_depth_seen(0),
-      m_local_steps(0),   // NEW
-      m_remote_steps(0),   // NEW
-      m_pwc_hits(0) {   // NEW
+      m_local_steps(0),
+      m_remote_steps(0),
+      m_pwc_hits(0) {
   m_pwc.resize(m_pwc_entries, {false, -1, 0ULL, 0ULL, 0ULL});
 }
 
 bool gmmu::translate(uint64_t va, unsigned cluster_id, uint64_t cycle) {
   if (pwq_full()) return false;  // caller (SM) must stall and retry
 
-  // XLATLAT: measured on ACCEPTED arrivals only. A PWQ-full rejection is not an
+  // Inter-arrival stats: measured on accepted arrivals only. A PWQ-full rejection is not an
   // arrival to the queueing system -- counting it would fabricate a burst that
   // the model never sees.
   if (m_xlat_last_arrival != 0 && cycle >= m_xlat_last_arrival)
@@ -99,7 +99,7 @@ void gmmu::cycle(uint64_t current_cycle) {
   m_last_cycle = current_cycle;   // fallback clock for done_tlb_req()
   m_total_cycles++;               // counts every cycle() invocation for occupancy denominator
 
-  // 39: idle early-exit. Every branch below is gated on one of these queues;
+  // Idle early exit. Every branch below is gated on one of these queues;
   // with all of them empty the remainder of cycle() touches no state beyond
   // the two unconditional updates above (occupancy accumulators below add 0).
   // The queues are filled only by translate()/pt_walk()/memory returns, so
@@ -156,13 +156,13 @@ void gmmu::cycle(uint64_t current_cycle) {
     // parent_mf->get_va() == entry.va (constructor sets m_va = access.get_addr())
     // parent_mf->get_tpc() == entry.cluster_id
 
-    m_active_walks[parent_mf] = 0;
+    m_active_walks.insert(parent_mf);
     if (accelsim_log_gmmu())
       printf("[GMMU_START] chiplet=%u va=0x%llx cyc=%llu pwq_wait=%llu\n",
              m_chiplet_id, (unsigned long long)entry.va,
              (unsigned long long)m_total_cycles,
              (unsigned long long)queuing_delay);
-    // XLATLAT: t6. entry.enqueue_cycle is t5, carried from translate().
+    // Latency breakdown: walk start (t6); entry.enqueue_cycle is the PWQ entry (t5).
     xlat_walk_t &wr = m_walk_start_cycles[parent_mf];
     wr.t_pwq_enq    = entry.enqueue_cycle;
     wr.t_walk_start = current_cycle;
@@ -189,7 +189,7 @@ void gmmu::cycle(uint64_t current_cycle) {
   if ((unsigned)m_active_walks.size() == m_n_ptw) m_ptw_full_cycles++;
 }
 
-// Recursive function to perform a page table walk step at the given level for parent_mf. (P3-1)
+// One walk step at the given level (see gmmu.h).
 void gmmu::pt_walk(mem_fetch* parent_mf, int level, uint64_t table_pa,
                    uint64_t current_cycle) {
   uint64_t va = parent_mf->get_va();
@@ -200,11 +200,11 @@ void gmmu::pt_walk(mem_fetch* parent_mf, int level, uint64_t table_pa,
   // For 2MB that means levels 0 and 1, since level 2 is the leaf.
   if (level < leaf_level) {
     uint64_t cached_pa;
-    m_pwc_lookups_lvl[level]++;
-    if (pwc_lookup(va, level, cached_pa)) {
+    if (pwc_lookup_touch(va, level, cached_pa, current_cycle)) {
+      m_pwc_lookups_lvl[level]++;
       m_pwc_hits++;
       m_pwc_hits_lvl[level]++;
-      {  // XLATLAT: a PWC hit costs no memory read; count it as a skipped level.
+      {  // Latency breakdown: a PWC hit costs no memory read; count it as a skipped level.
         auto w = m_walk_start_cycles.find(parent_mf);
         if (w != m_walk_start_cycles.end()) w->second.n_pwc_hit++;
       }
@@ -259,13 +259,12 @@ void gmmu::pt_walk(mem_fetch* parent_mf, int level, uint64_t table_pa,
 
 
   // tpc of child_mf determines where the reply is routed back.
-  // Fix A: a PTW borrows a cluster's icnt endpoint. Rotating round-robin across
-  // this chiplet's clusters spreads the single-port funnel (all PTW req/reply
-  // used to converge on the first cluster). Any cluster of this chiplet routes
-  // the reply to the same GMMU (gpu_module::icnt_pop -> cluster_to_chiplet), and
-  // the target DRAM is decided by the PT-node PA (get_sub_partition_id), not by
-  // sid/tpc, so spreading changes only where the reply returns.
-  // See docs/ptw_endpoint_funnel_redesign.ko.md.
+  // A PTW borrows a cluster's icnt endpoint. Rotating round-robin across this
+  // chiplet's clusters keeps all PTW requests and replies from converging on one
+  // port. Any cluster of this chiplet routes the reply to the same GMMU
+  // (gpu_module::icnt_pop -> cluster_to_chiplet), and the target DRAM is decided
+  // by the PT-node PA (get_sub_partition_id), not by sid/tpc, so rotating changes
+  // only which port the request and the reply use.
   unsigned cl_begin = m_mod->get_chiplet(m_chiplet_id)->get_cluster_global_begin();
   unsigned cl_count = m_mod->get_chiplet(m_chiplet_id)->get_num_clusters();
   unsigned endpoint = cl_begin + (m_rr_endpoint++ % cl_count);
@@ -290,12 +289,12 @@ void gmmu::pt_walk(mem_fetch* parent_mf, int level, uint64_t table_pa,
   // Check icnt input buffer availability before pushing.
   unsigned src_dev = m_mod->cluster2device(endpoint);
   unsigned dst_dev = m_mod->mem2device(child_mf->get_sub_partition_id());
-  unsigned flit_size = child_mf->get_ctrl_size();
+  unsigned packet_bytes = child_mf->get_ctrl_size();  // read request: control part only
 
-  if (!icnt_has_buffer(src_dev, flit_size)) {
+  if (!icnt_has_buffer(src_dev, packet_bytes)) {
     // icnt input buffer full: retry this step next cycle.
-    if (g_accelsim_diag) m_funnel_req_full++;  // FUNNEL_ (temp, P-5 gated)
-    {  // XLATLAT: backpressure is not page-table access time -- keep it separate
+    if (g_accelsim_diag) m_funnel_req_full++;  // diagnostics (ACCELSIM_DIAG)
+    {  // Latency breakdown: backpressure is not page-table access time -- keep it separate
        // so S7 is not inflated by interconnect congestion. The retry re-enters at
        // the SAME level, so no step is counted twice.
       auto w = m_walk_start_cycles.find(parent_mf);
@@ -312,26 +311,29 @@ void gmmu::pt_walk(mem_fetch* parent_mf, int level, uint64_t table_pa,
     return;
   }
 
+  // A PWC miss counts as one lookup when its read is issued. A step retried after
+  // icnt backpressure looks the PWC up again, but that is not a new lookup.
+  if (level < leaf_level) m_pwc_lookups_lvl[level]++;
   if (is_remote) m_remote_steps++;
   else           m_local_steps++;
-  {  // XLATLAT: one page-table read actually left for memory. n_remote / n_steps
+  {  // Latency breakdown: one page-table read actually left for memory. n_remote / n_steps
      // is the per-walk q that E[S] = E[M]*t_local + E[R]*t_icnt needs.
     auto w = m_walk_start_cycles.find(parent_mf);
     if (w != m_walk_start_cycles.end()) {
       w->second.n_steps++;
       if (is_remote) w->second.n_remote++;
-      w->second.t_step_issue  = current_cycle;  // L2MISSLOG (s29)
+      w->second.t_step_issue  = current_cycle;  // walk timeline log
       w->second.last_entry_pa = entry_pa;
     }
   }
-  // MEMLAT_ (temp): which memory sub-partition each PT-read step targets, split
+  // Diagnostics (ACCELSIM_DIAG): which memory sub-partition each PT-read step targets, split
   // local/remote. Detects a single-partition hotspot at the page-table owner.
-  if (g_accelsim_diag) {  // P-5 gated (std::map inserts per walk step)
+  if (g_accelsim_diag) {  // (std::map inserts per walk step)
     m_memlat_subpart_hist[child_mf->get_sub_partition_id()] += 1;
     if (is_remote) m_memlat_remote_subpart_hist[child_mf->get_sub_partition_id()] += 1;
-    m_funnel_req_ok++;   // FUNNEL_ (temp)
+    m_funnel_req_ok++;
   }
-  m_mod->icnt_push(src_dev, dst_dev, child_mf, flit_size);
+  m_mod->icnt_push(src_dev, dst_dev, child_mf, packet_bytes);
   if (accelsim_log_gmmu()) {
   printf("[GMMU_PTW] chiplet=%u va=0x%llx level=%d entry_pa=0x%llx %s cyc=%llu\n",
          m_chiplet_id, (unsigned long long)va, level,
@@ -350,7 +352,7 @@ void gmmu::done_tlb_req(mem_fetch* child_mf, uint64_t current_cycle) {
   int       level     = child_mf->get_tlb_depth();
   mem_fetch* parent_mf = child_mf->get_parent_mf();
   uint64_t  va        = parent_mf->get_va();
-  {  // L2MISSLOG (s29): memory-step latency, issue (pt_walk) -> reply arrival here
+  {  // Walk timeline log: memory-step latency, issue (pt_walk) -> reply arrival here
     auto w = m_walk_start_cycles.find(parent_mf);
     if (w != m_walk_start_cycles.end() && w->second.t_step_issue != 0 &&
         current_cycle >= w->second.t_step_issue) {
@@ -363,11 +365,11 @@ void gmmu::done_tlb_req(mem_fetch* child_mf, uint64_t current_cycle) {
   // Leaf level for this VA's page size: 3 (PT) for 4KB, 2 (PD) for 2MB.
   const int leaf_level = pt_leaf_level(m_mod->page_shift_for_va(va));
 
-  // MEMLAT_ (temp): per-DRAM-step latency breakdown. This GMMU's steps are all
+  // Diagnostics (ACCELSIM_DIAG): per-DRAM-step latency breakdown. This GMMU's steps are all
   // local (chiplet==owner) or all remote; per-chiplet averages separate them.
   //   seg_reqmem = issue -> mem pushed reply   (req icnt + mem service)
   //   seg_reply  = mem pushed reply -> arrival  (reply icnt back to this GMMU)
-  if (g_accelsim_diag) {  // P-5 gated
+  if (g_accelsim_diag) {
     unsigned long long t0 = child_mf->get_timestamp();          // issue
     unsigned long long t1 = child_mf->get_return_timestamp();   // mem reply out
     unsigned long long now = current_cycle;
@@ -375,9 +377,9 @@ void gmmu::done_tlb_req(mem_fetch* child_mf, uint64_t current_cycle) {
       m_memlat_seg_reqmem_sum += (t1 - t0);
       m_memlat_seg_reply_sum  += (now - t1);
       m_memlat_seg_cnt++;
-      if ((now - t1) > m_memlat_seg_reply_max)   // FUNNEL_ (temp): reply tail
+      if ((now - t1) > m_memlat_seg_reply_max)   // reply tail
         m_memlat_seg_reply_max = (now - t1);
-      // FUNNEL_ (temp): split B at dest-cluster out_buffer arrival timestamp.
+      // Split the reply segment at the dest-cluster out_buffer arrival timestamp.
       unsigned long long arr = child_mf->get_icnt_receive_time();
       if (arr != 0 && arr >= t1 && now >= arr) {
         m_memlat_seg_transit_sum += (arr - t1);   // xbar+ring transit
@@ -403,7 +405,7 @@ void gmmu::done_tlb_req(mem_fetch* child_mf, uint64_t current_cycle) {
       // ensure_node() returns the OWNER's copy; re-query for this chiplet's.
       next_table_pa = m_pt->get_node_base_pa(va, level + 1, m_chiplet_id);
       m_fault_count++;
-      {  // L2MISSLOG (s29): this walk created a node/leaf (reference mode)
+      {  // walk timeline log: this walk created a node/leaf (reference mode)
         auto wf = m_walk_start_cycles.find(parent_mf);
         if (wf != m_walk_start_cycles.end()) wf->second.n_fault++;
       }
@@ -435,7 +437,7 @@ void gmmu::done_tlb_req(mem_fetch* child_mf, uint64_t current_cycle) {
       unsigned chiplet_id = m_pt->first_touch_data_owner(va);
       m_pt->map_leaf(va, chiplet_id);
       m_fault_count++;
-      {  // L2MISSLOG (s29): this walk created a node/leaf (reference mode)
+      {  // walk timeline log: this walk created a node/leaf (reference mode)
         auto wf = m_walk_start_cycles.find(parent_mf);
         if (wf != m_walk_start_cycles.end()) wf->second.n_fault++;
       }
@@ -446,15 +448,15 @@ void gmmu::done_tlb_req(mem_fetch* child_mf, uint64_t current_cycle) {
              chiplet_id);
       }
     }
-    // 44-2: duplicate of complete_walk()'s assert on the pte it actually
-    // uses (line below); as a plain assert this cost two extra page walks.
+    // Debug-build check: same as the assert in complete_walk() (line below); as a
+    // plain assert here it would cost two extra page-table walks.
     XLAT_HOT_ASSERT(m_pt->walk(va) && m_pt->walk(va)->present());
     complete_walk(parent_mf, current_cycle);
   }
 
 }
 
-// Completes a page table walk by storing the final PA result and cleaning up the parent_mf token. (P3-1)
+// Completes a page table walk by storing the final PA result and cleaning up the parent_mf token.
 void gmmu::complete_walk(mem_fetch* parent_mf, uint64_t current_cycle) {
   uint64_t va         = parent_mf->get_va();
   unsigned cluster_id = parent_mf->get_tpc();
@@ -469,7 +471,7 @@ void gmmu::complete_walk(mem_fetch* parent_mf, uint64_t current_cycle) {
   if (it != m_walk_start_cycles.end()) {
     m_ptw_time_sum += current_cycle - it->second.t_walk_start;
     m_ptw_complete_count++;
-    wr = it->second;          // XLATLAT: scalars ride up with the fill
+    wr = it->second;          // latency breakdown rides up with the fill
     have_wr = true;
     m_walk_start_cycles.erase(it);
   }
@@ -484,7 +486,7 @@ void gmmu::complete_walk(mem_fetch* parent_mf, uint64_t current_cycle) {
                  : (pshift == GPU_64K_SHIFT)  ? m_l2_tlb_64k
                                               : m_l2_tlb_4k;
   assert(l2 != nullptr);
-  // XLATLAT: the GMMU cannot address the requesting SM -- translate() replaced the
+  // Latency breakdown: the GMMU cannot address the requesting SM -- translate() replaced the
   // requester's cluster id with the chiplet representative so page placement lands
   // on this chiplet. The L2 MSHR is what knows who is waiting, so the walk scalars
   // are handed to it and it stamps every pending cluster.
@@ -500,7 +502,7 @@ void gmmu::complete_walk(mem_fetch* parent_mf, uint64_t current_cycle) {
          (unsigned long long)m_total_cycles);
   }
 
-  if (FILE* lf = l2miss_log_file()) {  // L2MISSLOG (s29): one line per completed walk
+  if (FILE* lf = l2miss_log_file()) {  // walk timeline log: one line per completed walk
     fprintf(lf, "C %llu %u 0x%llx %llu %llu %u %u %u %u %u %u %u 0x%llx 0x%llx\n",
             (unsigned long long)current_cycle, m_chiplet_id,
             (unsigned long long)page_vpn(va, pshift),
@@ -525,7 +527,12 @@ uint64_t gmmu::pwc_key(uint64_t va, int level) const {
   switch (level) {
     case 0: return pml4;
     case 1: return (pml4 << 9)  | pdp;
-    case 2: return (pml4 << 18) | (pdp << 9) | pd;
+    case 2: {
+      // A PD entry can point to a 4KB PT and to a 64KB big PT (dual PDE). The two
+      // pointers are cached as separate entries, told apart by bit 27.
+      const uint64_t big = (m_mod->page_shift_for_va(va) == GPU_64K_SHIFT) ? 1ULL : 0ULL;
+      return (big << 27) | (pml4 << 18) | (pdp << 9) | pd;
+    }
     default: return (uint64_t)-1;
   }
 }
@@ -536,6 +543,18 @@ bool gmmu::pwc_lookup(uint64_t va, int level, uint64_t& out_next_pa) const {
   for (const auto& e : m_pwc) {
     if (e.valid && e.level == level && e.va_key == key) {
       out_next_pa = e.next_pa;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool gmmu::pwc_lookup_touch(uint64_t va, int level, uint64_t& out_next_pa, uint64_t cycle) {
+  uint64_t key = pwc_key(va, level);
+  for (auto& e : m_pwc) {
+    if (e.valid && e.level == level && e.va_key == key) {
+      out_next_pa = e.next_pa;
+      e.lru_time  = cycle;   // a hit makes this entry the most recently used
       return true;
     }
   }
@@ -594,7 +613,7 @@ void gmmu::print_stats(FILE* f) const {
   fprintf(f, "  completed walks    : %llu\n",         m_ptw_complete_count);
 
   fprintf(f, "  PWQ max depth    : %llu\n", m_pwq_max_depth_seen);
-  // XLATLAT: PWQ inter-arrival shape. Exponential (i.e. the model's Poisson
+  // PWQ inter-arrival shape. Exponential (i.e. the model's Poisson
   // assumption) would show a geometric decay across bins; a spike at b0/b1 means
   // arrivals come in bursts and M/G/32 does not describe this queue.
   fprintf(f, "  [XLATHIST] chiplet=%u kind=pwq_interarrival n=%llu",
@@ -625,8 +644,8 @@ void gmmu::print_stats(FILE* f) const {
               k, lvl_name[k], lk, hk, lk ? 100.0 * (double)hk / (double)lk : 0.0);
     }
   }
-  // MEMLAT_/FUNNEL_ (temp) report -- P-5: only under ACCELSIM_DIAG (the
-  // counters are gated too; without the flag these rows would all be zero).
+  // Diagnostics report, only under ACCELSIM_DIAG (the counters are gated too;
+  // without the flag these rows would all be zero).
   if (g_accelsim_diag) {
   fprintf(f, "  [MEMLAT] remote-step sub-partition dist:");
   for (auto &kv : m_memlat_remote_subpart_hist)
@@ -643,7 +662,7 @@ void gmmu::print_stats(FILE* f) const {
             (double)m_memlat_seg_reply_sum / n,
             (double)(m_memlat_seg_reqmem_sum + m_memlat_seg_reply_sum) / n);
   }
-  // FUNNEL_ (temp): single repr_cluster endpoint funnel evidence (req + reply).
+  // PTW request injection and reply latency at the borrowed cluster endpoints.
   {
     unsigned long long req_tot = m_funnel_req_ok + m_funnel_req_full;
     fprintf(f, "  [FUNNEL] req: injected=%llu requeued(input_full)=%llu stall=%.1f%%"
@@ -652,7 +671,7 @@ void gmmu::print_stats(FILE* f) const {
             req_tot ? 100.0 * (double)m_funnel_req_full / req_tot : 0.0,
             m_memlat_seg_cnt ? (double)m_memlat_seg_reply_sum / m_memlat_seg_cnt : 0.0,
             m_memlat_seg_reply_max);
-    // FUNNEL_ (temp): reply seg B split — transit(xbar+ring) vs last-hop(dest cluster
+    // Reply segment split — transit(xbar+ring) vs last-hop(dest cluster
     // egress FIFO wait behind normal SM traffic). last-hop dominant => borrowing an
     // SM cluster's icnt egress port is the artifact, not xbar transit.
     unsigned long long sc = m_memlat_seg_split_cnt ? m_memlat_seg_split_cnt : 1;
@@ -662,20 +681,38 @@ void gmmu::print_stats(FILE* f) const {
             (double)m_memlat_seg_lasthop_sum / sc,
             m_memlat_seg_lasthop_max, m_memlat_seg_split_cnt);
   }
-  }  // g_accelsim_diag (P-5)
+  }  // g_accelsim_diag
 }
-// XLATDBG: what this chiplet's GMMU is still waiting on. A walk that has been
+// Deadlock dump: what this chiplet's GMMU is still waiting on. A walk that has been
 // active for far longer than a DRAM round trip is a lost reply, not a slow one.
 void gmmu::xlatdbg_dump_pending(FILE* fp) const {
-  const unsigned long long now = (unsigned long long)m_last_cycle;  // gmmu's own clock
+  const unsigned long long now = (unsigned long long)m_last_cycle;  // last cycle passed to cycle()
   fprintf(fp, "XLATDBG_DEADLOCK: gmmu chiplet=%u active_walks=%zu pwq=%zu pending_steps=%zu\n",
           m_chiplet_id, m_active_walks.size(), m_pwq.size(), m_pending_next_steps.size());
-  for (const auto& kv : m_active_walks) {
-    mem_fetch* mf = kv.first;
-    unsigned long long started = 0;
+  for (mem_fetch* mf : m_active_walks) {
     auto it = m_walk_start_cycles.find(mf);
-    if (it != m_walk_start_cycles.end()) started = it->second.t_walk_start;
-    fprintf(fp, "XLATDBG_DEADLOCK:   walk mf=%p level=%d started=%llu age=%llu\n",
-            (void*)mf, kv.second, started, (now > started) ? now - started : 0);
+    if (it == m_walk_start_cycles.end()) {
+      fprintf(fp, "XLATDBG_DEADLOCK:   walk mf=%p (no walk record)\n", (void*)mf);
+      continue;
+    }
+    const xlat_walk_t& w = it->second;
+    const unsigned long long started = w.t_walk_start;
+    const unsigned long long age = (now > started) ? now - started : 0;
+    // Levels finished or in flight: PT reads sent to memory + levels served by the PWC.
+    const unsigned done = (unsigned)w.n_steps + (unsigned)w.n_pwc_hit;
+    if (w.t_step_issue != 0) {
+      // A PT read is in memory; it belongs to the last level counted above.
+      fprintf(fp, "XLATDBG_DEADLOCK:   walk mf=%p level=%u started=%llu age=%llu va=0x%llx "
+                  "state=waiting_pt_read issued=%llu entry_pa=0x%llx\n",
+              (void*)mf, done - 1, started, age, (unsigned long long)mf->get_va(),
+              (unsigned long long)w.t_step_issue, (unsigned long long)w.last_entry_pa);
+    } else {
+      // Queued in m_pending_next_steps: after a PWC hit, a returned PT read, or a
+      // full ICNT input buffer (icnt_bp counts those retries).
+      fprintf(fp, "XLATDBG_DEADLOCK:   walk mf=%p level=%u started=%llu age=%llu va=0x%llx "
+                  "state=queued_next_step icnt_bp=%u\n",
+              (void*)mf, done, started, age, (unsigned long long)mf->get_va(),
+              (unsigned)w.icnt_bp);
+    }
   }
 }

@@ -268,7 +268,8 @@ void gpu_l1_tlb::fill(uint64_t vpn, const gpu_pte_t &pte,
     }
   }
 
-  // Mark MSHR entry as ready so tick() can drain pending retries
+  // Mark the MSHR entry ready; ldst_unit::cycle_b() drains it and replays the
+  // waiting warps.
   m_mshr.mark_ready(vpn);
 }
 
@@ -906,10 +907,6 @@ void gpu_l2_tlb::remove_from_mshr(uint64_t vpn_val, unsigned cluster_id) {
   ready_del(cluster_id, vpn_val);  // T10: every occurrence is gone
   m_ep_consume++;  // T12 (44-4): a merge count shrank
   if (c.empty()) m_mshr.erase(it);  // T13: table_full() reads size live
-}
-
-void gpu_l2_tlb::tick(uint64_t /*current_cycle*/) {
-  // No-op in Phase 5. Reserved for future fill-latency pipeline drain.
 }
 
 void gpu_l2_tlb::print_stats(FILE* f) const {

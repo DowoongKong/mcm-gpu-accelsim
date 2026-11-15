@@ -364,7 +364,7 @@ struct l2_mshr_entry_t {
 //  L2 TLB
 // Per-chiplet, set-associative, LRU replacement.
 // Shared by all SMs on the chiplet; deduplicates PTW requests via L2 MSHR.
-// Interface mirrors gpu_l1_tlb: access / fill / tick / print_stats.
+// Interface mirrors gpu_l1_tlb: access / fill / print_stats.
 class gpu_l2_tlb {
  public:
   // num_sets    : number of sets  (config: -gpgpu_l2_tlb_sets)
@@ -469,9 +469,6 @@ class gpu_l2_tlb {
   void xlatdbg_dump(FILE* fp, unsigned chiplet, const char* tag) const;
   // XLATDBG: non-mutating probe -- what would access() answer for this vpn?
   void xlatdbg_probe(FILE* fp, uint64_t vpn, unsigned cluster_id, uint64_t cur) const;
-
-  // No-op in Phase 5; reserved for future fill-latency pipeline modeling.
-  void tick(uint64_t current_cycle);
 
   void print_stats(FILE* f = stdout) const;
   // -gpgpu_l2_tlb_set_hash: must be called before the first access (no entries yet).
