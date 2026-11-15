@@ -82,7 +82,7 @@ class xbar_router {
   bool out_empty(unsigned out) const { return out_buffers[out].empty(); }
 
   bool Busy() const;
-  bool Has_Buffer_In(unsigned input_deviceID, unsigned size,
+  bool Has_Buffer_In(unsigned input_deviceID, unsigned flits,
                      bool update_counter = false);
   bool Has_Buffer_Out(unsigned output_deviceID, unsigned size);
 
@@ -463,7 +463,12 @@ class LocalInterconnect {
   void* Pop(unsigned ouput_deviceID);
   void Advance();
   bool Busy() const;
-  bool HasBuffer(unsigned deviceID, unsigned int size) const;
+  // Can a packet of `bytes` bytes enter deviceID's input buffer? Input buffers count
+  // flits, so the size is converted with bytes_to_flits() before the check.
+  bool HasBuffer(unsigned deviceID, unsigned int bytes) const;
+  // Flit sizes in bytes that mem_fetch::get_num_flits() uses (-icnt_flit_size,
+  // -icnt_inter_flit_size). Set once at init, before the first HasBuffer().
+  void set_flit_sizes(unsigned local_flit_bytes, unsigned inter_flit_bytes);
   // H3-3b: Pop(dev) 이 읽는 바로 그 출력 버퍼에 대한 미러 등록 / 비었는지 확인.
   void SetOutMirror(unsigned dev, unsigned char *slot);
   bool OutEmpty(unsigned dev) const;
@@ -499,6 +504,10 @@ class LocalInterconnect {
   std::vector<unsigned> m_n_local_mem;      // [n_chiplets] mem-sub count per chiplet
 
   bool m_use_ring = false;                 // ring vs Phase-1 direct handoff
+  unsigned m_flit_bytes_local = 0;         // -icnt_flit_size
+  unsigned m_flit_bytes_inter = 0;         // -icnt_inter_flit_size
+  // Flits a packet of `bytes` bytes occupies in a router input buffer.
+  unsigned bytes_to_flits(unsigned bytes) const;
   std::vector<ring_net*> m_ring;           // one ring per subnet (when m_use_ring)
   void handoff_ring();                     // ICP egress<->ring<->ICP ingress
 

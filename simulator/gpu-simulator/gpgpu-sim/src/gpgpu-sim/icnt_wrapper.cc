@@ -166,6 +166,11 @@ void icnt_reg_options(class OptionParser* opp) {
   option_parser_register(opp, "-icnt_grant_cycles", OPT_UINT32,
                          &g_inct_config.grant_cycles, "grant_cycles", "1");
   
+  // The ring/xbar values below are counted in ICNT cycles and flits, so their latency
+  // and bandwidth scale with the ICNT clock (-gpgpu_clock_domains). The experiment
+  // configs set them for ICNT = 1395 MHz. When the ICNT clock changes, recompute them:
+  //   cycles = latency_ns * f_icnt_GHz,  width = bandwidth_GBps / (flit_bytes * f_icnt_GHz)
+  // Buffer limits are storage sizes in flits and stay the same.
   option_parser_register(opp, "-icnt_use_ring", OPT_UINT32,
                          &g_inct_config.use_ring,
                          "1 = inter-chiplet ring, 0 = direct handoff", "0");
@@ -235,6 +240,11 @@ void icnt_configure_chiplets(unsigned n_chiplets,
   if (g_network_mode == LOCAL_XBAR && g_localicnt_interface)
     g_localicnt_interface->configure_chiplets(n_chiplets, cluster_to_chiplet,
                                               mem_sub_to_chiplet);
+}
+
+void icnt_set_flit_sizes(unsigned local_flit_bytes, unsigned inter_flit_bytes) {
+  if (g_network_mode == LOCAL_XBAR && g_localicnt_interface)
+    g_localicnt_interface->set_flit_sizes(local_flit_bytes, inter_flit_bytes);
 }
 
 bool icnt_ring_enabled() {

@@ -594,10 +594,12 @@ void LocalInterconnect::Push(unsigned in, unsigned out, void* data, unsigned int
   unsigned dst_ch = m_dev_chiplet[out];
 
   if (src_ch == dst_ch) {                                      // LOCAL
-    assert(net[subnet][src_ch]->Has_Buffer_In(m_local_idx[in], size));
+    // The admitted packet must fit by the flits it really occupies.
+    assert(net[subnet][src_ch]->Has_Buffer_In(m_local_idx[in], net[subnet][src_ch]->flits_of(data)));
     net[subnet][src_ch]->Push(m_local_idx[in], m_local_idx[out], data, size);
   } else {                                                     // REMOTE
-    assert(net[subnet][src_ch]->Has_Buffer_In(m_local_idx[in], size));
+    // The admitted packet must fit by the flits it really occupies.
+    assert(net[subnet][src_ch]->Has_Buffer_In(m_local_idx[in], net[subnet][src_ch]->flits_of(data)));
     net[subnet][src_ch]->Push(m_local_idx[in], net[subnet][src_ch]->icp_index(), data, size);
   }
 }
@@ -641,17 +643,17 @@ void LocalInterconnect::Advance() {
   // state between them (same disjointness argument as the chiplet axis), so
   // up to n_subnets*m_n_chiplets=8 iterations can run at once instead of being
   // capped at m_n_chiplets=4 per subnet, processed in two sequential batches.
-  const unsigned long long __icnt_t0 = g_phase_timing_on ? icnt_split_now_ns() : 0;
+  const unsigned long long xbar_advance_wall_start = g_phase_timing_on ? icnt_split_now_ns() : 0;
 #pragma omp parallel for schedule(runtime) collapse(2)
   for (unsigned s = 0; s < n_subnets; ++s)
     for (unsigned ch = 0; ch < m_n_chiplets; ++ch)
       net[s][ch]->Advance();
   if (g_phase_timing_on) {
-    g_icnt_local_ns += icnt_split_now_ns() - __icnt_t0;
+    g_icnt_local_ns += icnt_split_now_ns() - xbar_advance_wall_start;
     g_icnt_local_calls++;
   }
 
-  const unsigned long long __icnt_t1 = g_phase_timing_on ? icnt_split_now_ns() : 0;
+  const unsigned long long handoff_wall_start = g_phase_timing_on ? icnt_split_now_ns() : 0;
   if (m_n_chiplets > 1) {
     if (m_use_ring) {
       for (unsigned s = 0; s < n_subnets; ++s) m_ring[s]->advance();
@@ -661,7 +663,7 @@ void LocalInterconnect::Advance() {
     }
   }
   if (g_phase_timing_on) {
-    g_icnt_handoff_ns += icnt_split_now_ns() - __icnt_t1;
+    g_icnt_handoff_ns += icnt_split_now_ns() - handoff_wall_start;
     g_icnt_handoff_calls++;
   }
 }
@@ -755,10 +757,28 @@ bool LocalInterconnect::Busy() const {
   return false;
 }
 
-bool LocalInterconnect::HasBuffer(unsigned deviceID, unsigned int size) const {
+bool LocalInterconnect::HasBuffer(unsigned deviceID, unsigned int bytes) const {
   unsigned subnet = (n_subnets > 1 && deviceID >= n_shader) ? REPLY_NET : REQ_NET;
   unsigned ch     = m_dev_chiplet[deviceID];
-  return net[subnet][ch]->Has_Buffer_In(m_local_idx[deviceID], size, true);
+  return net[subnet][ch]->Has_Buffer_In(m_local_idx[deviceID], bytes_to_flits(bytes), true);
+}
+
+void LocalInterconnect::set_flit_sizes(unsigned local_flit_bytes, unsigned inter_flit_bytes) {
+  assert(local_flit_bytes > 0 && inter_flit_bytes > 0);
+  m_flit_bytes_local = local_flit_bytes;
+  m_flit_bytes_inter = inter_flit_bytes;
+}
+
+// Same rule as xbar_router::Push() -> mem_fetch::get_num_flits(). With the ring, or with one
+// chiplet, every packet in a router input buffer is counted with the local flit size, so the
+// result is exact. Without the ring a remote packet uses the inter-chiplet flit size and the
+// destination is not known here, so take the smaller flit size: it can only over-count.
+unsigned LocalInterconnect::bytes_to_flits(unsigned bytes) const {
+  assert(m_flit_bytes_local > 0 && "set_flit_sizes() must run before HasBuffer()");
+  const unsigned flit = (m_use_ring || m_n_chiplets == 1)
+                            ? m_flit_bytes_local
+                            : std::min(m_flit_bytes_local, m_flit_bytes_inter);
+  return (bytes + flit - 1) / flit;
 }
 
 void LocalInterconnect::DisplayStats() const {

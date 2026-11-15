@@ -942,11 +942,11 @@ class gpgpu_sim : public gpgpu_t {
   bool m_icnt_mirrors_wired = false;
   bool m_cluster_icnt_mirror_ok = false;          // 로컬 xbar + 비 SST 일 때만
   void wire_icnt_mirrors();
-  // H3-3c: 서브파티션 L2 루프. 건너뛴 방문의 유일한 부수효과(L2 포트 샘플)는 방문 재개 시와
-  // 통계 출력 직전에 한꺼번에 반영한다(flush_l2loop_idle).
-  std::vector<unsigned char> m_l2loop_busy;       // [sub-partition]
-  std::vector<unsigned long long> m_l2loop_last;  // 마지막으로 실제 방문한 루프 틱
-  unsigned long long m_l2loop_tick = 0;           // 실행된 L2 루프 수
+  // L2 loop of block 4. A skipped visit's only effect (one idle L2-port sample) is
+  // added later, on the next visit or before the stats are printed (flush_l2loop_idle).
+  std::vector<unsigned char> m_l2loop_busy;       // [sub-partition] busy flag
+  std::vector<unsigned long long> m_l2loop_last;  // loop tick of the last real visit
+  unsigned long long m_l2loop_tick = 0;           // L2 loops run so far
   bool m_l2loop_mirror_ok = false;
   void flush_l2loop_idle();
 
@@ -1048,8 +1048,8 @@ class gpgpu_sim : public gpgpu_t {
   cache_stats aggregated_l2_stats;
 
   // performance counter for stalls due to congestion.
-  unsigned int gpu_stall_dramfull;
-  unsigned int gpu_stall_icnt2sh;
+  unsigned long long gpu_stall_dramfull;
+  unsigned long long gpu_stall_icnt2sh;
   unsigned long long partiton_reqs_in_parallel;
   unsigned long long partiton_reqs_in_parallel_total;
   unsigned long long partiton_reqs_in_parallel_util;

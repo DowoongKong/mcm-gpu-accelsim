@@ -1,7 +1,7 @@
 # MCM GPU simulator (Accel-Sim / GPGPU-Sim fork)
 
 Trace-driven multi-chip-module GPU simulator with a virtual-memory model (per-chiplet TLBs, page-table walkers, page and
-page-table placement). This is the source of the build used for the experiments in `../experiments/`.
+page-table placement).
 
 | part | origin |
 |---|---|

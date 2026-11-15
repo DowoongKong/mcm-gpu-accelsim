@@ -533,12 +533,8 @@ void gpu_module::icnt_deliver(unsigned input_deviceID,
 
   if (remote) {
     mf->set_local_access(false);
-    // 44-2 (V6): bumped from the parallel CORE phase B (each chiplet's SMs push
-    // through here concurrently); non-atomic increments were losing counts
-    // (mcm_local_accesses differed run-to-run). Statistic only, model-neutral.
-    // H3-2: 공유 스칼라 + atomic -> 스레드별 슬롯 + atomic. 캐시라인 경쟁이
-    // 사라져 증가 1회가 8스레드에서 ~36ns -> ~2.3ns(측정). 합계는 출력 시점에
-    // 더하며, unsigned 덧셈이라 값은 완전히 동일하다.
+    // Also called from the parallel CORE phase, so the count goes to a
+    // per-thread slot (summed at print time). Statistic only.
     bump_access_count(0);
   } else {
     mf->set_local_access(true);
@@ -579,9 +575,8 @@ void gpu_module::icnt_deliver(unsigned input_deviceID,
 
 void gpu_module::icnt_push(unsigned input_deviceID, unsigned output_deviceID,
                            void* data, unsigned int size) {
-  // C-4: direct delivery. The legacy fixed-latency delay queue that used to
-  // sit here (SMELL-11: it also exempted PTW replies from input backpressure)
-  // was removed; the ring owns all inter-chiplet latency and bandwidth.
+  // Hands the packet to icnt_deliver() with no extra delay; inter-chiplet
+  // latency and bandwidth are modeled by the ring.
   icnt_deliver(input_deviceID, output_deviceID, data, size);
 }
 

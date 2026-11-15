@@ -202,7 +202,7 @@ bool memory_partition_unit::busy() const {
   return busy;
 }
 
-void memory_partition_unit::cache_cycle(unsigned cycle) {
+void memory_partition_unit::cache_cycle(unsigned long long cycle) {
   for (unsigned p = 0; p < m_config->m_n_sub_partition_per_memory_channel;
        p++) {
     m_sub_partition[p]->cache_cycle(cycle);
@@ -275,10 +275,7 @@ void memory_partition_unit::simple_dram_model_cycle() {
     }
   }
 
-  // mem_fetch *mf = m_sub_partition[spid]->L2_dram_queue_top();
-  // if( !m_dram->full(mf->is_write()) ) {
-  // L2->DRAM queue to DRAM latency queue
-  // Arbitrate among multiple L2 subpartitions
+  // L2 -> DRAM latency queue: round-robin over the sub-partitions, one request per cycle.
   int last_issued_partition = m_arbitration_metadata.last_borrower();
   for (unsigned p = 0; p < m_config->m_n_sub_partition_per_memory_channel;
        p++) {
@@ -304,7 +301,6 @@ void memory_partition_unit::simple_dram_model_cycle() {
       break;  // the DRAM should only accept one request per cycle
     }
   }
-  //}
 }
 
 void memory_partition_unit::dram_cycle() {
@@ -337,10 +333,7 @@ void memory_partition_unit::dram_cycle() {
   m_dram->cycle();
   m_dram->dram_log(SAMPLELOG);
 
-  // mem_fetch *mf = m_sub_partition[spid]->L2_dram_queue_top();
-  // if( !m_dram->full(mf->is_write()) ) {
-  // L2->DRAM queue to DRAM latency queue
-  // Arbitrate among multiple L2 subpartitions
+  // L2 -> DRAM latency queue: round-robin over the sub-partitions, one request per cycle.
   int last_issued_partition = m_arbitration_metadata.last_borrower();
   for (unsigned p = 0; p < m_config->m_n_sub_partition_per_memory_channel;
        p++) {
@@ -366,7 +359,6 @@ void memory_partition_unit::dram_cycle() {
       break;  // the DRAM should only accept one request per cycle
     }
   }
-  //}
 
   // DRAM latency queue
   if (!m_dram_latency_queue.empty() &&
@@ -466,7 +458,7 @@ memory_sub_partition::~memory_sub_partition() {
   delete m_L2interface;
 }
 
-void memory_sub_partition::cache_cycle(unsigned cycle) {
+void memory_sub_partition::cache_cycle(unsigned long long cycle) {
   // L2 fill responses
   if (!m_config->m_L2_config.disabled()) {
     if (m_L2cache->access_ready() && !m_L2_icnt_queue->full()) {
@@ -622,19 +614,19 @@ bool memory_sub_partition::dram_L2_queue_full() const {
 
 void memory_sub_partition::dram_L2_queue_push(class mem_fetch *mf) {
   m_dram_L2_queue->push(mf);
-  // H3-3c: DRAM 병렬 루프에서 호출된다. 이 서브파티션은 한 memory_partition_unit 에만
-  // 속하므로 이 바이트를 쓰는 스레드는 하나다.
+  // Called from the parallel DRAM loop. A sub-partition belongs to one memory
+  // partition, so only one thread writes this flag.
   if (m_l2loop_mirror) *m_l2loop_mirror = 1;
 }
 
-// H3-3c: cache_cycle() 을 단계별로 따라가 "샘플 1회 외 no-op" 조건을 모은다.
-//  - gpgpu_sim 루프: full(sector) 이면 gpu_stall_dramfull++ 이므로 full 이 아니어야 한다.
-//  - 단계1 L2 fill 응답: access_ready() 가 거짓.
-//  - 단계2 DRAM->L2: m_dram_L2_queue 가 빔.
-//  - L2cache->cycle(): miss 큐 비고 두 포트 한가 -> 샘플(false,false) 1회 + 보충 no-op.
-//  - 단계3 새 접근: m_icnt_L2_queue 가 빔.
-//  - 단계4 ROP: m_rop 가 빔(준비 시각이 남은 항목도 방문 대상으로 둔다).
-// m_L2_icnt_queue / m_L2_dram_queue 는 이 루프의 판정에 영향이 없다(각각 pop 루프와 DRAM 이 비운다).
+// A cache_cycle() visit only takes one L2-port sample when all of these hold:
+//  - not full(sector): otherwise the caller counts gpu_stall_dramfull.
+//  - fill responses: access_ready() is false.
+//  - DRAM -> L2: m_dram_L2_queue is empty.
+//  - L2cache->cycle(): miss queue empty and both ports free -> one (false,false) sample.
+//  - new accesses: m_icnt_L2_queue is empty.
+//  - ROP: m_rop is empty (entries that are not ready yet still count as work).
+// m_L2_icnt_queue and m_L2_dram_queue do not matter here (block 2 and the DRAM drain them).
 bool memory_sub_partition::l2loop_idle(unsigned sector_chunk) const {
   if (full(sector_chunk)) return false;
   if (!m_dram_L2_queue->empty() || !m_icnt_L2_queue->empty() || !m_rop.empty()) return false;
@@ -732,7 +724,7 @@ unsigned memory_sub_partition::flushL2() {
   if (!m_config->m_L2_config.disabled()) {
     m_L2cache->flush();
   }
-  if (m_l2loop_mirror) *m_l2loop_mirror = 1;   // H3-3c: 보수적으로 깨운다
+  if (m_l2loop_mirror) *m_l2loop_mirror = 1;   // wake the L2 loop (conservative)
   return 0;  // TODO: write the flushed data to the main memory
 }
 
@@ -856,12 +848,15 @@ mem_fetch *memory_sub_partition::pop() {
 
 mem_fetch *memory_sub_partition::top() {
   mem_fetch *mf = m_L2_icnt_queue->top();
-  if (mf && (mf->get_access_type() == L2_WRBK_ACC ||
-             mf->get_access_type() == L1_WRBK_ACC)) {
+  // Writebacks need no reply: drop every one at the head and report the next real packet.
+  // NULL must keep meaning "the head slot is empty", because cycle() pops the queue on NULL;
+  // returning NULL right after dropping a writeback made that pop remove the next packet unsent.
+  while (mf && (mf->get_access_type() == L2_WRBK_ACC ||
+                mf->get_access_type() == L1_WRBK_ACC)) {
     m_L2_icnt_queue->pop();
     m_request_tracker.erase(mf);
     delete mf;
-    mf = NULL;
+    mf = m_L2_icnt_queue->top();
   }
   return mf;
 }

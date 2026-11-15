@@ -900,6 +900,9 @@ void gpgpu_sim_config::reg_options(option_parser_t opp) {
       opp, "-gpgpu_ptx_sim_mode", OPT_INT32,
       &(gpgpu_ctx->func_sim->g_ptx_sim_mode),
       "Select between Performance (default) or Functional simulation (1)", "0");
+  // The ICNT clock is also the time unit of the local-interconnect parameters
+  // (-icnt_ring_hop_latency, -icnt_ring_link_width, -icnt_xbar_port_width); see
+  // icnt_wrapper.cc before changing it.
   option_parser_register(opp, "-gpgpu_clock_domains", OPT_CSTR,
                          &gpgpu_clock_domains,
                          "Clock Domain Frequencies in MhZ {<Core Clock>:<ICNT "
@@ -985,7 +988,7 @@ void gpgpu_sim_config::reg_options(option_parser_t opp) {
                         "256");
   option_parser_register(opp, "-gmmu_pwc_entries", OPT_UINT32,
                         &gmmu_pwc_entries,
-                        "page walk cache entries per intermediate level per chiplet GMMU",
+                        "page walk cache entries per chiplet GMMU, shared by the three intermediate levels",
                         "128");
   // Placement snapshot: freeze first-touch placement so it becomes a controlled
   // variable across configs. Empty = disabled (first-touch behaves as before).
@@ -1538,6 +1541,7 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
     icnt_configure_chiplets(m_n_chiplets,
                             m_gpu_module->get_cluster_to_chiplet_vec(),       // size n_simt_clusters
                             m_gpu_module->get_mem_sub_partition_to_chiplet_vec()); // size n_mem_sub_partition
+    icnt_set_flit_sizes(m_memory_config->icnt_flit_size, m_memory_config->icnt_inter_flit_size);
     icnt_create(m_shader_config->n_simt_clusters,
                 m_memory_config->m_n_mem_sub_partition);
   }
@@ -2372,8 +2376,8 @@ void gpgpu_sim::gpu_print_stat(unsigned long long streamID) {
           gpgpu_ctx->device_runtime->g_max_total_param_size);
 
   // performance counter for stalls due to congestion.
-  printf("gpu_stall_dramfull = %d\n", gpu_stall_dramfull);
-  printf("gpu_stall_icnt2sh    = %d\n", gpu_stall_icnt2sh);
+  printf("gpu_stall_dramfull = %llu\n", gpu_stall_dramfull);
+  printf("gpu_stall_icnt2sh    = %llu\n", gpu_stall_icnt2sh);
 
   // printf("partiton_reqs_in_parallel = %lld\n", partiton_reqs_in_parallel);
   // printf("partiton_reqs_in_parallel_total    = %lld\n",
@@ -2472,7 +2476,7 @@ void gpgpu_sim::gpu_print_stat(unsigned long long streamID) {
     total_l2_css.clear();
 
     printf("\n========= L2 cache stats =========\n");
-    flush_l2loop_idle();   // H3-3c: 건너뛴 방문의 포트 샘플을 읽기 전에 반영
+    flush_l2loop_idle();  // add the port samples of skipped visits first
     for (unsigned i = 0; i < m_memory_config->m_n_mem_sub_partition; i++) {
       m_memory_sub_partition[i]->accumulate_L2cache_stats(l2_stats);
       m_memory_sub_partition[i]->get_L2cache_sub_stats(l2_css);
@@ -3041,8 +3045,8 @@ void gpgpu_sim::wire_icnt_mirrors() {
     }
   }
 
-  // H3-3c: 서브파티션 L2 루프. 인터커넥트 출력 버퍼 훅이 필요하고(로컬 xbar), 방문마다 결과가
-  // 달라지는 선택 기능(power 누적, visualizer, SST)이 꺼져 있을 때만 건너뛴다.
+  // L2 loop of block 4: skip idle sub-partitions only when the ICNT can flag its output
+  // buffers (local xbar) and no option that works on every visit (power, visualizer, SST) is on.
   m_l2loop_busy.assign(n_sub, 1);
   m_l2loop_last.assign(n_sub, 0);
   m_l2loop_mirror_ok = icnt_out_mirror_supported() && !m_memory_config->SST_mode &&
@@ -3055,7 +3059,8 @@ void gpgpu_sim::wire_icnt_mirrors() {
   }
 }
 
-// H3-3c: 틱 m_l2loop_tick 까지 건너뛴 방문의 포트 샘플을 모두 반영한다. 통계를 읽기 직전에 부른다.
+// Adds the port samples of every visit skipped up to the current loop tick.
+// Call it before reading the L2 stats.
 void gpgpu_sim::flush_l2loop_idle() {
   if (!m_l2loop_mirror_ok) return;
   for (unsigned i = 0; i < m_l2loop_last.size(); i++) {
@@ -3068,21 +3073,21 @@ void gpgpu_sim::flush_l2loop_idle() {
 }
 
 void gpgpu_sim::cycle() {
-  // 31: whole-body bracket. wall - sum(cycle_ns) isolates work outside cycle()
-  // (trace parse at CTA issue is INSIDE, via issue_block2core -> tail bucket).
-  const unsigned long long __cyc0 = g_phase_timing_on ? phase_now_ns() : 0;
-  unsigned long long __pt_t0 = 0;  // set at the tail bracket; scope must outlive the CORE block
+  // Phase timing (ACCELSIM_PHASE_TIMING): wall time of the whole cycle().
+  const unsigned long long cycle_wall_start = g_phase_timing_on ? phase_now_ns() : 0;
+  unsigned long long tail_wall_start = 0;  // set in the CORE block, read at the end of cycle()
   int clock_mask = next_clock_domain();
-  // H3-3: 미러 연결은 어떤 클럭 블록보다 먼저(첫 사이클에 CORE/ICNT 가 없어도 L2 루프 전에).
+  // First call only: hook up the busy flags that let the loops below skip
+  // idle clusters and sub-partitions (see wire_icnt_mirrors()).
   if (!m_icnt_mirrors_wired) wire_icnt_mirrors();
 
-  if (clock_mask & CORE) {
-    const unsigned long long __pt_ci0 = g_phase_timing_on ? phase_now_ns() : 0;
-    // shader core loading (pop from ICNT into core) follows CORE clock
-    // H3-3b: 응답 FIFO 도 비고 인터커넥트 출력 버퍼도 빈 클러스터의 icnt_cycle() 은
-    // 아무 일도 하지 않는다(icnt_pop 이 NULL, 부작용 없음). 미러가 0 인 칸은 건너뛴다.
-    // g_accelsim_diag 는 방문마다 카운터를 올리므로 그때는 건너뛰지 않는다 -- 다만 미러는
-    // 계속 실제 상태로 갱신해 두어, 켜고 끄는 사이에도 불변식이 깨지지 않게 한다.
+  if (clock_mask & ICNT) {
+    const unsigned long long cluster_icnt_wall_start = g_phase_timing_on ? phase_now_ns() : 0;
+    // ICNT -> cluster replies run on the ICNT clock, the same clock on which the
+    // network fills these output buffers.
+    // Skip idle clusters. m_cluster_icnt_busy[i] == 0 means cluster i's response
+    // FIFO and its ICNT output buffer are both empty, so icnt_cycle() would do
+    // nothing. Not skipped under ACCELSIM_DIAG, which counts every visit.
     const bool skip_idle_clusters = m_cluster_icnt_mirror_ok && !g_accelsim_diag;
     for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
       if (skip_idle_clusters && !m_cluster_icnt_busy[i]) {
@@ -3097,15 +3102,15 @@ void gpgpu_sim::cycle() {
             (!m_cluster[i]->icnt_response_empty() || !icnt_out_empty(i)) ? 1 : 0;
     }
     if (g_phase_timing_on)
-      g_phase_timers.cluster_icnt_ns += phase_now_ns() - __pt_ci0;
+      g_phase_timers.cluster_icnt_ns += phase_now_ns() - cluster_icnt_wall_start;
   }
   unsigned partiton_replys_in_parallel_per_cycle = 0;
-  if (clock_mask & ICNT) {
-    const unsigned long long __pt2b = g_phase_timing_on ? phase_now_ns() : 0;
-    // pop from memory controller to interconnect
-    // H3-3a: L2->icnt 큐가 빈 서브파티션은 top()==NULL(부작용 없음) -> pop() 도 빈 fifo 에서
-    // 아무것도 바꾸지 않는다(min_len 0 큐; m_request_tracker.erase(NULL) 은 no-op).
-    // 미러가 0 인 칸은 건너뛰고, 방문한 칸은 방문 직후 실제 상태로 미러를 맞춘다.
+  if (clock_mask & L2) {
+    const unsigned long long icnt_pop_wall_start = g_phase_timing_on ? phase_now_ns() : 0;
+    // On L2 edges, move at most one reply per sub-partition from its L2-to-ICNT queue
+    // into the ICNT; the L2 side sends its replies at its own clock.
+    // Skip sub-partitions whose L2-to-ICNT queue is empty (m_l2icnt_nonempty[i] == 0):
+    // top() would return NULL and pop() would change nothing.
     for (unsigned i = 0; i < m_memory_config->m_n_mem_sub_partition; i++) {
       if (!m_l2icnt_nonempty[i]) {
 #ifdef H33_MIRROR_CHECK
@@ -3115,10 +3120,10 @@ void gpgpu_sim::cycle() {
       }
       mem_fetch *mf = m_memory_sub_partition[i]->top();
       if (mf) {
+        // Packet size in bytes: a write ack carries only the control part.
         unsigned response_size =
             mf->get_is_write() ? mf->get_ctrl_size() : mf->size();
         if (::icnt_has_buffer(m_shader_config->mem2device(i), response_size)) {
-          // if (!mf->get_is_write())
           mf->set_return_timestamp(gpu_sim_cycle + gpu_tot_sim_cycle);
           mf->set_status(IN_ICNT_TO_SHADER, gpu_sim_cycle + gpu_tot_sim_cycle);
           m_gpu_module->icnt_push(m_shader_config->mem2device(i), mf->get_tpc(), mf,
@@ -3126,36 +3131,37 @@ void gpgpu_sim::cycle() {
           m_memory_sub_partition[i]->pop();
           partiton_replys_in_parallel_per_cycle++;
         } else {
-          gpu_stall_icnt2sh++;
+          gpu_stall_icnt2sh++;  // input buffer full: retry next ICNT cycle
         }
       } else {
+        // top() == NULL: the head slot is empty; pop() advances it.
         m_memory_sub_partition[i]->pop();
       }
-      m_l2icnt_nonempty[i] = m_memory_sub_partition[i]->l2icnt_queue_empty() ? 0 : 1;  // H3-3a
+      m_l2icnt_nonempty[i] = m_memory_sub_partition[i]->l2icnt_queue_empty() ? 0 : 1;
     }
     if (g_phase_timing_on) {
-      const unsigned long long __pt2e = phase_now_ns();
-      g_phase_timers.icnt_ns += __pt2e - __pt2b;
+      const unsigned long long icnt_pop_wall_end = phase_now_ns();
+      // Two wall-time totals: icnt_ns = this loop + the icnt_transfer() call below,
+      // g_icnt_pop_ns = this loop only.
+      g_phase_timers.icnt_ns += icnt_pop_wall_end - icnt_pop_wall_start;
       g_phase_timers.icnt_calls++;
-      g_icnt_pop_ns += __pt2e - __pt2b;   // H3: mem-ctrl -> icnt pop loop
+      g_icnt_pop_ns += icnt_pop_wall_end - icnt_pop_wall_start;
       g_icnt_pop_calls++;
     }
   }
   partiton_replys_in_parallel += partiton_replys_in_parallel_per_cycle;
 
   if (clock_mask & DRAM) {
-    const unsigned long long __pt0 = g_phase_timing_on ? phase_now_ns() : 0;
-    // P5 (M5, deferred from P2c): partitions are independent -- proposition
-    // T-DRAM, audited in P2c. modern-gpu-simulator parallelises exactly this
-    // loop with no reduction and no critical section (gpu-sim.cc:2905 there).
+    const unsigned long long dram_wall_start = g_phase_timing_on ? phase_now_ns() : 0;
+    // Memory partitions only touch their own state, so they run in parallel;
+    // the statistics they share (memory_stats_t) are updated atomically.
 #pragma omp parallel for schedule(runtime)
     for (unsigned i = 0; i < m_memory_config->m_n_mem; i++) {
       if (m_memory_config->simple_dram_model)
         m_memory_partition_unit[i]->simple_dram_model_cycle();
-      else
-        m_memory_partition_unit[i]
-            ->dram_cycle();  // Issue the dram command (scheduler + delay model)
-      // Update performance counters for DRAM
+      else  // DRAM->L2 return, DRAM timing model, L2->DRAM issue.
+        m_memory_partition_unit[i]->dram_cycle();
+      // Copy this channel's DRAM counters into the power-model stats.
       m_memory_partition_unit[i]->set_dram_power_stats(
           m_power_stats->pwr_mem_stat->n_cmd[CURRENT_STAT_IDX][i],
           m_power_stats->pwr_mem_stat->n_activity[CURRENT_STAT_IDX][i],
@@ -3168,7 +3174,7 @@ void gpgpu_sim::cycle() {
           m_power_stats->pwr_mem_stat->n_req[CURRENT_STAT_IDX][i]);
     }
     if (g_phase_timing_on) {
-      g_phase_timers.dram_ns += phase_now_ns() - __pt0;
+      g_phase_timers.dram_ns += phase_now_ns() - dram_wall_start;
       g_phase_timers.dram_calls++;
     }
   }
@@ -3176,33 +3182,21 @@ void gpgpu_sim::cycle() {
   // L2 operations follow L2 clock domain
   unsigned partiton_reqs_in_parallel_per_cycle = 0;
   if (clock_mask & L2) {
-    const unsigned long long __pt1 = g_phase_timing_on ? phase_now_ns() : 0;
-    // §26 (2026-08-15): chiplet/sub-partition-width parallel-for was tried and
-    // reverted here -- digest stayed bit-identical (E1/E1b/E2 all passed) but
-    // gave zero net benefit and a measured 1t regression (448.5s -> 485.0s,
-    // BFS32 k1~k5), because this block's per-call payload is small (13-20s
-    // absolute) relative to the fork/join cost of two new parallel regions
-    // re-entered ~500k times. See implog §26 for the full before/after numbers.
+    const unsigned long long l2_gmmu_wall_start = g_phase_timing_on ? phase_now_ns() : 0;
+    // These loops stay serial: a parallel version gave identical results but ran
+    // slower, because each call does too little work to pay for the threads.
     // GMMU is per-chiplet and clocked with the L2 domain.
     for (unsigned c = 0; c < m_n_chiplets; c++) {
       m_gpu_module->get_gmmu(c)->cycle(
           gpu_sim_cycle + gpu_tot_sim_cycle);
     }
-    // P5: L2 TLB tick: no-op in Phase 5; reserved for future latency pipeline.
-    for (unsigned c = 0; c < m_gpu_module->get_num_chiplets(); c++) {
-      m_gpu_module->get_chiplet(c)->get_l2_tlb_4k()->tick(
-          gpu_sim_cycle + gpu_tot_sim_cycle);
-      m_gpu_module->get_chiplet(c)->get_l2_tlb_64k()->tick(
-          gpu_sim_cycle + gpu_tot_sim_cycle);
-      m_gpu_module->get_chiplet(c)->get_l2_tlb_2m()->tick(
-          gpu_sim_cycle + gpu_tot_sim_cycle);
-    }
 
     m_power_stats->pwr_mem_stat->l2_cache_stats[CURRENT_STAT_IDX].clear();
-    // H3-3c: 한가한 서브파티션(l2loop_idle && 인터커넥트 출력 버퍼 빔)의 방문은 L2 포트 샘플
-    // 1회 외에 아무것도 하지 않는다. 미러가 0 이면 건너뛰고, 다시 방문할 때(또는 통계 출력 전)
-    // 건너뛴 횟수만큼 샘플을 더한다. diag 는 방문마다 카운터를 올리므로 그때는 건너뛰지 않되
-    // 미러·틱 장부는 계속 맞춰 둔다.
+    // Skip idle sub-partitions. When the L2 side is idle (l2loop_idle) and the ICNT
+    // output buffer is empty, a visit only adds one idle L2-port sample; the skipped
+    // samples are added on the next visit or before the stats are printed.
+    // ACCELSIM_DIAG counts every visit, so nothing is skipped then, but the busy
+    // flags and visit ticks are still kept up to date.
     const unsigned long long l2tick = ++m_l2loop_tick;
     const bool skip_idle_l2 = m_l2loop_mirror_ok && !g_accelsim_diag;
     for (unsigned i = 0; i < m_memory_config->m_n_mem_sub_partition; i++) {
@@ -3222,7 +3216,7 @@ void gpgpu_sim::cycle() {
       // backed up) Note:This needs to be called in DRAM clock domain if there
       // is no L2 cache in the system In the worst case, we may need to push
       // SECTOR_CHUNCK_SIZE requests, so ensure you have enough buffer for them
-      // ACCEPT_ (temp, P-5 gated): per-chiplet mem-accept backpressure.
+      // Diagnostics (ACCELSIM_DIAG): per-chiplet count of visits with a full L2 input queue.
       if (g_accelsim_diag) {
         unsigned mch = m_gpu_module ? m_gpu_module->mem_sub_partition_to_chiplet(i) : 0;
         if (mch < 8) {
@@ -3242,12 +3236,12 @@ void gpgpu_sim::cycle() {
         m_memory_sub_partition[i]->accumulate_L2cache_stats(
             m_power_stats->pwr_mem_stat->l2_cache_stats[CURRENT_STAT_IDX]);
       }
-      if (m_l2loop_mirror_ok)   // H3-3c
+      if (m_l2loop_mirror_ok)  // busy unless this visit left nothing to do
         m_l2loop_busy[i] = (m_memory_sub_partition[i]->l2loop_idle(SECTOR_CHUNCK_SIZE) &&
                             icnt_out_empty(m_shader_config->mem2device(i))) ? 0 : 1;
     }
     if (g_phase_timing_on) {
-      g_phase_timers.l2gmmu_ns += phase_now_ns() - __pt1;
+      g_phase_timers.l2gmmu_ns += phase_now_ns() - l2_gmmu_wall_start;
       g_phase_timers.l2gmmu_calls++;
     }
   }
@@ -3258,13 +3252,13 @@ void gpgpu_sim::cycle() {
   }
 
   if (clock_mask & ICNT) {
-    const unsigned long long __pt2 = g_phase_timing_on ? phase_now_ns() : 0;
+    const unsigned long long icnt_transfer_wall_start = g_phase_timing_on ? phase_now_ns() : 0;
     // FUNNEL_ (temp): xbar arrival timestamp. ST-10: only the ACCELSIM_DIAG
     // readers (gmmu MEMLAT/FUNNEL, shader NORMREP) consume it, so stamp only then.
     if (g_accelsim_diag) g_icnt_now = gpu_sim_cycle + gpu_tot_sim_cycle;
     icnt_transfer();
     if (g_phase_timing_on) {
-      g_phase_timers.icnt_ns += phase_now_ns() - __pt2;
+      g_phase_timers.icnt_ns += phase_now_ns() - icnt_transfer_wall_start;
       g_phase_timers.icnt_calls++;
     }
   }
@@ -3370,7 +3364,7 @@ void gpgpu_sim::cycle() {
     // at full thread width. No chiplet grouping is needed here -- that grouping
     // exists solely to bound pass B.
     const unsigned n_clusters_flat = m_shader_config->n_simt_clusters;
-    const unsigned long long __pt_a0 = g_phase_timing_on ? phase_now_ns() : 0;
+    const unsigned long long phase_a_wall_start = g_phase_timing_on ? phase_now_ns() : 0;
 // guided, per-loop (28): parked SMs make whole chunks trivial, so static
 // chunking starves some threads. guided fixes that here without touching the
 // 8-iteration icnt collapse(2) loop, which a global OMP_SCHEDULE=dynamic
@@ -3384,7 +3378,7 @@ void gpgpu_sim::cycle() {
       if (m_cluster_ran[i]) m_cluster[i]->core_cycle_phase_a();
     }
     if (g_phase_timing_on) {
-      g_phase_timers.phase_a_ns += phase_now_ns() - __pt_a0;
+      g_phase_timers.phase_a_ns += phase_now_ns() - phase_a_wall_start;
       g_phase_timers.phase_a_calls++;
     }
 
@@ -3395,18 +3389,18 @@ void gpgpu_sim::cycle() {
     // depends on (design doc 7-1). Parallelism is capped at n_chiplets simply
     // because the outer loop has that many iterations -- no num_threads needed;
     // surplus threads idle here and pick the work back up in pass C.
-    const unsigned long long __pt_b0 = g_phase_timing_on ? phase_now_ns() : 0;
+    const unsigned long long phase_b_wall_start = g_phase_timing_on ? phase_now_ns() : 0;
 #pragma omp parallel for schedule(runtime) if(par_b)
     for (unsigned ch = 0; ch < n_chiplet_groups; ch++) {
-      const unsigned long long __pt_bc0 = g_phase_timing_on ? phase_now_ns() : 0;  // D1
+      const unsigned long long phase_b_group_wall_start = g_phase_timing_on ? phase_now_ns() : 0;
       for (unsigned ci = 0; ci < m_chiplet_cluster_order[ch].size(); ci++) {
         const unsigned i = m_chiplet_cluster_order[ch][ci];
         if (m_cluster_ran[i]) m_cluster[i]->core_cycle_phase_b();
       }
       if (g_phase_timing_on && ch < 8) {  // D1: per-group time + running thread
-        const unsigned long long __pt_body = phase_now_ns() - __pt_bc0;
-        g_phase_timers.phase_b_chip_ns[ch] += __pt_body;
-        g_phase_timers.phase_b_chip_cur_ns[ch] = __pt_body;  // D1b
+        const unsigned long long phase_b_group_wall_ns = phase_now_ns() - phase_b_group_wall_start;
+        g_phase_timers.phase_b_chip_ns[ch] += phase_b_group_wall_ns;
+        g_phase_timers.phase_b_chip_cur_ns[ch] = phase_b_group_wall_ns;  // D1b
 #ifdef _OPENMP
         const int tid = omp_get_thread_num();
 #else
@@ -3416,7 +3410,7 @@ void gpgpu_sim::cycle() {
       }
     }
     if (g_phase_timing_on) {
-      g_phase_timers.phase_b_ns += phase_now_ns() - __pt_b0;
+      g_phase_timers.phase_b_ns += phase_now_ns() - phase_b_wall_start;
       g_phase_timers.phase_b_calls++;
       {  // D1b: per-cycle maximum over groups (serial, after the region joined)
         unsigned long long mx = 0; unsigned am = 0;
@@ -3433,7 +3427,7 @@ void gpgpu_sim::cycle() {
     }
 
     // P11: pass C is per-SM work only, same as pass A -- flat, full thread width.
-    const unsigned long long __pt_c0 = g_phase_timing_on ? phase_now_ns() : 0;
+    const unsigned long long phase_c_wall_start = g_phase_timing_on ? phase_now_ns() : 0;
 // guided, per-loop: same rationale as pass A (28).
 #pragma omp parallel for schedule(guided) reduction(+ : active_sms_this_cycle) if(par_c)
     for (unsigned i = 0; i < n_clusters_flat; i++) {
@@ -3453,12 +3447,12 @@ void gpgpu_sim::cycle() {
       }
     }
     if (g_phase_timing_on) {
-      g_phase_timers.phase_c_ns += phase_now_ns() - __pt_c0;
+      g_phase_timers.phase_c_ns += phase_now_ns() - phase_c_wall_start;
       g_phase_timers.phase_c_calls++;
     }
     // 31: everything from here to the end of cycle() -- kernel-completion
     // scans, STATEHASH, issue_block2core() (which parses CTA traces), flushes.
-    __pt_t0 = g_phase_timing_on ? phase_now_ns() : 0;
+    tail_wall_start = g_phase_timing_on ? phase_now_ns() : 0;
 #ifdef _OPENMP
     if (pt_guard_active && m_gpu_module &&
         m_gpu_module->get_page_table()->mutation_count() != pt_mut_before) {
@@ -3491,13 +3485,13 @@ void gpgpu_sim::cycle() {
     // occupancy is only changed by cluster i's own core_cycle(), so sampling it
     // after every cluster has cycled yields the same values as sampling it
     // right after each one -- the accumulation is integer, hence order-free.
-    const unsigned long long __pt_occ0 = g_phase_timing_on ? phase_now_ns() : 0;
+    const unsigned long long occupancy_wall_start = g_phase_timing_on ? phase_now_ns() : 0;
     for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
       m_cluster[i]->get_current_occupancy(
           gpu_occupancy.aggregate_warp_slot_filled,
           gpu_occupancy.aggregate_theoretical_warp_slots);
     }
-    if (g_phase_timing_on) g_phase_timers.tail_occ_ns += phase_now_ns() - __pt_occ0;
+    if (g_phase_timing_on) g_phase_timers.tail_occ_ns += phase_now_ns() - occupancy_wall_start;
     *active_sms += (float)active_sms_this_cycle;
 
     // STATEHASH: one fingerprint line per cycle, emitted from the sequential
@@ -3574,9 +3568,9 @@ void gpgpu_sim::cycle() {
     }
 #endif
 
-    const unsigned long long __pt_ib0 = g_phase_timing_on ? phase_now_ns() : 0;
+    const unsigned long long cta_issue_wall_start = g_phase_timing_on ? phase_now_ns() : 0;
     issue_block2core();
-    if (g_phase_timing_on) g_phase_timers.tail_issue_ns += phase_now_ns() - __pt_ib0;
+    if (g_phase_timing_on) g_phase_timers.tail_issue_ns += phase_now_ns() - cta_issue_wall_start;
     decrement_kernel_latency();
 
     // Depending on configuration, invalidate the caches once all of threads are
@@ -3690,9 +3684,9 @@ void gpgpu_sim::cycle() {
 #endif
   }
   if (g_phase_timing_on) {
-    const unsigned long long __now = phase_now_ns();
-    if (clock_mask & CORE) g_phase_timers.tail_ns += __now - __pt_t0;
-    g_phase_timers.cycle_ns += __now - __cyc0;
+    const unsigned long long cycle_wall_end = phase_now_ns();
+    if (clock_mask & CORE) g_phase_timers.tail_ns += cycle_wall_end - tail_wall_start;
+    g_phase_timers.cycle_ns += cycle_wall_end - cycle_wall_start;
   }
 }
 

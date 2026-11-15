@@ -79,5 +79,8 @@ void icnt_configure_chiplets(unsigned n_chiplets,
                              const std::vector<unsigned>& cluster_to_chiplet,
                              const std::vector<unsigned>& mem_sub_to_chiplet);
 bool icnt_ring_enabled();
+// No-op unless g_network_mode == LOCAL_XBAR. Hands the flit sizes (bytes) that mem_fetch uses
+// to the local interconnect, which converts icnt_has_buffer() sizes from bytes to flits.
+void icnt_set_flit_sizes(unsigned local_flit_bytes, unsigned inter_flit_bytes);
 
 #endif

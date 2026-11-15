@@ -213,11 +213,16 @@ void dram_t::scheduler_frfcfs() {
     // Power stats
     // if(req->data->get_type() != READ_REPLY && req->data->get_type() !=
     // WRITE_ACK)
+    // m_stats is shared by every DRAM channel, and cycle() runs the channels in
+    // parallel, so these updates must be atomic.
+#pragma omp atomic
     m_stats->total_n_access++;
 
     if (req->data->get_type() == WRITE_REQUEST) {
+#pragma omp atomic
       m_stats->total_n_writes++;
     } else if (req->data->get_type() == READ_REQUEST) {
+#pragma omp atomic
       m_stats->total_n_reads++;
     }
 
@@ -241,13 +246,21 @@ void dram_t::scheduler_frfcfs() {
         if (m_config->gpgpu_memlatency_stat) {
           mrq_latency = m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle -
                         bk[b]->mrq->timestamp;
+#pragma omp atomic
           m_stats->tot_mrq_latency += mrq_latency;
+#pragma omp atomic
           m_stats->tot_mrq_num++;
           bk[b]->mrq->timestamp =
               m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle;
+#pragma omp atomic
           m_stats->mrq_lat_table[LOGB2(mrq_latency)]++;
-          if (mrq_latency > m_stats->max_mrq_latency) {
-            m_stats->max_mrq_latency = mrq_latency;
+          unsigned max_seen;
+#pragma omp atomic read
+          max_seen = m_stats->max_mrq_latency;
+          if (mrq_latency > max_seen) {
+#pragma omp critical(dram_max_mrq_latency)
+            if (mrq_latency > m_stats->max_mrq_latency)
+              m_stats->max_mrq_latency = mrq_latency;
           }
         }
 
