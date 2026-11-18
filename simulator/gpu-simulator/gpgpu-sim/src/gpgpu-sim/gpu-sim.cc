@@ -61,43 +61,22 @@
 
 #include <chrono>  // PHASE_TIMING: wall-clock phase-boundary instrumentation
 
-// FUNNEL_ (temp): defined in local_interconnect.cc; set each ICNT cycle below.
+// ICNT cycle stamp for the ACCELSIM_DIAG reply-latency rows; defined in local_interconnect.cc.
 extern unsigned long long g_icnt_now;
 
-// ACCEPT_ (temp): per-chiplet mem-accept backpressure. g_memfull_stall = cycles a
-// sub-partition rejected an icnt request because it was full; g_memfull_total =
-// total sub-partition service opportunities. High chiplet0 ratio => accept path is
-// the convergence bottleneck (then DRAM bwutil tells if it's DRAM or upstream L2/queue).
+// [ACCEPT] (ACCELSIM_DIAG): per-chiplet L2-loop visits, all (total) and with a full input (stall).
 unsigned long long g_memfull_stall[8] = {0};
 unsigned long long g_memfull_total[8] = {0};
 
-// PHASE_TIMING (perf audit, docs/parallelization_overview.ko.md step 0): wall-clock
-// share of each cycle()-domain block, to find where the remaining sequential time
-// actually goes (L2/GMMU loop and ICNT are currently unparallelized -- this measures
-// whether that's worth fixing before doing it). Diagnostic only: gated off by default,
-// touches no simulation state, and prints to stderr on a separate line so it can never
-// leak into a digest comparison (mirrors the STATEHASH / ACCELSIM_SERIAL_PHASE pattern).
-// perf(1) is not available in this container (confirmed 2026-08-15) -- this is the
-// documented fallback from docs/xlat_perf_audit_plan.ko.md Sec 3-2, not a fresh guess.
-// §25 needs g_phase_timing_on readable from local_interconnect.cc
-// (LocalInterconnect::Advance(), a different translation unit). `const`
-// globals have internal linkage by default in C++ -- `extern` here is not
-// optional, unlike for a plain non-const global.
+// ACCELSIM_PHASE_TIMING: wall-clock time per cycle() block, printed to stderr ([PHASE_TIMING*]).
+// extern is required: a const global has internal linkage, and local_interconnect.cc reads it.
 extern const bool g_phase_timing_on = (getenv("ACCELSIM_PHASE_TIMING") != NULL);
 
-// P-5: runtime gate for the (temp) diagnostic counter families -- ACCEPT_,
-// POPGATE_, NORMREP/FUNNEL_, MEMLAT_, RINGLAT_/RINGSRC_/RINGINJ_/RINGLINK_/
-// BUCKET_, D-PROBE. None of their output lines are digest patterns
-// (scripts/xtract_amrs.py), so disabling them is digest-neutral. Default OFF;
-// set ACCELSIM_DIAG=1 to restore both the counters and their report lines
-// without rebuilding (same pattern as ACCELSIM_LOG_GMMU / PHASE_TIMING).
-// The XLATLAT/XLATSUM/GMMU_STAT/PWQ instrumentation is research data and part
-// of the digest -- it stays unconditional.
+// ACCELSIM_DIAG: turns on the diagnostic counters and rows ([ACCEPT], [POPGATE], [NORMREP], ...).
+// Off by default; the translation statistics always print.
 extern const bool g_accelsim_diag = (getenv("ACCELSIM_DIAG") != NULL);
 
-// Verification logging: CTA placement lines, OFF unless ACCELSIM_LOG_CTA is
-// set. [CTA_ISSUE] pairs with [CTA_DONE] on (sm, hw_cta) in FIFO order, since
-// a hardware CTA slot is reused only after it has been released.
+// ACCELSIM_LOG_CTA: print [CTA_ISSUE] rows; each pairs with the next [CTA_DONE] on (sm, hw_cta).
 static bool accelsim_log_cta() {
   static const bool on = (getenv("ACCELSIM_LOG_CTA") != NULL);
   return on;
@@ -109,42 +88,28 @@ struct phase_timers_t {
   unsigned long long phase_a_ns = 0, phase_b_ns = 0, phase_c_ns = 0;
   unsigned long long dram_calls = 0, l2gmmu_calls = 0, icnt_calls = 0;
   unsigned long long phase_a_calls = 0, phase_b_calls = 0, phase_c_calls = 0;
-  // D1 (pressure_speedup_implog Sec 5): phase B wall time per chiplet group and
-  // which OMP thread ran each group (checks the dynamic schedule). Written
-  // inside the parallel loop, one group per iteration, so no two threads ever
-  // touch the same index at the same time. Measurement only, PHASE_TIMING-gated.
+  // [PHASE_TIMING_B]: phase B time and running thread per chiplet group (one writer per index).
   unsigned long long phase_b_chip_ns[8] = {0};
   unsigned long long phase_b_chip_thread[8][16] = {{0}};
-  // D1b: this cycle's body time per group (written in the loop, read by the
-  // master after the region joins), the sum over cycles of the per-cycle
-  // maximum (the region's critical path if scheduling were free), which group
-  // was the maximum, and log2(us) histograms of the per-cycle maximum and of
-  // every group body.
+  // [PHASE_TIMING_B2]: per-cycle group times and their maximum (sum, argmax, log2(us) histograms).
   unsigned long long phase_b_chip_cur_ns[8] = {0};
   unsigned long long phase_b_cyclemax_ns = 0;
   unsigned long long phase_b_argmax_cnt[8] = {0};
   unsigned long long phase_b_max_hist[24] = {0};
   unsigned long long phase_b_body_hist[24] = {0};
 };
-static inline unsigned phase_log2us_bucket(unsigned long long ns) {  // D1b
+static inline unsigned phase_log2us_bucket(unsigned long long ns) {  // log2(us), 0..23
   unsigned long long us = ns / 1000ull;
   unsigned b = 0;
   while (us > 1 && b < 23) { us >>= 1; b++; }
   return b;
 }
 static phase_timers_t g_phase_timers;
-// §25 pre-measurement: split icnt_ns into the part that will become
-// chiplet-parallel (local xbar Advance()) vs the part that must stay
-// sequential (handoff/handoff_ring, real chiplet-to-chiplet exchange).
-// Free-standing (not struct members) so local_interconnect.cc can extern
-// them without needing phase_timers_t's definition.
+// icnt_transfer() time: per-chiplet Advance() (parallel) vs. serial handoff between chiplets.
+// Plain globals so local_interconnect.cc can extern them.
 unsigned long long g_icnt_local_ns = 0, g_icnt_handoff_ns = 0;
 unsigned long long g_icnt_local_calls = 0, g_icnt_handoff_calls = 0;
-// H3 measurement: the icnt phase timer covers TWO blocks -- the memory-controller
-// -> interconnect pop loop (this counter) and icnt_transfer()'s xbar Advance
-// (g_icnt_local_ns + g_icnt_handoff_ns). icnt_calls is exactly 2x local_calls
-// because of that, which made the phase look like it had unexplained overhead.
-// Split it out so the two are attributable separately.
+// Time of the L2 -> ICNT reply loop alone; icnt_ns also includes icnt_transfer().
 unsigned long long g_icnt_pop_ns = 0, g_icnt_pop_calls = 0;
 static inline unsigned long long phase_now_ns() {
   using namespace std::chrono;
@@ -487,10 +452,8 @@ void shader_core_config::reg_options(class OptionParser *opp) {
   option_parser_register(opp, "-gpgpu_l1_tlb_4k_lookup_latency", OPT_UINT32,
                          &gpgpu_l1_tlb_4k_lookup_latency,
                          "L1 TLB (4KB) lookup latency in core cycles", "10");
-  // L1 TLB (64KB) configuration options. Defaults keep the 64KB TLB idle unless
-  // -gpgpu_page_size_policy selects 64KB pages. Sizes follow the MCM-GPU reference
-  // config (32/16/8 entries for 4KB/64KB/2MB); MSHR matches the 4KB TLB's so page
-  // size stays the only variable.
+  // L1 TLB (64KB) options; idle unless -gpgpu_page_size_policy uses 64KB pages.
+  // Sizes follow the MCM-GPU reference config; MSHR equals the 4KB TLB's so only page size differs.
   option_parser_register(opp, "-gpgpu_l1_tlb_64k_sets", OPT_UINT32,
                          &gpgpu_l1_tlb_64k_sets,
                          "L1 TLB (64KB) sets: 1 = fully-associative", "1");
@@ -506,12 +469,8 @@ void shader_core_config::reg_options(class OptionParser *opp) {
   option_parser_register(opp, "-gpgpu_l1_tlb_64k_lookup_latency", OPT_UINT32,
                          &gpgpu_l1_tlb_64k_lookup_latency,
                          "L1 TLB (64KB) lookup latency in core cycles", "10");
-  // L1 TLB (2MB) configuration options. Defaults keep the 2MB TLB idle unless
-  // -gpgpu_page_size_policy selects 2MB pages.
-  // Sizes follow the MCM-GPU reference config: L1 TLB is per-SM, fully
-  // associative, 10-cycle, 32/16/8 entries for 4KB/64KB/2MB.
-  // MSHR sizes are not part of that config, so they are kept equal to the 4KB
-  // TLB's: page size stays the only variable between the two TLBs.
+  // L1 TLB (2MB) options; idle unless -gpgpu_page_size_policy uses 2MB pages.
+  // Sizes follow the MCM-GPU reference config; MSHR equals the 4KB TLB's so only page size differs.
   option_parser_register(opp, "-gpgpu_l1_tlb_2m_sets", OPT_UINT32,
                          &gpgpu_l1_tlb_2m_sets,
                          "L1 TLB (2MB) sets: 1 = fully-associative", "1");
@@ -543,12 +502,67 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          &gpgpu_l1_tlb_ports,
                          "concurrent array probes the per-SM L1 TLB can run "
                          "(0 = unlimited, the pre-existing behaviour)",
-                         "0");  // 35: occupancy ports inflate cycles ~34% (33); default off
+                         "0");  // off by default: occupancy ports inflate cycle counts
+  option_parser_register(opp, "-gpgpu_l1_tlb_lookups_per_cycle", OPT_UINT32,
+                         &gpgpu_l1_tlb_lookups_per_cycle,
+                         "new lookups each L1 TLB starts per cycle (pipelined "
+                         "ports; each still takes the full lookup latency). "
+                         "Requests beyond it wait in the TLB's input queue. "
+                         "0 = unlimited",
+                         "0");
   option_parser_register(opp, "-gpgpu_l2_tlb_ports", OPT_UINT32,
                          &gpgpu_l2_tlb_ports,
                          "concurrent array probes the per-chiplet L2 TLB can run "
                          "(0 = unlimited, the pre-existing behaviour)",
-                         "0");  // 35: see above -- the L2 gate was the larger distorter
+                         "0");  // off by default, see above; the L2 gate distorts more than the L1 one
+  option_parser_register(opp, "-gpgpu_l2_tlb_starts_per_cycle", OPT_UINT32,
+                         &gpgpu_l2_tlb_starts_per_cycle,
+                         "new lookups each per-chiplet L2 TLB starts per cycle "
+                         "(pipelined; each still takes the full lookup latency). "
+                         "Refused requests retry the next cycle, and the SM that "
+                         "goes first rotates every cycle. 0 = unlimited",
+                         "0");
+  option_parser_register(opp, "-gpgpu_ldst_replay_first", OPT_BOOL,
+                         &gpgpu_ldst_replay_first,
+                         "a LSU dispatch slot freed in a cycle goes to a parked "
+                         "memory instruction whose translation completed before "
+                         "a new memory instruction (0 = the new instruction "
+                         "first; a replay enters only a slot empty at cycle start)",
+                         "0");
+  option_parser_register(opp, "-gpgpu_ldst_bypass_send_per_bank", OPT_BOOL,
+                         &gpgpu_ldst_bypass_send_per_bank,
+                         "the L1D-bypassing accesses of one memory instruction "
+                         "are sent up to -gpgpu_l1_banks per cycle, as in "
+                         "Accel-Sim 2.0 (0 = one per cycle)",
+                         "0");
+  option_parser_register(opp, "-gpgpu_ldst_banked_response", OPT_BOOL,
+                         &gpgpu_ldst_banked_response,
+                         "the ldst unit takes up to -gpgpu_l1_banks responses "
+                         "per cycle and writes back up to -gpgpu_l1_banks "
+                         "L1D-bypassing responses in one cycle, as in Accel-Sim "
+                         "2.0 (0 = one response per cycle through a one-entry "
+                         "stage)",
+                         "0");
+  option_parser_register(opp, "-gpgpu_alu_ready_queue", OPT_BOOL,
+                         &gpgpu_alu_ready_queue,
+                         "pipelined ALU units keep issued instructions in an "
+                         "in-order queue, ready latency - initiation interval "
+                         "cycles after dispatch, leaving only into a free result "
+                         "slot, as in Accel-Sim 2.0 (0 = shift register, one "
+                         "cycle later when latency > interval, with a result "
+                         "slot reserved at issue)",
+                         "0");
+  option_parser_register(opp, "-gpgpu_ldst_gate_skip_shared", OPT_BOOL,
+                         &gpgpu_ldst_gate_skip_shared,
+                         "shared-memory LOAD/STORE do not take the per-warp ldst "
+                         "gate (they need no translation)",
+                         "0");
+  option_parser_register(opp, "-gpgpu_ldst_gate_release_at_xlat", OPT_BOOL,
+                         &gpgpu_ldst_gate_release_at_xlat,
+                         "a LOAD/STORE releases the per-warp ldst gate once every "
+                         "page it touches is translated, instead of when it "
+                         "leaves the ldst dispatch",
+                         "0");
   option_parser_register(opp, "-gpgpu_tlb_decouple", OPT_BOOL,
                          &gpgpu_tlb_decouple,
                          "non-blocking L1 TLB via ldst park/replay "
@@ -557,6 +571,15 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          &gpgpu_tlb_ideal,
                          "ideal TLB: instant (0-cycle) translation via functional "
                          "page-table fill; baseline to measure translation overhead", "0");
+  option_parser_register(opp, "-gpgpu_l1d_vipt", OPT_BOOL,
+                         &gpgpu_l1d_vipt,
+                         "L1 data cache virtually indexed, physically tagged: the "
+                         "L1 TLB lookup runs in parallel with the L1D access, so "
+                         "an L1 TLB hit adds no latency (0 = lookup, then L1D "
+                         "access). Needs the L1D bank and set inside the 4KB page "
+                         "offset and every L1 TLB lookup latency <= "
+                         "-gpgpu_l1_latency",
+                         "0");
   option_parser_register(opp, "-gpgpu_smem_latency", OPT_UINT32, &smem_latency,
                          "smem Latency", "3");
   option_parser_register(opp, "-gpgpu_cache:dl1PrefL1", OPT_CSTR,
@@ -900,9 +923,7 @@ void gpgpu_sim_config::reg_options(option_parser_t opp) {
       opp, "-gpgpu_ptx_sim_mode", OPT_INT32,
       &(gpgpu_ctx->func_sim->g_ptx_sim_mode),
       "Select between Performance (default) or Functional simulation (1)", "0");
-  // The ICNT clock is also the time unit of the local-interconnect parameters
-  // (-icnt_ring_hop_latency, -icnt_ring_link_width, -icnt_xbar_port_width); see
-  // icnt_wrapper.cc before changing it.
+  // The ICNT clock is also the unit of the -icnt_ring_* and -icnt_xbar_port_width parameters.
   option_parser_register(opp, "-gpgpu_clock_domains", OPT_CSTR,
                          &gpgpu_clock_domains,
                          "Clock Domain Frequencies in MhZ {<Core Clock>:<ICNT "
@@ -910,7 +931,8 @@ void gpgpu_sim_config::reg_options(option_parser_t opp) {
                          "500.0:2000.0:2000.0:2000.0");
   option_parser_register(opp, "-icnt_inter_hop_latency_ns", OPT_UINT32,
                          &icnt_inter_hop_latency_ns,
-                         "inter-chiplet one-way link latency in ns (0 = disabled)", "0");
+                         "obsolete, must be 0 (inter-chiplet latency: -icnt_use_ring, "
+                         "-icnt_ring_hop_latency)", "0");
   option_parser_register(
       opp, "-gpgpu_max_concurrent_kernel", OPT_INT32, &max_concurrent_kernel,
       "maximum kernels that can run concurrently on GPU, set this value "
@@ -969,10 +991,9 @@ void gpgpu_sim_config::reg_options(option_parser_t opp) {
                          "thread block launch latency in cycles. Default: 0",
                          "0");
   
-  // MCM-GPU topology. 1 chiplet == monolithic baseline; SMs and memory
-  // partitions are split into n contiguous groups by gpu_module.
+  // MCM topology: SMs and memory partitions split into n contiguous chiplets; 1 = monolithic.
   option_parser_register(opp, "-gpgpu_n_chiplets", OPT_UINT32, &m_n_chiplets,
-                       "number of chiplets in MCM GPU (Phase 1 scaffolding)",
+                       "number of chiplets in the MCM GPU",
                        "1");
   // Sizes the PMM physical-page pool that first-touch placement draws from.
   option_parser_register(opp, "-gpu_mem_size_mb", OPT_UINT32,
@@ -990,8 +1011,7 @@ void gpgpu_sim_config::reg_options(option_parser_t opp) {
                         &gmmu_pwc_entries,
                         "page walk cache entries per chiplet GMMU, shared by the three intermediate levels",
                         "128");
-  // Placement snapshot: freeze first-touch placement so it becomes a controlled
-  // variable across configs. Empty = disabled (first-touch behaves as before).
+  // Placement map: dump first-touch placement, or load it to fix placement across configs.
   option_parser_register(opp, "-gmmu_placement_dump", OPT_CSTR,
                         &gmmu_placement_dump,
                         "write the first-touch placement map to this file at exit "
@@ -1027,7 +1047,7 @@ void gpgpu_sim_config::reg_options(option_parser_t opp) {
                         "1 = XOR-fold of the VPN in log2(sets)-bit chunks, i.e. set bit k = XOR of VPN "
                         "bits k, k+b, k+2b, ... -- the structure of the XOR set hashes reverse-engineered "
                         "on NVIDIA Pascal/Ampere L2/L3 TLBs (Nayak'21 XOR-7, NDSS'26) and confirmed on "
-                        "RTX 3090 (regular_exp/docs/tlb_set_hashing.ko.md). Requires power-of-two sets.",
+                        "RTX 3090. Requires power-of-two sets.",
                         "0");
   option_parser_register(opp, "-gpgpu_l2_tlb_mshr_entries", OPT_UINT32,
                         &m_l2_tlb_mshr_entries,
@@ -1037,7 +1057,9 @@ void gpgpu_sim_config::reg_options(option_parser_t opp) {
                         "L2 TLB max merged clusters per in-flight VPN", "46");
   option_parser_register(opp, "-gpgpu_l2_tlb_lookup_latency", OPT_UINT32,
                         &m_l2_tlb_lookup_latency,
-                        "L2 TLB lookup latency in core cycles", "80");
+                        "L2 TLB (4KB) lookup latency in core cycles, including "
+                        "the SM<->L2 TLB round trip (no separate transfer delay "
+                        "is modeled)", "80");
   // L2 TLB (64KB) configuration options. 512 entries = 64 sets x 8-way.
   option_parser_register(opp, "-gpgpu_l2_tlb_64k_sets", OPT_UINT32,
                         &m_l2_tlb_64k_sets,
@@ -1053,12 +1075,11 @@ void gpgpu_sim_config::reg_options(option_parser_t opp) {
                         "L2 TLB (64KB) max merged clusters per in-flight VPN", "46");
   option_parser_register(opp, "-gpgpu_l2_tlb_64k_lookup_latency", OPT_UINT32,
                         &m_l2_tlb_64k_lookup_latency,
-                        "L2 TLB (64KB) lookup latency in core cycles", "80");
-  // L2 TLB (2MB) configuration options. The unsuffixed -gpgpu_l2_tlb_* options
-  // above stay 4KB-only, so existing config files keep working unchanged.
-  // Sizes follow the MCM-GPU reference config: L2 TLB is chiplet-private, 8-way,
-  // 80-cycle, 1024/512/256 entries for 4KB/64KB/2MB. 256 entries = 32 sets x 8.
-  // MSHR sizes are not in that config, so they match the 4KB TLB's (see L1 above).
+                        "L2 TLB (64KB) lookup latency in core cycles, including "
+                        "the SM<->L2 TLB round trip", "80");
+  // L2 TLB (2MB) options. Unsuffixed sets/assoc/MSHR/latency are 4KB-only; set_hash, ports,
+  // issue_width and starts_per_cycle apply to every page size.
+  // Sizes follow the MCM-GPU reference config; MSHR equals the 4KB TLB's.
   option_parser_register(opp, "-gpgpu_l2_tlb_2m_sets", OPT_UINT32,
                         &m_l2_tlb_2m_sets,
                         "L2 TLB (2MB) sets per chiplet (32 x 8-way = 256 entries)", "32");
@@ -1073,14 +1094,16 @@ void gpgpu_sim_config::reg_options(option_parser_t opp) {
                         "L2 TLB (2MB) max merged clusters per in-flight VPN", "46");
   option_parser_register(opp, "-gpgpu_l2_tlb_2m_lookup_latency", OPT_UINT32,
                         &m_l2_tlb_2m_lookup_latency,
-                        "L2 TLB (2MB) lookup latency in core cycles", "80");
+                        "L2 TLB (2MB) lookup latency in core cycles, including "
+                        "the SM<->L2 TLB round trip", "80");
 
   option_parser_register(opp, "-gpgpu_cta_scheduling_policy", OPT_UINT32,
                         &m_cta_sched_policy,
                         "CTA-to-cluster assignment policy: 0=SEQUENTIAL (default), "
-                        "1=ROUND_ROBIN_CHIPLET (interleave across chiplets per CTA), "
-                        "2=STATIC_BINDING (home chiplet = cta_id %% n_chiplets, "
-                        "timing-independent; required for the local-PTW A/B)",
+                        "1=ROUND_ROBIN_CHIPLET (chiplet-interleaved cluster order, "
+                        "lead chiplet = cycle % n_chiplets), "
+                        "2=STATIC_BINDING (home chiplet = cta_id % n_chiplets, "
+                        "independent of timing)",
                         "0");
 
   option_parser_register(opp, "-gpgpu_lasp_policy", OPT_UINT32, &m_lasp_policy,
@@ -1105,22 +1128,22 @@ void gpgpu_sim_config::reg_options(option_parser_t opp) {
                         "1");
   option_parser_register(opp, "-gpgpu_cta_chiplet_cursor", OPT_UINT32,
                         &m_cta_chiplet_cursor,
-                        "1 = per-chiplet CTA cursors (PCC): a CTA is issued as "
-                        "soon as its home chiplet has a free slot, independent "
-                        "of the other chiplets' progress (CTA->chiplet map "
-                        "unchanged; needs STATIC_BINDING or a LASP policy); "
-                        "0 = single sequential cursor (legacy)",
+                        "1 = distributed CTA scheduling (MCM-GPU, ISCA'17): each "
+                        "chiplet issues its own CTAs from a per-chiplet cursor as "
+                        "soon as it has a free slot, independent of the other "
+                        "chiplets' progress (CTA->chiplet map unchanged; needs "
+                        "STATIC_BINDING or a LASP policy); 0 = single sequential "
+                        "cursor (legacy)",
                         "0");
   option_parser_register(opp, "-gpgpu_kernel_rebind", OPT_UINT32,
                         &m_kernel_rebind,
-                        "what an SM core bound to a finished kernel does when the "
-                        "next kernel arrives. 0 = v7b hand-over (default): the core "
-                        "continues with the next kernel created by the trace "
-                        "framework, busy or not -- bit-identical to every v7b result, "
-                        "which got this behaviour from allocator address reuse; "
-                        "1 = the core drops the finished kernel and rebinds through "
-                        "select_kernel() once it is idle (the upstream comment's "
-                        "intent). Both are deterministic",
+                        "what an SM core holding a finished kernel does when a new "
+                        "kernel arrives. 0 (default): it moves to the next kernel the "
+                        "trace framework creates, busy or not, without select_kernel(), "
+                        "so its CTAs skip -gpgpu_kernel_launch_latency (upstream gets "
+                        "the same from allocator address reuse); 1: it drops the "
+                        "finished kernel and, once idle, takes one via select_kernel(), "
+                        "so every kernel waits the launch latency. Both are deterministic",
                         "0");
 }
 
@@ -1139,7 +1162,7 @@ void increment_x_then_y_then_z(dim3 &i, const dim3 &bound) {
 }
 
 void gpgpu_sim::launch(kernel_info_t *kinfo) {
-  note_issue_event();  // 39: new kernel changes the issue-scan verdict
+  note_issue_event();  // issue epoch: a new kernel can change the CTA issue scan
   unsigned kernelID = kinfo->get_uid();
   unsigned long long streamID = kinfo->get_streamID();
 
@@ -1172,10 +1195,8 @@ void gpgpu_sim::launch(kernel_info_t *kinfo) {
     abort();
   }
 
-  // LASP (S40): stamp the config-selected policy on every launched kernel.
-  // Policy 0 leaves the ctor default KERNEL_WIDE, so the issue path behaves
-  // exactly as before S40. The locality type is supplied manually via config
-  // (an oracle locality table stands in for the paper's compiler pass).
+  // LASP: set the configured CTA binding on each kernel; 0 keeps KERNEL_WIDE (no LASP).
+  // The locality type comes from config, standing in for the paper's compiler pass.
   {
     unsigned pol = m_config.get_lasp_policy();
     if (pol != 0) {
@@ -1184,14 +1205,8 @@ void gpgpu_sim::launch(kernel_info_t *kinfo) {
                      : (pol == 2) ? lasp::COL_BINDING : lasp::CHUNK_BINDING;
       unsigned cs = m_config.get_lasp_chunk_size();
       if (pol == 4) {
-        // KERNEL_PARTITION (MCM-GPU ISCA'17 Sec. 5.2: "divide the total
-        // number of CTAs in a kernel equally among the number of GPMs, and
-        // assign a group of contiguous CTAs to a GPM"). Expressed as
-        // CHUNK_BINDING with a per-kernel chunk of ceil(#CTAs / n_chiplets):
-        // (lin / chunk) then ranges over 0..n_chiplets-1, so the trailing
-        // "% n_chiplets" in the issue path and pcc_home() is the identity and
-        // every downstream consumer stays unchanged. Still a pure function of
-        // the CTA id (timing-independent), like the other bindings.
+        // KERNEL_PARTITION (MCM-GPU): equal groups of contiguous CTAs, one per chiplet.
+        // Done as CHUNK_BINDING, chunk = ceil(#CTAs / n_chiplets), so "% n_chiplets" is a no-op.
         unsigned n_chiplets = m_gpu_module ? m_gpu_module->get_num_chiplets()
                                            : m_config.get_num_chiplets();
         if (n_chiplets == 0) n_chiplets = 1;
@@ -1207,8 +1222,7 @@ void gpgpu_sim::launch(kernel_info_t *kinfo) {
     }
   }
 
-  // PCC: per-chiplet CTA cursors (docs/cta_chiplet_cursor.ko.md). Only the
-  // issue ORDER changes; the CTA->chiplet map is the same pure function.
+  // Distributed CTA scheduling: per-chiplet cursors change the issue order, not the CTA -> chiplet map.
   if (m_config.get_cta_chiplet_cursor()) {
     const bool static_bind =
         (m_config.get_cta_sched_policy() == CTA_SCHED_STATIC_BINDING);
@@ -1258,15 +1272,8 @@ bool gpgpu_sim::hit_max_cta_count() const {
 bool gpgpu_sim::kernel_more_cta_left(kernel_info_t *kernel) const {
   if (hit_max_cta_count()) return false;
 
-  // PCC: a core may still hold the pointer of a kernel that finished and was
-  // deleted, so do not dereference it unless it is still in m_running_kernels.
-  // (The original note called the legacy freed-object read harmless; it was not --
-  // it followed allocator address reuse into the next kernel. See
-  // gpgpu_sim::on_kernel_deleted().)
-  // KERNEL HAND-OVER (2026-09-13): this guard used to run only with the cursor on.
-  // It now runs always, as the second line of defence behind on_kernel_deleted()/
-  // on_kernel_created(), which already keep every core off freed kernels: a kernel
-  // that is not in m_running_kernels is never dereferenced here.
+  // A core may still hold a deleted kernel's pointer: dereference it only if it is still running.
+  // Backup check; on_kernel_deleted()/on_kernel_created() already move cores off it.
   if (kernel) {
     bool running = false;
     for (unsigned n = 0; n < m_running_kernels.size(); n++)
@@ -1279,37 +1286,9 @@ bool gpgpu_sim::kernel_more_cta_left(kernel_info_t *kernel) const {
   return false;
 }
 
-// KERNEL HAND-OVER (2026-09-13).
-// accel_sim_framework::cleanup() deletes a finished kernel while SM cores still
-// hold its pointer (shader_core_ctx::m_kernel), and issue_block2core() then
-// evaluated kernel_more_cta_left() on it: a heap use-after-free (AddressSanitizer:
-// kernel_info_t::no_more_ctas_to_run; the same code is in upstream Accel-Sim
-// v2.0.0). What that read returned was decided by the allocator. With glibc
-// tcache the next kernel is allocated at the very address just freed, so the
-// stale pointer silently became the next kernel and busy cores carried straight
-// on with it. Every v7b result was produced that way: the unmodified audit binary
-// changes its nw8M result under glibc.malloc.tcache_count=0.
-// kernel_info_t growing the PCC fields broke that address reuse, and two defects
-// surfaced in the PCC trees:
-//  (a) the stale read itself -- cursor-off runs crashed or disagreed; and
-//  (b) thread-order dependence -- when a kernel's last CTAs retire on several SMs
-//      in the same parallel pass, only the SM entering the kernel_teardown
-//      critical section last NULLs its own m_kernel. The binding issue path treats
-//      NULL ("use the selected kernel") differently from a finished pointer, so the
-//      winner of the critical section leaked into the model (even cursor-on
-//      ref_contig on nw8M gave a different result on every rerun).
-// Both are fixed here by deciding the hand-over explicitly, in serial context:
-//  -gpgpu_kernel_rebind 0 (default): remember the deleted pointer (value only,
-//      never dereferenced) and, when the framework creates the next kernel, move
-//      every core still pointing at it onto that kernel -- exactly the v7b
-//      behaviour, now defined and deterministic (LIFO, as tcache reuse was).
-//      Verified bit-identical to the v7b runs of nw8M base/lptw/ptwhop0/ref_batch4
-//      (+dumped map), gc48M base, gups4M all arms; 8t==1t.
-//  -gpgpu_kernel_rebind 1: clear those pointers now; each core rebinds through
-//      select_kernel() once it is idle.
-// Assumes the trace flow creates the next kernel before any further cycle, as
-// accel_sim_framework does (window of 1). The unconditional running-kernel guard
-// in kernel_more_cta_left() stays as a second line of defence.
+// Kernel hand-over, decided in serial code: the framework deletes a finished kernel that cores
+// may still point at. Rebind 0: keep the pointer and move those cores to the next created kernel.
+// Rebind 1: clear those pointers now; each idle core picks a kernel via select_kernel().
 void gpgpu_sim::on_kernel_deleted(const kernel_info_t *k) {
   if (!k) return;
   if (m_config.get_kernel_rebind() == 0) {
@@ -1342,8 +1321,7 @@ void gpgpu_sim::decrement_kernel_latency() {
   for (unsigned n = 0; n < m_running_kernels.size(); n++) {
     if (m_running_kernels[n] && m_running_kernels[n]->m_kernel_TB_latency) {
       m_running_kernels[n]->m_kernel_TB_latency--;
-      // 39: latency gate opening is a time-driven verdict change (the one
-      // event no queue mutation would signal) -- bump the epoch here.
+      // Issue epoch: the launch-latency gate opening can change the CTA issue scan.
       if (!m_running_kernels[n]->m_kernel_TB_latency) note_issue_event();
     }
   }
@@ -1371,20 +1349,33 @@ kernel_info_t *gpgpu_sim::select_kernel() {
     if (kernel_more_cta_left(m_running_kernels[idx]) &&
         !m_running_kernels[idx]->m_kernel_TB_latency) {
       m_last_issued_kernel = idx;
-      m_running_kernels[idx]->start_cycle = gpu_sim_cycle + gpu_tot_sim_cycle;
       // record this kernel for stat print if it is the first time this kernel
       // is selected for execution
       unsigned launch_uid = m_running_kernels[idx]->get_uid();
-      assert(std::find(m_executed_kernel_uids.begin(),
-                       m_executed_kernel_uids.end(),
-                       launch_uid) == m_executed_kernel_uids.end());
-      m_executed_kernel_uids.push_back(launch_uid);
-      m_executed_kernel_names.push_back(m_running_kernels[idx]->name());
+      // Already recorded if a handed-over core issued its first CTA (note_kernel_issued()).
+      if (std::find(m_executed_kernel_uids.begin(), m_executed_kernel_uids.end(),
+                    launch_uid) == m_executed_kernel_uids.end()) {
+        m_running_kernels[idx]->start_cycle = gpu_sim_cycle + gpu_tot_sim_cycle;
+        m_executed_kernel_uids.push_back(launch_uid);
+        m_executed_kernel_names.push_back(m_running_kernels[idx]->name());
+      }
 
       return m_running_kernels[idx];
     }
   }
   return NULL;
+}
+
+// Executed-kernel list (stat header) at a kernel's first CTA. select_kernel() also adds it, but under
+// -gpgpu_kernel_rebind 0 a kernel can get every CTA on handed-over cores, never through select_kernel().
+void gpgpu_sim::note_kernel_issued(kernel_info_t *kernel) {
+  const unsigned uid = kernel->get_uid();
+  if (std::find(m_executed_kernel_uids.begin(), m_executed_kernel_uids.end(), uid) !=
+      m_executed_kernel_uids.end())
+    return;
+  kernel->start_cycle = gpu_sim_cycle + gpu_tot_sim_cycle;
+  m_executed_kernel_uids.push_back(uid);
+  m_executed_kernel_names.push_back(kernel->name());
 }
 
 unsigned gpgpu_sim::finished_kernel() {
@@ -1398,7 +1389,7 @@ unsigned gpgpu_sim::finished_kernel() {
 }
 
 void gpgpu_sim::set_kernel_done(kernel_info_t *kernel) {
-  if (kernel->pcc_on()) {   // PCC: per-chiplet issue summary (G1/G3 evidence)
+  if (kernel->pcc_on()) {   // PCC: per-chiplet issue summary ([PCC] rows)
     for (unsigned c = 0; c < kernel->pcc_n(); c++)
       printf("[PCC] kernel uid=%u chiplet=%u issued=%u last_issue_cycle=%llu\n",
              kernel->get_uid(), c, kernel->pcc_issued(c),
@@ -1494,10 +1485,8 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
 
   gpu_kernel_time.clear();
 
-  // MCM: build the chiplet topology wrapper before the memory system below, so
-  // icnt_configure_chiplets() can read its owner maps. Note bind_global_arrays()
-  // cannot run here: m_cluster is only created by createSIMTCluster() in the
-  // exec/sst/trace subclass constructor, which is where the bind happens.
+  // Build the chiplet topology first: icnt_configure_chiplets() below reads its owner maps.
+  // The exec/SST subclass constructors call bind_global_arrays(); trace mode never reads those arrays.
   m_gpu_module = NULL;
 
   m_n_chiplets = m_config.get_num_chiplets();
@@ -1512,8 +1501,7 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
     m_gpu_module->init();
     m_gpu_module->set_stats_file(stdout);
 
-    // Prints the SM/partition-to-chiplet split; doubles as the visual check
-    // that num_chiplets==1 reproduces the monolithic layout.
+    // Print the SM / memory-partition to chiplet split.
     m_gpu_module->dump_partitioning();
   }
 
@@ -1537,7 +1525,7 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
     }
 
     icnt_wrapper_init();
-    // Phase 1: split the local crossbar per chiplet — inject owner maps first.
+    // Split the local crossbar per chiplet: pass the owner maps before icnt_create().
     icnt_configure_chiplets(m_n_chiplets,
                             m_gpu_module->get_cluster_to_chiplet_vec(),       // size n_simt_clusters
                             m_gpu_module->get_mem_sub_partition_to_chiplet_vec()); // size n_mem_sub_partition
@@ -1553,9 +1541,7 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
   m_last_issued_kernel = 0;
   m_last_cluster_issue = m_shader_config->n_simt_clusters -
                          1;  // this causes first launch to use simt cluster 0
-  // Create scheduler from config.  SEQUENTIAL (0) reproduces original behavior;
-  // ROUND_ROBIN_CHIPLET (1) distributes consecutive CTAs across chiplets so
-  // first-touch page placement benefits each chiplet equally. (P3-5)
+  // CTA scheduler from -gpgpu_cta_scheduling_policy (0 = upstream order).
   m_cta_scheduler = cta_scheduler_t::create(
       static_cast<cta_scheduling_policy_t>(m_config.m_cta_sched_policy));
   printf("[CTA_SCHED] policy=%s\n", m_cta_scheduler->policy_name());
@@ -1702,30 +1688,12 @@ bool sst_gpgpu_sim::active() {
 }
 
 void gpgpu_sim::init() {
-  // P3: reject configurations that break the parallel CORE / DRAM phases.
-  // Each option below opens a write path crossing the chiplet or partition
-  // boundary that those loops assume is private:
-  //   -gpgpu_tlb_ideal 1          -> gpu_page_table, one table for the whole GPU (W3)
-  //   simple_dram_model           -> simple_dram_model_cycle() was never audited
-  //                                  for partition locality (T-DRAM covers dram_cycle only)
-  // Compiled in only for a parallel build, so serial runs -- which legitimately
-  // use -gpgpu_tlb_ideal for the translation-cost baseline -- are unaffected.
-  // abort() rather than assert(): a future -DNDEBUG must not silently drop it.
+  // Parallel builds: reject configs that write across chiplets or partitions in the parallel loops.
+  // abort(), not assert(), so NDEBUG cannot drop the check.
 #ifdef _OPENMP
   {
-    // Empirical thread ceiling, raised to 16 after G6. The race behind the
-    // 8/16-thread divergences was the non-atomic warp_inst uid counter
-    // (warp_inst_sm_next_uid; a stale increment could roll it backwards, so a
-    // core's later instruction could get a SMALLER uid than one in flight, and
-    // register_set::get_ready() picked a different "oldest"). With G6 in
-    // (atomic capture, abstract_hardware_model.cc), 1/2/4/8/16 threads all
-    // reproduce the sequential digest exactly: 2dconv 16t 13/13 across two
-    // harnesses and three load regimes, and BFS synth_32M (5 kernel teardowns,
-    // frozen placement) 8t/16t MATCH. Implementation log section 19-20.
-    // Above 16 remains unverified -- not "unsafe", just never run -- so keep
-    // refusing rather than warning: a silently wrong result is the exact
-    // failure mode this effort exists to prevent. Set
-    // ACCELSIM_ALLOW_UNVERIFIED_THREADS to override when investigating.
+    // Refuse more than 16 threads (untested; a failure would be a silently wrong result).
+    // ACCELSIM_ALLOW_UNVERIFIED_THREADS overrides.
     const int omp_max = omp_get_max_threads();
     if (omp_max > 16 && getenv("ACCELSIM_ALLOW_UNVERIFIED_THREADS") == NULL) {
       fprintf(stderr,
@@ -1743,8 +1711,14 @@ void gpgpu_sim::init() {
       abort();
     }
     const char *unsafe_opt = NULL;
-    if (m_shader_config->gpgpu_tlb_ideal)
-      unsafe_opt = "-gpgpu_tlb_ideal 1 (W3: GPU-wide gpu_page_table)";
+    // The ideal TLB maps pages on first access (shared write) unless a placement map is loaded.
+    const char *placement = m_config.get_gmmu_placement_load();
+    const bool placement_preloaded = placement && placement[0] != '\0';
+    if (m_shader_config->gpgpu_tlb_ideal && !placement_preloaded && omp_max > 1)
+      unsafe_opt = "-gpgpu_tlb_ideal 1 with more than one thread but without "
+                   "-gmmu_placement_load (first access maps pages into the "
+                   "GPU-wide page table; load a placement map or use "
+                   "OMP_NUM_THREADS=1)";
     else if (m_memory_config->simple_dram_model)
       unsafe_opt = "simple_dram_model (not audited for partition locality)";
     if (unsafe_opt) {
@@ -1761,38 +1735,12 @@ void gpgpu_sim::init() {
   }
 #endif
 
-  // A1/A2 (design doc sections 21-22): any run that DECIDES placement itself
-  // -- i.e. does not load a frozen map -- defers the first-touch owner
-  // inserts out of the parallel CORE phase and commits them at a canonical
-  // sequential point each cycle (gpu-module.h). That covers both reference
-  // runs (placement dump, no load -- stage 1) and ordinary uncontrolled cold
-  // runs (neither dump nor load -- stage 2): both fire record_first_touch
-  // from a real first touch, and both need the insert kept out of the
-  // parallel phase. A loaded/frozen run never inserts (record_first_touch's
-  // find() always succeeds), so leaving it off the deferred path is harmless
-  // and keeps that path's behavior untouched by construction.
-  // Gated by RUN MODE, never by thread count -- the resulting map/statistics
-  // must not be a function of OMP_NUM_THREADS. Not OpenMP-conditional either:
-  // a serial run uses the same deferred semantics so every thread count
-  // produces the same result (verified stage 1: A2/A3; stage 2: B3/B4).
-  {
-    const char *pl = m_config.get_gmmu_placement_load();
-    // PCC: a loaded map was produced under the legacy CTA->SM placement.
-    // Local-memory VAs are a function of the hardware thread slot
-    // (translate_local_memaddr: m_sid/tid), so a different placement touches
-    // pages the map never saw. The legacy load path inserts those immediately
-    // from the parallel pass B and trips the mutation guard (FATAL). With the
-    // per-chiplet cursor on, route them through the same deferred first-touch
-    // commit the reference run uses (serial point after pass C; the walker
-    // sees the owner next cycle). Pages already in the map are unaffected:
-    // record_first_touch() finds them and inserts nothing.
-    const bool deferrable_mode =
-        !(pl && pl[0] != '\0') || (m_config.get_cta_chiplet_cursor() != 0);
-    if (deferrable_mode && m_gpu_module && m_gpu_module->get_page_table() &&
-        !m_gpu_module->get_page_table()->deferred_first_touch_enabled())
-      m_gpu_module->get_page_table()->enable_deferred_first_touch(
-          m_gpu_module->get_num_chiplets());
-  }
+  // Defer first-touch owner inserts out of the parallel passes; they are committed once per cycle
+  // in chiplet order (as 1 thread would) and read only in later cycles, so any thread count agrees.
+  if (m_gpu_module && m_gpu_module->get_page_table() &&
+      !m_gpu_module->get_page_table()->deferred_first_touch_enabled())
+    m_gpu_module->get_page_table()->enable_deferred_first_touch(
+        m_gpu_module->get_num_chiplets());
 
   // run a CUDA grid on the GPU microarchitecture simulator
   gpu_sim_cycle = 0;
@@ -1881,20 +1829,12 @@ void gpgpu_sim::print_stats(unsigned long long streamID) {
         "----------\n");
   }
   
-  // Print per-chiplet GMMU statistics: PTW counts, PWQ delay, local/remote
-  // steps, and PWC hit rate. These are the primary MCM-GPU evaluation metrics.
+  // Per-chiplet GMMU statistics: PTW counts, PWQ delay, local/remote steps, PWC hit rate.
   if (m_gpu_module) {
     printf("----------------------------GMMU-STATS-"
            "---------------------------------------\n");
-    // Which of the three experiment runs this is. Every field is read back from
-    // what the run actually DID, never from a config label, so a mis-specified
-    // config reports the wrong mode instead of a mislabelled right one.
-    //
-    // `pinned` is the decisive one. A -gmmu_placement_load whose file is missing
-    // only warns and falls back to first touch, which would silently turn a
-    // measurement run into an uncontrolled one while still emitting plausible
-    // stats. Reading placement_frozen() back makes that land as
-    // INVALID_map_not_loaded.
+    // [RUN_MODE]: run type from what the run actually did, not from config labels.
+    // pinned is read back, so a placement file that failed to load shows as INVALID_map_not_loaded.
     {
       const char* pd = m_config.get_gmmu_placement_dump();
       const char* pl = m_config.get_gmmu_placement_load();
@@ -1922,8 +1862,7 @@ void gpgpu_sim::print_stats(unsigned long long streamID) {
              dumping ? pd : (loading ? pl : ""),
              m_cta_scheduler ? m_cta_scheduler->policy_name() : "?");
     }
-    // Page-table footprint: baseline holds one copy, a replicated (local-PTW)
-    // page table holds one per chiplet.
+    // Page-table footprint; with local PTW it counts one copy per chiplet.
     if (m_gpu_module->get_page_table()) {
       size_t nodes = m_gpu_module->get_page_table()->pt_node_count();
       size_t pages = m_gpu_module->get_page_table()->pt_page_count();
@@ -1931,21 +1870,13 @@ void gpgpu_sim::print_stats(unsigned long long streamID) {
              nodes, pages, (double)(pages * GPU_PAGE_SIZE) / (1024.0 * 1024.0),
              m_gpu_module->local_ptw_enabled() ? 1 : 0);
     }
-    // P5-2: cumulative count of page-table mutations (owner-map inserts, node
-    // creation, leaf installs), INCLUDING those made while building or
-    // premapping the table before any kernel ran -- so it is non-zero in a
-    // pinned run as well (577,356 on BC 77zf). What must be zero is the delta
-    // across each parallel CORE phase; gpgpu_sim::cycle() enforces that with an
-    // abort, so a run that reaches this line had none.
+    // Total page-table changes, including build and premap, so nonzero even when pinned.
+    // cycle() aborts on any change inside the parallel passes.
     printf("[PAGE_TABLE] mutations=%llu  (cumulative incl. build/premap; "
            "parallel-phase delta guarded to 0)\n",
            m_gpu_module->get_page_table()->mutation_count());
-    // A1: deferred first-touch bookkeeping. Enabled in reference mode AND in
-    // PCC (+load) runs, where local-memory pages the map never saw must get a
-    // deterministic owner (see deferrable_mode). dedup counts buffered entries
-    // that inserted nothing at commit; new_pages = commits - dedup is the number
-    // of pages this run placed itself. In a pinned run it is 0, so
-    // commits == dedup there is expected, not a defect.
+    // [REF_DEFER]: deferred first-touch commits; dedup = commits that inserted nothing,
+    // new_pages = pages this run placed itself (with a loaded map, pages missing from it).
     if (m_gpu_module->get_page_table()->deferred_first_touch_enabled()) {
       const unsigned long long c = m_gpu_module->get_page_table()->deferred_ft_commits();
       const unsigned long long d = m_gpu_module->get_page_table()->deferred_ft_dedups();
@@ -1961,9 +1892,7 @@ void gpgpu_sim::print_stats(unsigned long long streamID) {
     for (unsigned c = 0; c < m_gpu_module->get_num_chiplets(); c++) {
       m_gpu_module->get_gmmu(c)->print_stats(stdout);
     }
-    // ST-3: under a fixed page-size policy (0/1/2) the other two TLB instances
-    // never see a request, yet printed 12 all-zero lines per SM per dump. Skip
-    // them. uniform_page_shift() is 0 for a mixed policy (3-5): print all three.
+    // With one page size, skip the two unused TLBs; uniform_page_shift() is 0 for mixed policies.
     const unsigned ups = m_gpu_module->uniform_page_shift();
     auto want_kind = [ups](unsigned shift) { return ups == 0 || ups == shift; };
     // L1 TLB statistics per SM, one TLB per page size
@@ -1974,22 +1903,19 @@ void gpgpu_sim::print_stats(unsigned long long streamID) {
             if (core->get_l1_tlb()     && want_kind(GPU_PAGE_SHIFT)) core->get_l1_tlb()->print_stats(stdout);
             if (core->get_l1_tlb_64k() && want_kind(GPU_64K_SHIFT))  core->get_l1_tlb_64k()->print_stats(stdout);
             if (core->get_l1_tlb_2m()  && want_kind(GPU_HUGE_SHIFT)) core->get_l1_tlb_2m()->print_stats(stdout);
-            core->xlat_print_stats(stdout);   // XLATLAT: SM-level view
+            core->xlat_print_stats(stdout);   // [LDST_XLATLAT] row, per SM
         }
     }
-    xlatsum_gpu_print(stdout);  // 34: GPU-wide XLATSUM rows (additive tag)
+    xlatsum_gpu_print(stdout);  // GPU-wide [XLATSUM] summary rows
     // L2 TLB statistics per chiplet, one TLB per page size
     for (unsigned c = 0; c < m_gpu_module->get_num_chiplets(); c++) {
       if (want_kind(GPU_PAGE_SHIFT)) m_gpu_module->get_chiplet(c)->get_l2_tlb_4k()->print_stats(stdout);
       if (want_kind(GPU_64K_SHIFT))  m_gpu_module->get_chiplet(c)->get_l2_tlb_64k()->print_stats(stdout);
       if (want_kind(GPU_HUGE_SHIFT)) m_gpu_module->get_chiplet(c)->get_l2_tlb_2m()->print_stats(stdout);
     }
-    // (temp) diagnostics report -- P-5: only under ACCELSIM_DIAG.
+    // Diagnostic rows ([ACCEPT], [POPGATE], [NORMREP], [NORMREP-MTX]): only under ACCELSIM_DIAG.
     if (g_accelsim_diag) {
-    // ACCEPT_ (temp): per-chiplet mem-accept backpressure + DRAM utilization.
-    // mem_full% high => convergence backpressure at accept path. If DRAM_util also
-    // high => real DRAM saturation; if DRAM_util low => throttle upstream of DRAM
-    // (L2 processing / icnt_L2 queue), not DRAM-BW bound.
+    // [ACCEPT]: per-chiplet share of L2 visits with a full input, and DRAM utilization.
     {
       unsigned nc = m_gpu_module->get_num_chiplets(); if (nc > 8) nc = 8;
       // aggregate per-chiplet DRAM bwutil over that chiplet's memory channels
@@ -2008,10 +1934,7 @@ void gpgpu_sim::print_stats(unsigned long long streamID) {
                dram_ch_cnt[c] ? 100.0 * dram_util_sum[c] / dram_ch_cnt[c] : 0.0);
       }
     }
-    // POPGATE_ (temp): per-chiplet repr-cluster icnt-pop gating. Written
-    // pre-Fix-A; with the endpoint round-robin, PTW replies spread across all
-    // clusters of the chiplet, so this row now samples only the repr cluster's
-    // share (a lower bound, not the whole chiplet's PTW gating).
+    // [POPGATE]: icnt-pop gating of each chiplet's first cluster only (a lower bound).
     for (unsigned c = 0; c < m_gpu_module->get_num_chiplets(); c++) {
       unsigned repr = m_gpu_module->get_chiplet(c)->get_cluster_global_begin();
       unsigned long long icnt_cycles = 0, gated = 0;
@@ -2021,9 +1944,7 @@ void gpgpu_sim::print_stats(unsigned long long streamID) {
              repr, c, icnt_cycles, gated,
              icnt_cycles ? 100.0 * gated / icnt_cycles : 0.0);
     }
-    // FUNNEL_ (temp): normal (non-PTW) reply xbar latency by SOURCE mem chiplet.
-    // Compare transit_avg here vs PTW [FUNNEL] reply-split transit_avg: if similar,
-    // the delay is general chiplet-source xbar congestion (placement), not PTW-specific.
+    // [NORMREP]: non-PTW reply xbar latency by source memory chiplet (compare with PTW [FUNNEL]).
     {
       extern unsigned long long g_normrep_transit_sum[8], g_normrep_lasthop_sum[8],
           g_normrep_cnt[8];
@@ -2033,7 +1954,7 @@ void gpgpu_sim::print_stats(unsigned long long streamID) {
                "[n=%llu]\n", c, (double)g_normrep_transit_sum[c] / n,
                (double)g_normrep_lasthop_sum[c] / n, g_normrep_cnt[c]);
       }
-      // FUNNEL_ (temp): normal-reply transit_avg matrix [src mem chiplet][dst cluster chiplet].
+      // [NORMREP-MTX]: normal-reply transit_avg matrix [src mem chiplet][dst cluster chiplet].
       extern unsigned long long g_normrep_mtx_transit[8][8], g_normrep_mtx_cnt[8][8];
       unsigned nc = m_gpu_module->get_num_chiplets(); if (nc > 8) nc = 8;
       printf("[NORMREP-MTX] transit_avg  rows=src_mem_chiplet  cols=dst_cluster_chiplet\n");
@@ -2047,15 +1968,12 @@ void gpgpu_sim::print_stats(unsigned long long streamID) {
         printf("\n");
       }
     }
-    }  // g_accelsim_diag (P-5): ACCEPT/POPGATE/NORMREP rows
+    }  // g_accelsim_diag: ACCEPT/POPGATE/NORMREP rows
     printf("----------------------------END-of-GMMU-STATS-"
            "----------------------------------\n");
   }
 
-  // PHASE_TIMING: cumulative-so-far wall-clock share of each cycle() domain block.
-  // Printed here (not only at process exit) so a run that later crashes/deadlocks
-  // still leaves at least one snapshot. stderr, own tag, own stream -- never part
-  // of the stdout digest. See docs/parallelization_overview.ko.md Sec 8 item 2.
+  // PHASE_TIMING totals so far, to stderr, at every stats dump (a crashed run still keeps one).
   if (g_phase_timing_on) {
     const unsigned long long total_ns =
         g_phase_timers.dram_ns + g_phase_timers.l2gmmu_ns + g_phase_timers.icnt_ns +
@@ -2077,7 +1995,7 @@ void gpgpu_sim::print_stats(unsigned long long streamID) {
         g_phase_timers.phase_a_ns * pct, g_phase_timers.phase_a_calls,
         g_phase_timers.phase_b_ns * pct, g_phase_timers.phase_b_calls,
         g_phase_timers.phase_c_ns * pct, g_phase_timers.phase_c_calls);
-    if (g_phase_timers.phase_b_calls) {  // D1: phase B per chiplet group (stderr only)
+    if (g_phase_timers.phase_b_calls) {  // [PHASE_TIMING_B]: phase B per chiplet group
       fprintf(stderr, "[PHASE_TIMING_B] chip_s=");
       for (unsigned c = 0; c < 8; c++)
         if (g_phase_timers.phase_b_chip_ns[c])
@@ -2097,7 +2015,7 @@ void gpgpu_sim::print_stats(unsigned long long streamID) {
         fprintf(stderr, "}");
       }
       fprintf(stderr, "\n");
-      // D1b
+      // per-cycle maximum over groups and log2(us) histograms
       fprintf(stderr, "[PHASE_TIMING_B2] cyclemax=%.3fs argmax=",
               (double)g_phase_timers.phase_b_cyclemax_ns / 1.0e9);
       for (unsigned c = 0; c < 8; c++)
@@ -2113,8 +2031,7 @@ void gpgpu_sim::print_stats(unsigned long long streamID) {
           fprintf(stderr, "%s%u:%llu", b ? "," : "", b, g_phase_timers.phase_b_body_hist[b]);
       fprintf(stderr, "\n");
     }
-    // 31: coverage accounting. cycle_ns is the whole cycle() body; buckets
-    // above are its parts. "uncov" is what cycle() spends outside every bucket.
+    // Coverage: "uncov" is cycle() time outside every bucket above.
     const unsigned long long bucket_sum = total_ns +
         g_phase_timers.cluster_icnt_ns + g_phase_timers.tail_ns;
     fprintf(stderr,
@@ -2129,11 +2046,8 @@ void gpgpu_sim::print_stats(unsigned long long streamID) {
         g_phase_timers.tail_issue_ns / 1.0e9, g_phase_timers.tail_occ_ns / 1.0e9,
         (g_phase_timers.tail_ns - g_phase_timers.tail_issue_ns -
          g_phase_timers.tail_occ_ns) / 1.0e9);
-    // §25 pre-measurement: icnt split into local-xbar-Advance() (candidate for
-    // chiplet-width parallel) vs handoff/handoff_ring (must stay sequential --
-    // genuine chiplet-to-chiplet exchange). Percentages are of icnt_ns itself,
-    // not of total, so they read directly as "how much of ICNT would move".
-    // H3: include the pop loop so the three components sum to the icnt phase.
+    // ICNT_POP: the three parts of the icnt phase.
+    // ICNT_SPLIT: icnt_transfer() as parallel Advance() vs. serial handoff, in % of icnt_transfer().
     fprintf(stderr,
         "[PHASE_TIMING_ICNT_POP] mem2icnt_pop=%.3fs(n=%llu) xbar_advance=%.3fs "
         "handoff=%.3fs  sum=%.3fs  icnt_phase=%.3fs\n",
@@ -2185,10 +2099,7 @@ void gpgpu_sim::deadlock_check() {
       if (busy)
         printf("GPGPU-Sim uArch DEADLOCK:  memory partition %u busy\n", i);
     }
-    // XLATDBG: dump WHAT is stuck, not just that something is. m_request_tracker
-    // holds every request that entered the sub-partition and has not left, and
-    // mem_fetch::print reports its status plus the cycle that status last
-    // changed -- i.e. exactly where it stopped moving.
+    // Deadlock dump (XLATDBG_*): each stuck request with its status and the cycle it last changed.
     {
       const unsigned subs = m_memory_config->m_n_sub_partition_per_memory_channel;
       printf("XLATDBG_DEADLOCK: ===== stuck memory requests =====\n");
@@ -2208,9 +2119,6 @@ void gpgpu_sim::deadlock_check() {
           m_gpu_module->get_gmmu(c)->xlatdbg_dump_pending(stdout);
           m_gpu_module->get_chiplet(c)->get_l2_tlb_4k()->xlatdbg_dump(stdout, c, "4k");
         }
-      if (m_gpu_module)
-        printf("XLATDBG_DEADLOCK: pwq_rollback(MISS rolled back, gate lost)=%llu\n",
-               m_gpu_module->m_xlatdbg_pwq_rollback);
       printf("XLATDBG_DEADLOCK: ===== end =====\n");
       fflush(stdout);
     }
@@ -2555,7 +2463,7 @@ void gpgpu_sim::gpu_print_stat(unsigned long long streamID) {
     printf("=========================================\n");
   }
 
-  // PMM stats: free_pages equals init count until Phase 3 (gpu_malloc hook) is added.(new)
+  // PMM stats: physical frames still free in each chiplet's pool.
   if (m_gpu_module) {
     printf("\n========= PMM Statistics =========\n");
     for (unsigned c = 0; c < m_gpu_module->get_num_chiplets(); c++)
@@ -2584,32 +2492,32 @@ void shader_core_ctx::mem_instruction_stats(const warp_inst_t &inst) {
     case reg_space:
       break;
     case shared_space:
-      {  // W5: shared scalar stat, incremented from every SM
+      {  // shared statistic, updated by every SM in parallel: atomic
       #pragma omp atomic
         m_stats->gpgpu_n_shmem_insn += active_count;
       }
       break;
     case sstarr_space:
-      {  // W5: shared scalar stat, incremented from every SM
+      {  // shared statistic, updated by every SM in parallel: atomic
       #pragma omp atomic
         m_stats->gpgpu_n_sstarr_insn += active_count;
       }
       break;
     case const_space:
-      {  // W5: shared scalar stat, incremented from every SM
+      {  // shared statistic, updated by every SM in parallel: atomic
       #pragma omp atomic
         m_stats->gpgpu_n_const_insn += active_count;
       }
       break;
     case param_space_kernel:
     case param_space_local:
-      {  // W5: shared scalar stat, incremented from every SM
+      {  // shared statistic, updated by every SM in parallel: atomic
       #pragma omp atomic
         m_stats->gpgpu_n_param_insn += active_count;
       }
       break;
     case tex_space:
-      {  // W5: shared scalar stat, incremented from every SM
+      {  // shared statistic, updated by every SM in parallel: atomic
       #pragma omp atomic
         m_stats->gpgpu_n_tex_insn += active_count;
       }
@@ -2617,12 +2525,12 @@ void shader_core_ctx::mem_instruction_stats(const warp_inst_t &inst) {
     case global_space:
     case local_space:
       if (inst.is_store())
-        {  // W5: shared scalar stat, incremented from every SM
+        {  // shared statistic, updated by every SM in parallel: atomic
         #pragma omp atomic
           m_stats->gpgpu_n_store_insn += active_count;
         }
       else
-        {  // W5: shared scalar stat, incremented from every SM
+        {  // shared statistic, updated by every SM in parallel: atomic
         #pragma omp atomic
           m_stats->gpgpu_n_load_insn += active_count;
         }
@@ -2638,6 +2546,8 @@ bool shader_core_ctx::can_issue_1block(kernel_info_t &kernel) {
 
     return occupy_shader_resource_1block(kernel, false);
   } else {
+    // One kernel per SM: the distributed and strict-affinity paths may offer another kernel's CTA.
+    if (m_n_active_cta > 0 && m_cta_kernel != &kernel) return false;
     return (get_n_active_cta() < m_config->max_cta(kernel));
   }
 }
@@ -2762,6 +2672,8 @@ void shader_core_ctx::issue_block2core(kernel_info_t &kernel) {
     assert(occupy_shader_resource_1block(kernel, true));
 
   kernel.inc_running();
+  m_cta_kernel = &kernel;
+  m_gpu->note_kernel_issued(&kernel);
 
   // find a free CTA context
   unsigned free_cta_hw_id = (unsigned)-1;
@@ -2861,14 +2773,11 @@ void shader_core_ctx::issue_block2core(kernel_info_t &kernel) {
   init_warps(free_cta_hw_id, start_thread, end_thread, ctaid, cta_size, kernel);
   m_n_active_cta++;
   if (accelsim_log_cta()) {
-    // Derive x,y,z from the linear id: the trace-driven thread init has
-    // already advanced the dim3 cursor to the NEXT CTA by this point.
+    // x,y,z from the linear id: the dim3 cursor already points at the next CTA.
     dim3 g = kernel.get_grid_dim();
     dim3 xyz;
     xyz.x = ctaid % g.x; xyz.y = (ctaid / g.x) % g.y; xyz.z = ctaid / (g.x * g.y);
-    // SMELL-6 fix: use the authoritative owner map instead of re-deriving the
-    // chiplet by integer division (wrong whenever split_range() hands the
-    // remainder clusters to the lower chiplets).
+    // Use the owner map: integer division is wrong when clusters do not split evenly.
     unsigned chiplet = m_gpu->get_gpu_module()
                            ? m_gpu->get_gpu_module()->cluster_to_chiplet(m_tpc)
                            : 0;
@@ -2922,9 +2831,7 @@ int gpgpu_sim::next_clock_domain(void) {
   return mask;
 }
 
-// ============================================================
-// CTA Scheduler implementations
-// ============================================================
+// CTA scheduler implementations
 
 cta_scheduler_t* cta_scheduler_t::create(cta_scheduling_policy_t policy) {
   switch (policy) {
@@ -2941,9 +2848,10 @@ cta_scheduler_t* cta_scheduler_t::create(cta_scheduling_policy_t policy) {
   }
 }
 
-// Visits clusters starting one past last_issued, identical to the original loop.
+// Upstream order: clusters from one past last_issued, wrapping around.
 std::vector<unsigned> SequentialScheduler::cluster_order(
-    unsigned n_clusters, unsigned /*n_chiplets*/, unsigned last_issued) {
+    unsigned n_clusters, unsigned /*n_chiplets*/, unsigned last_issued,
+    unsigned long long /*cycle*/) {
   std::vector<unsigned> order;
   order.reserve(n_clusters);
   for (unsigned i = 0; i < n_clusters; i++)
@@ -2951,59 +2859,42 @@ std::vector<unsigned> SequentialScheduler::cluster_order(
   return order;
 }
 
-// Interleaves cluster visits across chiplets: for each intra-chiplet slot,
-// all chiplets are visited before the slot advances.  m_start_chiplet rotates
-// each call so no chiplet is always visited first.
+// Chiplet-interleaved visit order. The lead chiplet comes from the cycle, not the call
+// count, so skipped scans do not change it.
 std::vector<unsigned> RoundRobinChipletScheduler::cluster_order(
-    unsigned n_clusters, unsigned n_chiplets, unsigned /*last_issued*/) {
+    unsigned n_clusters, unsigned n_chiplets, unsigned /*last_issued*/,
+    unsigned long long cycle) {
   assert(n_chiplets > 0 && n_clusters % n_chiplets == 0);
   unsigned clusters_per_chiplet = n_clusters / n_chiplets;
+  const unsigned start = (unsigned)(cycle % n_chiplets);
 
   std::vector<unsigned> order;
   order.reserve(n_clusters);
 
   for (unsigned slot = 0; slot < clusters_per_chiplet; slot++) {
     for (unsigned k = 0; k < n_chiplets; k++) {
-      unsigned chip = (m_start_chiplet + k) % n_chiplets;
+      unsigned chip = (start + k) % n_chiplets;
       order.push_back(chip * clusters_per_chiplet + slot);
     }
   }
 
-  // Rotate start chiplet so the lead alternates across rounds.
-  m_start_chiplet = (m_start_chiplet + 1) % n_chiplets;
   return order;
 }
-// ============================================================
 
-// The pre-MCM issue_block2core() body survives as SequentialScheduler above
-// (policy 0): identical visit order, so config files without
-// -gpgpu_cta_scheduling_policy behave exactly as upstream.
+// Policy 0 (SequentialScheduler) keeps the upstream visit order.
 void gpgpu_sim::issue_block2core() {
-  // 32: when no kernel has CTAs left (kernel drain -- most BFS cycles), the
-  // whole scan below is side-effect free: select_kernel()'s mutations are all
-  // gated on a kernel with remaining CTAs, set_kernel() never fires (k stays
-  // NULL), and the issue pass never runs (selected_kernel NULL). Skipping it
-  // replaces 256 clusters x 128-slot select_kernel scans per cycle with this
-  // single 128-slot check. Measured before the change: 225s of a 407s wall
-  // (callgrind: select_kernel 18.6%, kernel_more_cta_left 10.3%).
+  // No CTAs left: the scan below would change nothing, so skip it.
   if (!get_more_cta_left()) return;
-  // 39: skip the 256-cluster scan when nothing that can change its verdict
-  // happened since a scan that issued nothing. Events: CTA exit (slot freed),
-  // kernel launch, TB_latency hitting 0. A scan that DID issue re-arms itself
-  // (occupancy moved). The one state-mutating non-issuing path (idle core
-  // adopting a kernel via select_kernel) is a fixed point: re-running the scan
-  // on the adopted state still issues nothing, so skipping stays exact.
+  // Skip the scan if nothing changed since a scan that issued nothing (CTA exit, kernel launch
+  // and TB_latency reaching 0 bump the epoch). Exact: a repeat would issue nothing either.
   if (m_issue_seen_epoch == m_issue_event_epoch) return;
   unsigned n_clusters = m_shader_config->n_simt_clusters;
-  // Falls back to 1 if gpu_module is not yet initialized; this makes
-  // ROUND_ROBIN_CHIPLET degenerate to SEQUENTIAL without crashing.
   unsigned n_chiplets = m_gpu_module ? m_gpu_module->get_num_chiplets() : 1;
 
-  // Delegate cluster visit ordering to the configured scheduling policy.
-  // SEQUENTIAL          : clusters 0..N-1 with last_issued offset (original).
-  // ROUND_ROBIN_CHIPLET : chiplet-interleaved order for first-touch locality.
+  // Cluster visit order comes from the configured CTA scheduling policy.
   std::vector<unsigned> order =
-      m_cta_scheduler->cluster_order(n_clusters, n_chiplets, m_last_cluster_issue);
+      m_cta_scheduler->cluster_order(n_clusters, n_chiplets, m_last_cluster_issue,
+                                     gpu_sim_cycle + gpu_tot_sim_cycle);
 
   unsigned issued_total = 0;
   for (unsigned idx : order) {
@@ -3014,17 +2905,15 @@ void gpgpu_sim::issue_block2core() {
       issued_total += num;
     }
   }
-  // 39: issued -> occupancy moved, scan again next cycle; barren scan -> sleep
-  // until the next event bumps the epoch.
+  // A scan that issued nothing sleeps until the next issue event.
   if (issued_total == 0) m_issue_seen_epoch = m_issue_event_epoch;
 }
 
 unsigned long long g_single_step =
     0;  // set this in gdb to single step the pipeline
 
-// H3-3: 미러 연결. 클러스터(trace_gpgpu_sim 생성자)와 인터커넥트 라우터(icnt_create)가 모두
-// 만들어진 뒤여야 하므로 첫 cycle() 에서 한 번 한다. 모든 바이트를 1 로 시작해 첫 사이클은
-// 전부 방문한다 -- 연결 이전에 쌓인 상태가 있어도 불변식(0 => 할 일 없음)이 성립한다.
+// Wires the busy flags on the first cycle(), once clusters and ICNT routers exist.
+// All flags start at 1, so work queued before wiring is still visited.
 void gpgpu_sim::wire_icnt_mirrors() {
   m_icnt_mirrors_wired = true;
   const unsigned n_sub = m_memory_config->m_n_mem_sub_partition;
@@ -3034,19 +2923,17 @@ void gpgpu_sim::wire_icnt_mirrors() {
 
   const unsigned n_cl = m_shader_config->n_simt_clusters;
   m_cluster_icnt_busy.assign(n_cl, 1);
-  // SST 모드는 응답이 다른 경로(sst 클러스터의 별도 FIFO)로 들어오고, intersim2 에는 출력
-  // 버퍼 훅이 없다. 두 경우 모두 건너뛰기를 끄고 원래대로 전부 방문한다.
+  // No skipping under SST (own reply FIFO) or intersim2 (no output-buffer hook).
   m_cluster_icnt_mirror_ok = icnt_out_mirror_supported() && !m_memory_config->SST_mode;
   if (m_cluster_icnt_mirror_ok) {
     for (unsigned i = 0; i < n_cl; i++) {
-      assert(m_cluster[i]->get_cluster_id() == i);   // icnt_pop(m_cluster_id) 와 같은 장치 번호
+      assert(m_cluster[i]->get_cluster_id() == i);   // same device number as icnt_pop(m_cluster_id)
       m_cluster[i]->set_icnt_busy_mirror(&m_cluster_icnt_busy[i]);
       icnt_set_out_mirror(i, &m_cluster_icnt_busy[i]);
     }
   }
 
-  // L2 loop of block 4: skip idle sub-partitions only when the ICNT can flag its output
-  // buffers (local xbar) and no option that works on every visit (power, visualizer, SST) is on.
+  // L2 loop skipping needs the local xbar and no per-visit work (power, visualizer, SST).
   m_l2loop_busy.assign(n_sub, 1);
   m_l2loop_last.assign(n_sub, 0);
   m_l2loop_mirror_ok = icnt_out_mirror_supported() && !m_memory_config->SST_mode &&
@@ -3059,8 +2946,7 @@ void gpgpu_sim::wire_icnt_mirrors() {
   }
 }
 
-// Adds the port samples of every visit skipped up to the current loop tick.
-// Call it before reading the L2 stats.
+// Adds the idle port samples of skipped L2 visits; call before reading L2 stats.
 void gpgpu_sim::flush_l2loop_idle() {
   if (!m_l2loop_mirror_ok) return;
   for (unsigned i = 0; i < m_l2loop_last.size(); i++) {
@@ -3077,17 +2963,13 @@ void gpgpu_sim::cycle() {
   const unsigned long long cycle_wall_start = g_phase_timing_on ? phase_now_ns() : 0;
   unsigned long long tail_wall_start = 0;  // set in the CORE block, read at the end of cycle()
   int clock_mask = next_clock_domain();
-  // First call only: hook up the busy flags that let the loops below skip
-  // idle clusters and sub-partitions (see wire_icnt_mirrors()).
+  // First call only: wire the busy flags used to skip idle clusters and sub-partitions.
   if (!m_icnt_mirrors_wired) wire_icnt_mirrors();
 
   if (clock_mask & ICNT) {
     const unsigned long long cluster_icnt_wall_start = g_phase_timing_on ? phase_now_ns() : 0;
-    // ICNT -> cluster replies run on the ICNT clock, the same clock on which the
-    // network fills these output buffers.
-    // Skip idle clusters. m_cluster_icnt_busy[i] == 0 means cluster i's response
-    // FIFO and its ICNT output buffer are both empty, so icnt_cycle() would do
-    // nothing. Not skipped under ACCELSIM_DIAG, which counts every visit.
+    // ICNT -> cluster replies, on the ICNT clock. Skip clusters whose response FIFO and ICNT
+    // output are empty (icnt_cycle() would do nothing), except under ACCELSIM_DIAG.
     const bool skip_idle_clusters = m_cluster_icnt_mirror_ok && !g_accelsim_diag;
     for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
       if (skip_idle_clusters && !m_cluster_icnt_busy[i]) {
@@ -3107,10 +2989,8 @@ void gpgpu_sim::cycle() {
   unsigned partiton_replys_in_parallel_per_cycle = 0;
   if (clock_mask & L2) {
     const unsigned long long icnt_pop_wall_start = g_phase_timing_on ? phase_now_ns() : 0;
-    // On L2 edges, move at most one reply per sub-partition from its L2-to-ICNT queue
-    // into the ICNT; the L2 side sends its replies at its own clock.
-    // Skip sub-partitions whose L2-to-ICNT queue is empty (m_l2icnt_nonempty[i] == 0):
-    // top() would return NULL and pop() would change nothing.
+    // Move at most one reply per sub-partition from L2 to ICNT, on the L2 clock.
+    // Empty queues are skipped: top() would return NULL and pop() would do nothing.
     for (unsigned i = 0; i < m_memory_config->m_n_mem_sub_partition; i++) {
       if (!m_l2icnt_nonempty[i]) {
 #ifdef H33_MIRROR_CHECK
@@ -3131,7 +3011,7 @@ void gpgpu_sim::cycle() {
           m_memory_sub_partition[i]->pop();
           partiton_replys_in_parallel_per_cycle++;
         } else {
-          gpu_stall_icnt2sh++;  // input buffer full: retry next ICNT cycle
+          gpu_stall_icnt2sh++;  // input buffer full: retry next L2 cycle
         }
       } else {
         // top() == NULL: the head slot is empty; pop() advances it.
@@ -3141,8 +3021,7 @@ void gpgpu_sim::cycle() {
     }
     if (g_phase_timing_on) {
       const unsigned long long icnt_pop_wall_end = phase_now_ns();
-      // Two wall-time totals: icnt_ns = this loop + the icnt_transfer() call below,
-      // g_icnt_pop_ns = this loop only.
+      // icnt_ns also includes icnt_transfer() below; g_icnt_pop_ns is this loop only.
       g_phase_timers.icnt_ns += icnt_pop_wall_end - icnt_pop_wall_start;
       g_phase_timers.icnt_calls++;
       g_icnt_pop_ns += icnt_pop_wall_end - icnt_pop_wall_start;
@@ -3153,8 +3032,7 @@ void gpgpu_sim::cycle() {
 
   if (clock_mask & DRAM) {
     const unsigned long long dram_wall_start = g_phase_timing_on ? phase_now_ns() : 0;
-    // Memory partitions only touch their own state, so they run in parallel;
-    // the statistics they share (memory_stats_t) are updated atomically.
+    // Partitions touch only their own state (shared memory_stats_t is atomic), so run in parallel.
 #pragma omp parallel for schedule(runtime)
     for (unsigned i = 0; i < m_memory_config->m_n_mem; i++) {
       if (m_memory_config->simple_dram_model)
@@ -3183,20 +3061,15 @@ void gpgpu_sim::cycle() {
   unsigned partiton_reqs_in_parallel_per_cycle = 0;
   if (clock_mask & L2) {
     const unsigned long long l2_gmmu_wall_start = g_phase_timing_on ? phase_now_ns() : 0;
-    // These loops stay serial: a parallel version gave identical results but ran
-    // slower, because each call does too little work to pay for the threads.
-    // GMMU is per-chiplet and clocked with the L2 domain.
+    // Serial: each call is too small to pay for threads. GMMU is per chiplet, on the L2 clock.
     for (unsigned c = 0; c < m_n_chiplets; c++) {
       m_gpu_module->get_gmmu(c)->cycle(
           gpu_sim_cycle + gpu_tot_sim_cycle);
     }
 
     m_power_stats->pwr_mem_stat->l2_cache_stats[CURRENT_STAT_IDX].clear();
-    // Skip idle sub-partitions. When the L2 side is idle (l2loop_idle) and the ICNT
-    // output buffer is empty, a visit only adds one idle L2-port sample; the skipped
-    // samples are added on the next visit or before the stats are printed.
-    // ACCELSIM_DIAG counts every visit, so nothing is skipped then, but the busy
-    // flags and visit ticks are still kept up to date.
+    // Skip idle sub-partitions: their only work, an idle L2-port sample, is added later.
+    // No skipping under ACCELSIM_DIAG, which counts every visit.
     const unsigned long long l2tick = ++m_l2loop_tick;
     const bool skip_idle_l2 = m_l2loop_mirror_ok && !g_accelsim_diag;
     for (unsigned i = 0; i < m_memory_config->m_n_mem_sub_partition; i++) {
@@ -3253,8 +3126,7 @@ void gpgpu_sim::cycle() {
 
   if (clock_mask & ICNT) {
     const unsigned long long icnt_transfer_wall_start = g_phase_timing_on ? phase_now_ns() : 0;
-    // FUNNEL_ (temp): xbar arrival timestamp. ST-10: only the ACCELSIM_DIAG
-    // readers (gmmu MEMLAT/FUNNEL, shader NORMREP) consume it, so stamp only then.
+    // Cycle stamp for the ACCELSIM_DIAG latency counters.
     if (g_accelsim_diag) g_icnt_now = gpu_sim_cycle + gpu_tot_sim_cycle;
     icnt_transfer();
     if (g_phase_timing_on) {
@@ -3264,8 +3136,7 @@ void gpgpu_sim::cycle() {
   }
 
   if (clock_mask & CORE) {
-    // P4: build the chiplet -> cluster grouping once. Done lazily here rather
-    // than in init() because m_gpu_module is not wired up at construction time.
+    // Group clusters by chiplet, once (lazily: gpu_module is not wired at construction).
     if (m_chiplet_cluster_order.empty()) {
       const unsigned n_chiplets =
           m_gpu_module ? m_gpu_module->get_num_chiplets() : 1u;
@@ -3276,8 +3147,7 @@ void gpgpu_sim::cycle() {
         assert(owner < n_chiplets);
         m_chiplet_cluster_order[owner].push_back(i);
       }
-      // Every cluster must appear exactly once: the grouping is a permutation,
-      // never a filter. A mapping bug here would silently drop SMs.
+      // Every cluster must appear exactly once, or SMs would be silently dropped.
       unsigned total = 0;
       for (unsigned c = 0; c < n_chiplets; c++)
         total += m_chiplet_cluster_order[c].size();
@@ -3285,40 +3155,14 @@ void gpgpu_sim::cycle() {
     }
     // L1 cache + shader core pipeline stages
     m_power_stats->pwr_mem_stat->core_cache_stats[CURRENT_STAT_IDX].clear();
-    // H2-A (speed): get_more_cta_left() is loop-invariant here -- it takes no
-    // per-cluster input -- yet it was called inside the loop below, where the `||`
-    // short circuit re-evaluates it for every IDLE cluster. It walks all
-    // -gpgpu_max_concurrent_kernel slots (128 in the MCM configs), so a cycle with
-    // many idle SMs paid up to 256 x 128 NULL checks. Measured at ~7% of run time.
-    //
-    // Hoisting is VALUE-identical, not merely close. The only mutation of the state
-    // it reads that is reachable from pass A is set_kernel_done()'s
-    // `m_running_kernels[k] = NULL` (via register_cta_thread_exit), and that call
-    // sits behind `!kernel_more_cta_left(kernel)`. So at that point either
-    // hit_max_cta_count() is true -- and then get_more_cta_left() returns false on
-    // its own first line, before and after -- or the kernel being retired had
-    // no_more_ctas_to_run(), i.e. it was already contributing false to the OR.
-    // Dropping a slot that contributed false cannot flip the result. CTA issue and
-    // m_total_cta_launched move only in the sequential tail, after this loop joins.
-    // (This is the snapshot the old T2-PROBE comment described; that probe was
-    // removed at some point and left its comment stranded above the accumulator.)
+    // Hoisted out of the loop. Same value: pass A only clears a kernel slot that already
+    // contributes false, and CTA issue happens after the loop.
     const bool more_cta_left = get_more_cta_left();
     unsigned long long active_sms_this_cycle = 0;
-    // P5: one chiplet per thread. Order *within* a chiplet stays sequential --
-    // that is the order gpu_l2_tlb / gmmu state depends on (design doc 7-1).
-    // Chiplets touch disjoint L2 TLB and GMMU objects (proposition T5), so the
-    // outer iterations are independent. Both accumulators are integer sums, so
-    // reduction is bit-exact regardless of thread count.
-    // P5-2: the GPU-wide page table must not change while chiplets run
-    // concurrently -- gmmu::translate()/pt_walk() reach it from every chiplet
-    // and its owner maps are plain unordered_maps. Frozen placement makes it
-    // read-only; sample the mutation counter around the region and abort if it
-    // moved, so an unsafe configuration fails loudly instead of corrupting the
-    // maps (which is what a 2-thread run actually did before this guard).
+    // The GPU-wide page table must not change during the parallel passes (its maps are not
+    // thread-safe): sample its mutation counter here and abort after pass C if it moved.
 #ifdef _OPENMP
-    // Only meaningful when chiplets actually run at the same time. A 1-thread
-    // OpenMP build is sequential, so it may legitimately populate the table --
-    // that is how the placement map gets produced in the first place.
+    // Only with more than one thread; a 1-thread run may fill the table (that builds the map).
     const bool pt_guard_active = (omp_get_max_threads() > 1);
     const unsigned long long pt_mut_before =
         (pt_guard_active && m_gpu_module)
@@ -3326,55 +3170,31 @@ void gpgpu_sim::cycle() {
 #endif
     const unsigned n_chiplet_groups = m_chiplet_cluster_order.size();
 
-    // P10: the CORE phase is now three passes over the same clusters.
-    //   A  writeback + every non-ldst functional unit + ldst B1..B3   [per-SM]
-    //   B  ldst B4 -- the only part touching the chiplet-shared L2 TLB / GMMU
-    //   C  ldst B5..B9 + read_operands + issue + decode/fetch          [per-SM]
-    // Splitting them is what later lets A and C run at full SM width while B
-    // stays at chiplet width (design doc, plan 3). This step only restructures:
-    // all three passes keep the chiplet-width schedule they had, so the result
-    // must be bit-identical to P9.
-    //
-    // The run/skip decision is latched in pass A and reused by B and C. Pass A
-    // retires threads, so get_not_completed() can change under us; re-testing
-    // per pass could cycle an SM in one pass and skip it in another, leaving it
-    // half-cycled. One test, one decision -- exactly what the single-pass loop did.
+    // CORE = three passes: A (writeback, non-ldst units, ldst cycle_a; per SM), B (ldst cycle_b:
+    // chiplet L2 TLB / GMMU; one chiplet per thread), C (ldst cycle_c, issue, fetch; per SM).
+    // Pass A's run/skip decision is reused by B and C: A retires threads, so a re-test could differ.
     if (m_cluster_ran.size() != m_shader_config->n_simt_clusters)
       m_cluster_ran.assign(m_shader_config->n_simt_clusters, 0);
 
-    // Race bisection switch. ACCELSIM_SERIAL_PHASE=A|B|C forces that one phase to
-    // a single thread while the others stay parallel. If serialising exactly one
-    // phase makes an 8-thread run reproduce the sequential result, the race lives
-    // in that phase -- which narrows the search from "somewhere in the CORE
-    // phase" to a few hundred lines. Read once: getenv in the cycle loop would
-    // itself be a shared read every cycle.
+    // ACCELSIM_SERIAL_PHASE=A|B|C runs that pass on one thread (to locate a race). Read once.
     static const char *serial_phase_env = getenv("ACCELSIM_SERIAL_PHASE");
     static const bool par_a = !(serial_phase_env && *serial_phase_env == 'A');
     static const bool par_b = !(serial_phase_env && *serial_phase_env == 'B');
     static const bool par_c = !(serial_phase_env && *serial_phase_env == 'C');
 
-    // Sub-phase race probe (ACCELSIM_SERIAL_SUBSYS). It must be initialised
-    // before the first parallel region, and exactly once: a function local
-    // static does both without adding a shared read to every cycle.
+    // ACCELSIM_SERIAL_SUBSYS probe: init once, before the first parallel region.
     static const bool probe_ready = (par_probe_init(), true);
     (void)probe_ready;
 
-    // P11: pass A is per-SM work only (proved by grepping cycle_a / execute_a for
-    // l2_tlb / gmmu / get_chiplet: zero hits), so it runs FLAT over every cluster
-    // at full thread width. No chiplet grouping is needed here -- that grouping
-    // exists solely to bound pass B.
+    // Pass A: per-SM work only, so all clusters run flat at full thread width.
     const unsigned n_clusters_flat = m_shader_config->n_simt_clusters;
     const unsigned long long phase_a_wall_start = g_phase_timing_on ? phase_now_ns() : 0;
-// guided, per-loop (28): parked SMs make whole chunks trivial, so static
-// chunking starves some threads. guided fixes that here without touching the
-// 8-iteration icnt collapse(2) loop, which a global OMP_SCHEDULE=dynamic
-// silently serializes (measured: icnt 82.6s -> 334.5s).
+// guided, per loop: idle SMs make static chunks uneven (a global OMP_SCHEDULE slows others).
 #pragma omp parallel for schedule(guided) if(par_a)
     for (unsigned i = 0; i < n_clusters_flat; i++) {
-      // Evaluate once and reuse: keeps the original short-circuit semantics of
-      // "get_not_completed() || get_more_cta_left()" exactly.
+      // Same as get_not_completed() || get_more_cta_left().
       const unsigned not_completed = m_cluster[i]->get_not_completed();
-      m_cluster_ran[i] = (not_completed || more_cta_left) ? 1 : 0;   // H2-A
+      m_cluster_ran[i] = (not_completed || more_cta_left) ? 1 : 0;   // more_cta_left: hoisted
       if (m_cluster_ran[i]) m_cluster[i]->core_cycle_phase_a();
     }
     if (g_phase_timing_on) {
@@ -3382,25 +3202,27 @@ void gpgpu_sim::cycle() {
       g_phase_timers.phase_a_calls++;
     }
 
-    // P11: pass B is the ONLY phase touching chiplet-shared state (the L2 TLB and
-    // the GMMU). It keeps the nested form: one chiplet per outer iteration, its
-    // SMs walked sequentially inside. That sequential inner walk is what
-    // preserves the B4a_i -> B4b_i -> B4e_i -> B4a_{i+1} chain the L2 MSHR
-    // depends on (design doc 7-1). Parallelism is capped at n_chiplets simply
-    // because the outer loop has that many iterations -- no num_threads needed;
-    // surplus threads idle here and pick the work back up in pass C.
+    // Pass B: one chiplet per thread; a chiplet's SMs run in order, which its L2 TLB and GMMU need.
     const unsigned long long phase_b_wall_start = g_phase_timing_on ? phase_now_ns() : 0;
 #pragma omp parallel for schedule(runtime) if(par_b)
     for (unsigned ch = 0; ch < n_chiplet_groups; ch++) {
       const unsigned long long phase_b_group_wall_start = g_phase_timing_on ? phase_now_ns() : 0;
-      for (unsigned ci = 0; ci < m_chiplet_cluster_order[ch].size(); ci++) {
-        const unsigned i = m_chiplet_cluster_order[ch][ci];
+      // With an L2 TLB start limit, rotate the first SM each cycle so no SM is always favoured.
+      const std::vector<unsigned> &order = m_chiplet_cluster_order[ch];
+      const unsigned n_order = (unsigned)order.size();
+      const unsigned first =
+          (m_shader_config->gpgpu_l2_tlb_starts_per_cycle && n_order)
+              ? (unsigned)((gpu_sim_cycle + gpu_tot_sim_cycle) % n_order)
+              : 0;
+      for (unsigned k = 0; k < n_order; k++) {
+        const unsigned ci = (first + k < n_order) ? first + k : first + k - n_order;
+        const unsigned i = order[ci];
         if (m_cluster_ran[i]) m_cluster[i]->core_cycle_phase_b();
       }
-      if (g_phase_timing_on && ch < 8) {  // D1: per-group time + running thread
+      if (g_phase_timing_on && ch < 8) {  // [PHASE_TIMING_B]: per-group time + running thread
         const unsigned long long phase_b_group_wall_ns = phase_now_ns() - phase_b_group_wall_start;
         g_phase_timers.phase_b_chip_ns[ch] += phase_b_group_wall_ns;
-        g_phase_timers.phase_b_chip_cur_ns[ch] = phase_b_group_wall_ns;  // D1b
+        g_phase_timers.phase_b_chip_cur_ns[ch] = phase_b_group_wall_ns;  // for the per-cycle maximum
 #ifdef _OPENMP
         const int tid = omp_get_thread_num();
 #else
@@ -3412,7 +3234,7 @@ void gpgpu_sim::cycle() {
     if (g_phase_timing_on) {
       g_phase_timers.phase_b_ns += phase_now_ns() - phase_b_wall_start;
       g_phase_timers.phase_b_calls++;
-      {  // D1b: per-cycle maximum over groups (serial, after the region joined)
+      {  // [PHASE_TIMING_B2]: per-cycle maximum over groups (serial, after the region joined)
         unsigned long long mx = 0; unsigned am = 0;
         for (unsigned c = 0; c < n_chiplet_groups && c < 8; c++) {
           const unsigned long long v = g_phase_timers.phase_b_chip_cur_ns[c];
@@ -3426,19 +3248,24 @@ void gpgpu_sim::cycle() {
       }
     }
 
-    // P11: pass C is per-SM work only, same as pass A -- flat, full thread width.
+    // Pass C is per-SM work only, same as pass A -- flat, full thread width.
     const unsigned long long phase_c_wall_start = g_phase_timing_on ? phase_now_ns() : 0;
-// guided, per-loop: same rationale as pass A (28).
+// guided, per-loop: same rationale as pass A.
 #pragma omp parallel for schedule(guided) reduction(+ : active_sms_this_cycle) if(par_c)
     for (unsigned i = 0; i < n_clusters_flat; i++) {
       if (m_cluster_ran[i]) {
         m_cluster[i]->core_cycle_phase_c();
-        // M2: accumulate into an integer local so the loop carries no shared
-        // dependence; folded into *active_sms once, after the loop.
+        // Integer reduction; added to *active_sms once after the loop.
         active_sms_this_cycle += m_cluster[i]->get_n_active_sms();
       }
-      // Update core icnt/cache stats for AccelWattch
-      if (m_config.g_power_simulation_enabled) {
+    }
+    if (g_phase_timing_on) {
+      g_phase_timers.phase_c_ns += phase_now_ns() - phase_c_wall_start;
+      g_phase_timers.phase_c_calls++;
+    }
+    // AccelWattch core stats. Serial: get_cache_stats() adds into a shared struct.
+    if (m_config.g_power_simulation_enabled) {
+      for (unsigned i = 0; i < n_clusters_flat; i++) {
         m_cluster[i]->get_icnt_stats(
             m_power_stats->pwr_mem_stat->n_simt_to_mem[CURRENT_STAT_IDX][i],
             m_power_stats->pwr_mem_stat->n_mem_to_simt[CURRENT_STAT_IDX][i]);
@@ -3446,45 +3273,30 @@ void gpgpu_sim::cycle() {
             m_power_stats->pwr_mem_stat->core_cache_stats[CURRENT_STAT_IDX]);
       }
     }
-    if (g_phase_timing_on) {
-      g_phase_timers.phase_c_ns += phase_now_ns() - phase_c_wall_start;
-      g_phase_timers.phase_c_calls++;
-    }
-    // 31: everything from here to the end of cycle() -- kernel-completion
-    // scans, STATEHASH, issue_block2core() (which parses CTA traces), flushes.
+    // Phase timing "tail": from here to the end of cycle().
     tail_wall_start = g_phase_timing_on ? phase_now_ns() : 0;
 #ifdef _OPENMP
     if (pt_guard_active && m_gpu_module &&
         m_gpu_module->get_page_table()->mutation_count() != pt_mut_before) {
       fprintf(stderr,
-              "\nFATAL: the GPU-wide page table was modified during the "
-              "parallel CORE phase\n"
-              "       (cycle %llu, %llu mutations). gmmu::translate() and "
-              "pt_walk() reach one\n"
-              "       shared gpu_page_table from every chiplet; concurrent "
-              "inserts corrupt it.\n"
-              "       Run with -gmmu_placement_load <map> so the table is "
-              "pre-built and read-only,\n"
-              "       or rebuild without -fopenmp.\n",
+              "\nFATAL: the GPU-wide page table changed during the parallel "
+              "CORE passes\n"
+              "       (cycle %llu, %llu changes). Nothing in passes A-C may "
+              "change it: first-touch\n"
+              "       owners are buffered and committed after pass C. A "
+              "page-table write inside\n"
+              "       the parallel passes is a simulator bug; rerun with "
+              "OMP_NUM_THREADS=1 to find it.\n",
               (unsigned long long)(gpu_sim_cycle + gpu_tot_sim_cycle),
               m_gpu_module->get_page_table()->mutation_count() - pt_mut_before);
       fflush(stderr);
       abort();
     }
 #endif
-    // A1: commit this cycle's buffered first-touch inserts (reference mode
-    // only; no-op otherwise). This runs after the parallel passes joined and
-    // after the pt-guard re-sampled the mutation counter, so the inserts are
-    // outside the guarded region by construction. Every owner-map reader
-    // (done_tlb_req level/leaf faults) executes at least one cycle after the
-    // translate that buffered the entry, so nothing observes the deferral.
+    // Commit this cycle's deferred first-touch inserts, after the parallel passes and the guard.
     if (m_gpu_module && m_gpu_module->get_page_table())
       m_gpu_module->get_page_table()->commit_deferred_first_touch();
-    // M3: occupancy sampling accumulates into the shared gpu_occupancy struct,
-    // so it cannot stay inside the loop that will be parallelised. Cluster i's
-    // occupancy is only changed by cluster i's own core_cycle(), so sampling it
-    // after every cluster has cycled yields the same values as sampling it
-    // right after each one -- the accumulation is integer, hence order-free.
+    // Occupancy sampling. Serial: adds into the shared gpu_occupancy struct.
     const unsigned long long occupancy_wall_start = g_phase_timing_on ? phase_now_ns() : 0;
     for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
       m_cluster[i]->get_current_occupancy(
@@ -3494,26 +3306,24 @@ void gpgpu_sim::cycle() {
     if (g_phase_timing_on) g_phase_timers.tail_occ_ns += phase_now_ns() - occupancy_wall_start;
     *active_sms += (float)active_sms_this_cycle;
 
-    // STATEHASH: one fingerprint line per cycle, emitted from the sequential
-    // part of the cycle (all three passes have joined, so nothing is racing the
-    // read). Diffing a 1-thread log against an N-thread log gives the FIRST
-    // cycle at which the two diverge -- the divergence is global by the end of
-    // the run, so only the first cycle localises anything. Off by default:
-    // ACCELSIM_STATEHASH=1 turns it on, and it is not cheap (it walks every TLB
-    // array every cycle).
+    // ACCELSIM_STATEHASH: per-cycle state fingerprint to find where two runs first diverge. Slow.
     static const bool statehash_on = (getenv("ACCELSIM_STATEHASH") != NULL);
     if (statehash_on && m_gpu_module) {
-      unsigned long long h_l2 = 0, h_l1 = 0;
-      for (unsigned c = 0; c < m_gpu_module->get_num_chiplets(); c++)
-        h_l2 += m_gpu_module->get_chiplet(c)->get_l2_tlb_4k()->state_fingerprint();
-      // Position-sensitive over SMs: a plain sum cancels when one SM runs ahead
-      // and another falls behind by the same amount, which is exactly what the
-      // first divergence looked like (sm=178 behind, sm=220 differing) -- the
-      // aggregate stayed equal for 11 cycles after the per-SM state had already
-      // parted. Fold the SM index in so nothing cancels.
+      // FNV over the unit index (a plain sum could cancel out); covers all three page sizes.
+      unsigned long long h_l2 = 1469598103934665603ull;
+      for (unsigned c = 0; c < m_gpu_module->get_num_chiplets(); c++) {
+        const chiplet *ch = m_gpu_module->get_chiplet(c);
+        const gpu_l2_tlb *tlbs[3] = {ch->get_l2_tlb_4k(), ch->get_l2_tlb_64k(), ch->get_l2_tlb_2m()};
+        for (unsigned k = 0; k < 3; k++) {
+          h_l2 ^= (tlbs[k] ? tlbs[k]->state_fingerprint() : 0ull) + (c * 3 + k) * 2654435761ull;
+          h_l2 *= 1099511628211ull;
+        }
+      }
+      unsigned long long h_l1 = 1469598103934665603ull;
       unsigned long long h_sm = 1469598103934665603ull;
       for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
-        h_l1 += m_cluster[i]->xlat_l1_fingerprint();
+        h_l1 ^= m_cluster[i]->xlat_l1_fingerprint() + i * 2654435761ull;
+        h_l1 *= 1099511628211ull;
         h_sm ^= (unsigned long long)m_shader_stats->m_num_sim_winsn[i] + i * 2654435761ull;
         h_sm *= 1099511628211ull;
       }
@@ -3521,10 +3331,7 @@ void gpgpu_sim::cycle() {
              (unsigned long long)(gpu_sim_cycle + gpu_tot_sim_cycle),
              (unsigned long long)gpu_sim_insn, h_l2, h_l1, h_sm);
 
-      // Per-SM detail inside a narrow cycle window. The aggregate above tells us
-      // WHEN the two runs part; this tells us WHICH SM. m_num_sim_winsn[sid] is
-      // the per-SM warp-instruction count that gpu_sim_insn aggregates, so the
-      // SM whose count differs is the one that ran ahead.
+      // [SMDETAIL] per SM within ACCELSIM_STATEHASH_LO..HI, to find which SM diverged.
       static const char *lo_s = getenv("ACCELSIM_STATEHASH_LO");
       static const char *hi_s = getenv("ACCELSIM_STATEHASH_HI");
       static const unsigned long long win_lo = lo_s ? strtoull(lo_s, 0, 10) : 0;
@@ -3579,13 +3386,7 @@ void gpgpu_sim::cycle() {
     if (m_config.gpgpu_flush_l1_cache) {
       for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
         if (m_cluster[i]->get_not_completed() == 0) {
-          // H2-C: tag_array::invalidate() returns immediately unless the array was
-          // touched since the last invalidate (gpu-cache.cc: `if (!is_used) return`),
-          // so the call was a no-op on almost every cluster on almost every cycle --
-          // but it still cost a walk into each core's tag_array (4.3% of run time at
-          // 256 SMs). m_l1_used mirrors that flag per cluster in one contiguous
-          // array; a zero there means is_used is false on every core of the cluster,
-          // so the skipped call could not have changed any state.
+          // Skip clusters with no L1D touch since the last invalidate: the call would do nothing.
           if (m_l1_used.empty() || m_l1_used[i]) {
             m_cluster[i]->cache_invalidate();
             if (!m_l1_used.empty()) m_l1_used[i] = 0;
@@ -3709,22 +3510,16 @@ void gpgpu_sim::perf_memcpy_to_gpu(size_t dst_start_addr, size_t count) {
     // 32
     //== 0);
 
-    // counter must be size_t: a 32-bit unsigned wraps to 0 at exactly 4GiB
-    // (count == 2^32), turning this loop infinite. First hit by LUD's 4GiB
-    // HtoD copy; every smaller memcpy terminates and hid the bug.
-    // S2: the four 32 B sectors of one 128 B line share their sub-partition
-    // whenever no chip/bank/hash bit lies below bit 7 (checked once); decode the
-    // line once instead of once per sector. Same calls, same order, same values.
+    // counter is size_t: a 32-bit one would loop forever at 4 GiB.
+    // Decode each 128 B line once when its sectors share a sub-partition (no mapping bit below 7).
     static const bool line_memo =
         m_memory_config->m_address_mapping.sub_partition_fixed_within(7);
     bool have_line = false;
     size_t memo_line = 0;
     unsigned memo_sub = 0;
     for (size_t counter = 0; counter < count; counter += 32) {
-      // s31: 64-bit like Accel-Sim v2.0.0 (was `const unsigned`, which cut the
-      // 64-bit destination address to its low 32 bits). Note: this address is the
-      // memcpy destination VA -- this warm-up is not translated, so the MCM
-      // experiments run with -gpgpu_perf_sim_memcpy 0 (docs/s31 section 6).
+      // 64-bit, or the address would be cut to 32 bits. This VA is not translated,
+      // so MCM runs use -gpgpu_perf_sim_memcpy 0.
       const size_t wr_addr = dst_start_addr + counter;
       mem_access_sector_mask_t mask;
       mask.set(wr_addr % 128 / 32);
@@ -3908,13 +3703,8 @@ void gpgpu_sim::on_gpu_malloc(uint64_t va, size_t aligned_size,
     m_gpu_module->on_malloc(va, aligned_size, page_shift);
 }
 
-// Turns the -gpgpu_page_size_policy setting into a page shift for one allocation.
-//
-// Fixed policies (0-2) give every allocation the same page size: page size is the
-// only variable, which is what a page-size sweep wants. A tiny allocation then
-// burns a whole page, so PMM use is worst-case; map_leaf() asserts if it runs out.
-// Automatic policies (3-5) instead pick the largest enabled page the allocation
-// can fill (size >= page size), which is closer to what a real driver does.
+// Page shift for one allocation from -gpgpu_page_size_policy. 0-2: one size for all
+// (small allocations waste a page); 3-5: the largest enabled page the allocation fills.
 unsigned gpgpu_sim::decide_page_shift(size_t size) const {
   const unsigned policy = m_shader_config->gpgpu_page_size_policy;
   switch (policy) {

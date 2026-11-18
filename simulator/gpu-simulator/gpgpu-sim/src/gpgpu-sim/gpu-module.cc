@@ -1,33 +1,28 @@
 #include <cstdlib>   // getenv, atoi
 #include <cstdint>  // uint64_t, strtoull
+#include <cstring>  // strlen
 #ifdef _OPENMP
-#include <omp.h>   // H3-2: MCM access 카운터 슬롯 인덱스(omp_get_thread_num)
+#include <omp.h>   // omp_get_thread_num(): per-thread MCM access counter slot
 #endif
 
 #include "gpu-module.h"
 #include "gpu-sim.h"
 #include "mem_fetch.h"
 #include "icnt_wrapper.h"
-#include "gmmu.h"  // full definition needed for creating gmmu objects (P3)
+#include "gmmu.h"  // full definition needed for creating gmmu objects
 #include "gpu_tlb.h"   // gpu_l2_tlb full definition needed for l2_tlb_request()
-#include "l2miss_log.h"  // L2MISSLOG (s29): gated miss/walk timeline
+#include "l2miss_log.h"  // L2 TLB miss/walk timeline log (ACCELSIM_L2MISS_LOG)
 
 #include <algorithm>
 
-// Verification logging: per-walk event lines, OFF unless ACCELSIM_LOG_PTW is set.
-// Runtime-gated so one binary serves production (no output, digest-neutral)
-// and verification runs (recompute walks / local-remote steps / occupancy
-// from the log and cross-check the GMMU_STAT counters).
+// [MCM_PTW] log lines, one per PT read request or reply; off unless ACCELSIM_LOG_PTW is set.
 static bool accelsim_log_ptw() {
   static const bool on = (getenv("ACCELSIM_LOG_PTW") != NULL);
   return on;
 }
 
 
-// ===================== Address Translation Verification =====================
-// Single toggle. When enabled, runs all active steps once at the end of
-// gpu_module::init(). OFF by default -> zero runtime cost in normal builds.
-// (plan: docs/verification_plan_address_translation.md)
+// Translation self-checks: run once at the end of init() if ADDR_XLAT_VERIFY is defined.
 // #define ADDR_XLAT_VERIFY
 #ifdef ADDR_XLAT_VERIFY
   static void run_address_translation_verify(gpu_module* mod);
@@ -52,8 +47,7 @@ chiplet::chiplet(gpgpu_sim* top, unsigned chiplet_id)
       m_global_mem(NULL) {}
 
 chiplet::~chiplet() {
-  // Phase 1: chiplet does not own global arrays or the objects inside them.
-  // Nothing to delete here.
+  // Owns nothing in the global arrays.
 }
 
 void chiplet::bind_cluster_range(unsigned global_begin, unsigned count) {
@@ -112,25 +106,20 @@ gpu_module::gpu_module(gpgpu_sim* top, unsigned n_chiplets, unsigned n_clusters,
       m_remote_access_count(0),
       m_local_access_count(0),
       m_acc_slots(0),
-      m_page_table(NULL),
-      m_current_lasp_config(NULL),
-      m_current_kernel_block_dim(dim3(256, 1, 1)) {
+      m_page_table(NULL) {
   assert(m_n_chiplets >= 1);
 
-  // H3-2: MCM access 카운터의 스레드별 슬롯을 여기서 딱 한 번 잡는다. 시뮬레이터
-  // 구성 시점이라 어떤 병렬 영역보다 앞서고, 이후 절대 크기를 바꾸지 않으므로
-  // 병렬 중 재할당(주소 이동)이 일어날 수 없다.
+  // Size the counter slots once, before any parallel region; never resized afterwards.
   unsigned slots;
 #ifdef _OPENMP
-  const int mx = omp_get_max_threads();   // OMP_NUM_THREADS 반영
+  const int mx = omp_get_max_threads();   // honors OMP_NUM_THREADS
   const int np = omp_get_num_procs();
-  slots = (unsigned)((mx > np) ? mx : np);  // 둘 중 큰 값 -> 나중에 스레드가
-  if (slots < 1) slots = 1;                 // 늘어나도 대체로 범위 안
+  slots = (unsigned)((mx > np) ? mx : np);  // the larger of the two, so a later
+  if (slots < 1) slots = 1;                 // thread-count increase mostly stays in range
 #else
   slots = 1;
 #endif
-  // 검증용 강제 지정(기본값 없음). 0 으로 두면 모든 증가가 폴백 공유 atomic 으로
-  // 가므로 H3-2 이전 동작과 완전히 동일해진다 -> 폴백 경로를 실제로 시험할 수 있다.
+  // Test override; 0 sends every increment to the shared fallback counters.
   if (const char* e = getenv("ACCELSIM_ACC_SLOTS")) {
     const long v = atol(e);
     if (v >= 0) slots = (unsigned)v;
@@ -146,7 +135,7 @@ gpu_module::~gpu_module() {
   m_chiplets.clear();
   delete m_page_table;  // release page table on simulator teardown
 
-  // P3: release GMMUs
+  // Release GMMUs
   for (auto* g : m_gmmus) {
     delete g;
   }
@@ -155,16 +144,13 @@ gpu_module::~gpu_module() {
 
 void gpu_module::init() {
   create_chiplets();
-  // P-6: cache the uniform page shift (config is final by now). See the member
-  // comment; page_shift_for_va() uses it as an O(1) fast path.
+  // Cached for the page_shift_for_va() fast path (the config is final by now).
   m_uniform_shift = uniform_page_shift();
-  // SMELL-5: the ACCELSIM_DIAG per-chiplet arrays (g_memfull_*, NORMREP) are
-  // statically sized for 8 chiplets; beyond that their rows are silently
-  // dropped. Warn once rather than abort -- only diagnostics are affected.
+  // ACCELSIM_DIAG per-chiplet arrays hold 8 chiplets; warn only, as just diagnostics are lost.
   if (m_n_chiplets > 8)
     fprintf(stderr,
             "WARNING: >8 chiplets -- ACCELSIM_DIAG per-chiplet diagnostics "
-            "beyond chiplet 7 are dropped (findings SMELL-5).\n");
+            "beyond chiplet 7 are dropped.\n");
 
   // Build owner maps.
   m_cluster_to_chiplet.assign(m_n_clusters, 0);
@@ -194,17 +180,12 @@ void gpu_module::init() {
       const unsigned g = mb + i;
       assert(g < m_n_mem);
       m_mem_to_chiplet[g] = cid;
-      for (unsigned sp = 0; sp < spm; sp++)   // SMELL-2 fix: config value, not 2
+      for (unsigned sp = 0; sp < spm; sp++)
         m_mem_sub_partition_to_chiplet[g * spm + sp] = cid;
     }
   }
 
-  // PMM initialization: split the physical frame space [0, total_pages) into
-  // one contiguous ascending range per chiplet. PFNs start at 0 -- the PA space
-  // is separate from the VA heap (GLOBAL_HEAP_START); the page table maps
-  // between them. Remainder frames go to the LAST chiplet (unlike split_range,
-  // which favors lower indices -- the two splits need not agree, they cover
-  // different resources).
+  // PMM: one contiguous frame range per chiplet; the last chiplet takes the remainder.
   uint64_t total_pages = (uint64_t)m_top->get_config().get_gpu_mem_size_mb()
                         * 1024ULL * 1024ULL / GPU_PAGE_SIZE;
   uint64_t pages_per_chiplet         = total_pages / m_n_chiplets;
@@ -213,11 +194,8 @@ void gpu_module::init() {
     uint64_t pfn_start = (uint64_t)cid * pages_per_chiplet;
     uint64_t pfn_end   = (cid == m_n_chiplets - 1)
                         ? total_pages : pfn_start + pages_per_chiplet;
-    // Bump range instead of pushing every frame: same ascending allocation
-    // order as the old queue, without materializing millions of entries.
     m_chiplets[cid]->pmm_set_range(pfn_start, pfn_end);
-    // A huge page must not straddle chiplets, or pfn_to_chiplet_via_addrdec()
-    // would disagree with the page's owner.
+    // 2MB-aligned bases, so a huge page never straddles chiplets.
     assert(pfn_start % GPU_HUGE_FRAMES == 0 &&
            "PMM: chiplet frame base must be 2MB-aligned for huge pages");
   }
@@ -227,12 +205,7 @@ void gpu_module::init() {
     distributed += m_chiplets[c]->free_page_count();
   assert(distributed == total_pages && "PMM page distribution mismatch");
 
-  // One-time cross-check (SMELL-3 fix; makes the A.1 verification permanent):
-  // the linear PMM split must agree with the config's addrdec chip bits for
-  // EVERY frame. Both express "which chiplet owns this PA"; if they disagree
-  // (D-bit position, indexing policy, mem size, or chiplet count changed),
-  // page ownership and every local/remote classification silently rot -- so
-  // fail loudly at init instead. Silent on success (digest-neutral).
+  // Check every frame: the PMM split must agree with addrdec's chiplet, or local/remote is wrong.
   {
     const linear_to_raw_address_translation& am =
         m_top->getMemoryConfig()->m_address_mapping;
@@ -257,10 +230,8 @@ void gpu_module::init() {
     }
   }
 
-  // CHIPLET_IPOLY keeps a chiplet's sub-partitions apart only for the chiplet
-  // count it was configured with, and hashes offsets INSIDE a page, which the
-  // page-base check above never decodes. Check the count, then decode every 256 B
-  // step of a sample of frames (every 97th, 16 steps each) against the owner.
+  // CHIPLET_IPOLY also hashes offsets inside a page: check its chiplet count, then
+  // decode every 256 B step of every 97th frame against the owner.
   {
     const linear_to_raw_address_translation& am =
         m_top->getMemoryConfig()->m_address_mapping;
@@ -299,33 +270,27 @@ void gpu_module::init() {
   printf("[PMM] init: total=%llu pages across %u chiplets\n",
         (unsigned long long)total_pages, m_n_chiplets);
   
-  // Phase 2: create the GPU-wide page table after PMM is ready
-  m_page_table = new gpu_page_table(this);
+  // Create the GPU-wide page table after the PMM is ready
+  m_page_table = new gpu_page_table(m_top->get_gpu_module());  // self via top (no-this rule)
   printf("[PAGE_TABLE] init: gpu_page_table created\n");
 
-  // Optional: freeze placement from a reference run's snapshot and pre-map the
-  // whole page table before the first kernel, so the measured region takes zero
-  // faults and placement is a controlled variable across configs.
-  // Disabled (empty path) by default -> first-touch behaves exactly as before.
+  // Optional: load a placement map and premap every page before kernel 1 (default: first touch).
   {
     const char* pl = m_top->get_config().get_gmmu_placement_load();
     bool frozen = false;
     if (pl && pl[0] != '\0' && m_page_table->load_placement(pl)) {
-      // premap() reserves every data-page PFN first, and only then allocates the
-      // root's per-chiplet copies, so data placement is identical with and
-      // without -gmmu_local_ptw.
+      // Premap allocates the root copies itself, after the data PFNs.
       if (m_top->get_config().get_gmmu_placement_exact())
-        m_page_table->premap_exact();          // s30: data/node/root PFNs as recorded
+        m_page_table->premap_exact();          // data/node/root PFNs as recorded
       else
         m_page_table->premap_from_placement();
       frozen = true;
     }
-    // Not frozen: nothing has reserved data pages yet, so the root may take its
-    // copies now. No-op unless -gmmu_local_ptw.
+    // No premap: the root may take its copies now (no-op unless -gmmu_local_ptw).
     if (!frozen) m_page_table->alloc_root_replicas();
   }
 
-  // P3: create one GMMU per chiplet
+  // Create one GMMU per chiplet
   unsigned n_ptw       = m_top->get_config().get_gmmu_n_ptw();
   unsigned pwq_depth   = m_top->get_config().get_gmmu_pwq_depth();
   unsigned pwc_entries = m_top->get_config().get_gmmu_pwc_entries();
@@ -339,11 +304,16 @@ void gpu_module::init() {
            c, n_ptw, pwq_depth, pwc_entries);
   }
   
-  // Create one L2 TLB per chiplet.
-  // Give each GMMU a back-pointer so complete_walk() can call l2_tlb->fill().
+  if (m_n_clusters > (1u << gpu_l2_tlb::kReqKeyClusterBits)) {
+    fprintf(stderr,
+            "FATAL: %u SIMT clusters, but the L2 TLB request key holds only %u "
+            "cluster-id bits (gpu_l2_tlb::kReqKeyClusterBits).\n",
+            m_n_clusters, gpu_l2_tlb::kReqKeyClusterBits);
+    abort();
+  }
+  // One L2 TLB per page size per chiplet, also given to the GMMU for complete_walk().
   for (unsigned c = 0; c < m_n_chiplets; c++) {
-    // 4KB L2 TLB. page_shift is now passed explicitly; it used to rely on the
-    // GPU_PAGE_SHIFT default.
+    // 4KB L2 TLB (page_shift passed explicitly, like the two below).
     gpu_l2_tlb* l2tlb_4k = new gpu_l2_tlb(
         m_top->get_config().get_l2_tlb_sets(),
         m_top->get_config().get_l2_tlb_assoc(),
@@ -353,6 +323,7 @@ void gpu_module::init() {
         c,
         GPU_PAGE_SHIFT);
     l2tlb_4k->set_ports(m_top->get_config().get_l2_tlb_ports());
+    l2tlb_4k->set_starts_per_cycle(m_top->get_config().get_l2_tlb_starts_per_cycle());
     l2tlb_4k->set_set_hash(m_top->get_config().get_l2_tlb_set_hash());
     m_chiplets[c]->set_l2_tlb_4k(l2tlb_4k);
     m_gmmus[c]->set_l2_tlb_4k(l2tlb_4k);
@@ -373,6 +344,7 @@ void gpu_module::init() {
         c,
         GPU_64K_SHIFT);
     l2tlb_64k->set_ports(m_top->get_config().get_l2_tlb_ports());
+    l2tlb_64k->set_starts_per_cycle(m_top->get_config().get_l2_tlb_starts_per_cycle());
     l2tlb_64k->set_set_hash(m_top->get_config().get_l2_tlb_set_hash());
     m_chiplets[c]->set_l2_tlb_64k(l2tlb_64k);
     m_gmmus[c]->set_l2_tlb_64k(l2tlb_64k);
@@ -392,6 +364,7 @@ void gpu_module::init() {
         c,
         GPU_HUGE_SHIFT);
     l2tlb_2m->set_ports(m_top->get_config().get_l2_tlb_ports());
+    l2tlb_2m->set_starts_per_cycle(m_top->get_config().get_l2_tlb_starts_per_cycle());
     l2tlb_2m->set_set_hash(m_top->get_config().get_l2_tlb_set_hash());
     m_chiplets[c]->set_l2_tlb_2m(l2tlb_2m);
     m_gmmus[c]->set_l2_tlb_2m(l2tlb_2m);
@@ -401,11 +374,37 @@ void gpu_module::init() {
            m_top->get_config().get_l2_tlb_2m_assoc(),
            m_top->get_config().get_l2_tlb_2m_mshr_entries());
   }
-  
-  // C-4: the legacy fixed-latency inter-chiplet delay queue is gone. The
-  // option is still parsed for config compatibility (every current config sets
-  // it to 0) but a nonzero value now fails loudly instead of silently doing
-  // nothing.
+
+  // Each PWQ entry belongs to a live L2 TLB MSHR entry, so a PWQ as deep as the MSHR entries
+  // of every L2 TLB in use never overflows. Require it.
+  {
+    const uint64_t probe_size[3] = {1, GPU_64K_PAGE_SIZE, GPU_HUGE_PAGE_SIZE};
+    bool used_4k = false, used_64k = false, used_2m = false;
+    for (uint64_t sz : probe_size) {
+      const unsigned s = m_top->decide_page_shift(sz);
+      if (s == GPU_PAGE_SHIFT) used_4k = true;
+      else if (s == GPU_64K_SHIFT) used_64k = true;
+      else used_2m = true;
+    }
+    unsigned mshr_total = 0;
+    if (used_4k)  mshr_total += m_top->get_config().get_l2_tlb_mshr_entries();
+    if (used_64k) mshr_total += m_top->get_config().get_l2_tlb_64k_mshr_entries();
+    if (used_2m)  mshr_total += m_top->get_config().get_l2_tlb_2m_mshr_entries();
+    printf("[GMMU] init: L2 TLB MSHR entries per PWQ=%u (4KB:%d 64KB:%d 2MB:%d) "
+           "pwq_depth=%u\n", mshr_total, used_4k, used_64k, used_2m, pwq_depth);
+    if (mshr_total > pwq_depth) {
+      fprintf(stderr,
+              "\nFATAL: -gmmu_pwq_depth %u is smaller than the L2 TLB MSHR "
+              "entries that share one\n       chiplet's PWQ (%u; page sizes "
+              "4KB:%d 64KB:%d 2MB:%d). A miss could find the PWQ\n       full. "
+              "Set -gmmu_pwq_depth to at least %u or reduce the MSHR entries.\n",
+              pwq_depth, mshr_total, used_4k, used_64k, used_2m, mshr_total);
+      fflush(stderr);
+      abort();
+    }
+  }
+
+  // -icnt_inter_hop_latency_ns is parsed for old configs only; a nonzero value aborts.
   if (m_top->get_config().get_icnt_inter_hop_latency_ns() != 0) {
     fprintf(stderr,
             "\nFATAL: -icnt_inter_hop_latency_ns is no longer modeled (the "
@@ -466,20 +465,12 @@ void gpu_module::bind_global_arrays(simt_core_cluster** global_clusters,
   }
 }
 
-// H3-2: MCM access 카운터 증가. kind 0=remote, 1=local.
-//
-// 스레드마다 자기 캐시라인(슬롯)에 올리고, 합은 통계 출력 시점에 낸다.
-// 증가 자체는 그대로 atomic 이다 -- 경쟁이 없는 lock xadd 라 비용이 평범한
-// 증가와 같고(측정: 8스레드 2.3ns, 공유 스칼라 atomic 은 36ns), 대신 "슬롯
-// 하나에는 한 스레드만 쓴다"는 논증이 깨지는 어떤 상황(중첩 병렬 영역, OpenMP
-// 밖의 pthread, 스레드 번호 중복)에서도 카운트가 유실되지 않는다.
-//
-// 슬롯을 못 쓰는 경우(스레드 번호가 범위를 벗어남, ACCELSIM_ACC_SLOTS=0,
-// -fopenmp 없이 빌드)에는 예전과 똑같이 공유 카운터로 폴백한다.
+// Add one to this thread's slot of an MCM access counter (kind 0 = remote, 1 = local).
+// Atomic, so counts stay exact even if threads share a slot; no usable slot -> fallback counter.
 void gpu_module::bump_access_count(unsigned kind) {
   unsigned long long* p;
 #ifdef _OPENMP
-  const int t = omp_get_thread_num();   // 직렬 구간에서는 0
+  const int t = omp_get_thread_num();   // 0 outside parallel regions
   if (t >= 0 && (unsigned)t < m_acc_slots)
     p = &m_acc_counts[(size_t)t * (size_t)ACC_SLOT_STRIDE + kind];
   else
@@ -497,9 +488,7 @@ void gpu_module::icnt_deliver(unsigned input_deviceID,
                               unsigned int size) {
   mem_fetch* mf = static_cast<mem_fetch*>(data);
 
-  // PTW reply travels back via the reply-ring so the return trip pays inter-chiplet
-  // latency (do NOT short-circuit at source). It is intercepted at the destination
-  // pop (gpu_module::icnt_pop) and routed to that chiplet's GMMU.
+  // PT read reply: sent through the ICNT (ring latency paid); icnt_pop() hands it to the GMMU.
   if (mf->get_type() == TLB_FILL_REPLY) {
     unsigned src_chiplet = mem_sub_partition_to_chiplet(device2mem(input_deviceID));
     unsigned dst_chiplet = cluster_to_chiplet(device2cluster(output_deviceID));
@@ -533,8 +522,7 @@ void gpu_module::icnt_deliver(unsigned input_deviceID,
 
   if (remote) {
     mf->set_local_access(false);
-    // Also called from the parallel CORE phase, so the count goes to a
-    // per-thread slot (summed at print time). Statistic only.
+    // Per-thread slot: also called from the parallel phase.
     bump_access_count(0);
   } else {
     mf->set_local_access(true);
@@ -575,16 +563,12 @@ void gpu_module::icnt_deliver(unsigned input_deviceID,
 
 void gpu_module::icnt_push(unsigned input_deviceID, unsigned output_deviceID,
                            void* data, unsigned int size) {
-  // Hands the packet to icnt_deliver() with no extra delay; inter-chiplet
-  // latency and bandwidth are modeled by the ring.
+  // No extra delay here; the ring models inter-chiplet latency and bandwidth.
   icnt_deliver(input_deviceID, output_deviceID, data, size);
 }
 
-// P5: L2 TLB request from shader core. Returns true if request is accepted (either hit or MSHR allocated).
-// link_used (out): did this call actually put a request on the SM->L2 link?
-// A request already inside the L2's lookup stage is NOT retransmitted -- it is
-// simply still being probed -- so it must not consume issue bandwidth. Charging
-// it would recreate the head-of-line block this drain exists to remove.
+// L2 TLB request from an SM; true if accepted (hit, new MSHR entry or merge).
+// link_used: false when the request was already being probed (nothing new sent on the link).
 bool gpu_module::l2_tlb_request(uint64_t va, unsigned cluster_id,
                                   uint64_t cycle,
                                   gpu_pte_t& out_pte, bool& is_l2_hit,
@@ -601,8 +585,7 @@ bool gpu_module::l2_tlb_request(uint64_t va, unsigned cluster_id,
   if (link_used) *link_used = true;
 
   gpu_pte_t l2_pte;
-  // T1-a: access() reports whether this rid was already inside its probe
-  // window (== the former is_probing() call), saving one hash lookup per poll.
+  // access() also reports whether this request was already being probed.
   bool was_probing = false;
   auto result = l2tlb->access(va, cluster_id, l2_pte, cycle, pending_until,
                               &was_probing);
@@ -611,16 +594,14 @@ bool gpu_module::l2_tlb_request(uint64_t va, unsigned cluster_id,
 
   switch (result) {
     case gpu_l2_tlb::HIT:
-      // L2 TLB array hit: return pte immediately.
-      // Caller (shader.cc) fills L1 TLB directly without polling.
+      // L2 hit: the caller fills its L1 TLB directly.
       out_pte   = l2_pte;
       is_l2_hit = true;
       return true;
 
     case gpu_l2_tlb::MSHR_FULL:
-      // L2 MSHR at capacity for a new VPN; no MSHR entry was created.
-      // SM stalls and retries next cycle.
-      if (full_kind) *full_kind = l2tlb->last_full_merge() ? 1u : 2u;  // 44-4
+      // MSHR table full or this VPN at its merge cap; nothing changed, the SM retries.
+      if (full_kind) *full_kind = l2tlb->last_full_merge() ? 1u : 2u;  // 1 = merge cap, 2 = table full
       #ifdef LOG_TLB
       printf("[L2_TLB] chiplet=%u cluster=%u vpn=0x%llx -> MSHR_FULL\n",
                chiplet_id, cluster_id, (unsigned long long)page_vpn(va, pshift));
@@ -628,24 +609,23 @@ bool gpu_module::l2_tlb_request(uint64_t va, unsigned cluster_id,
       return false;
 
     case gpu_l2_tlb::MISS:
-      // First miss for this VPN on this chiplet: start PTW via GMMU.
-      // access() already created the L2 MSHR entry.
+      // First miss for this VPN: start a walk. The init check guarantees a free PWQ slot.
       if (gmmu_ptr->pwq_full()) {
-        // Cannot start walk; roll back L2 MSHR add so SM retries cleanly.
-        // XLATDBG: the gate was already erased by access(); rolling back only the
-        // MSHR leaves the request to re-arm a fresh full-latency gate next retry.
-        m_xlatdbg_pwq_rollback++;
-        l2tlb->remove_from_mshr(page_vpn(va, pshift), cluster_id);
-        return false;
+        fprintf(stderr,
+                "\nFATAL: chiplet %u PWQ full on an L2 TLB miss (cycle %llu, "
+                "vpn 0x%llx, page shift %u).\n       Every PWQ entry should "
+                "belong to a live L2 TLB MSHR entry.\n",
+                chiplet_id, (unsigned long long)cycle,
+                (unsigned long long)page_vpn(va, pshift), pshift);
+        fflush(stderr);
+        abort();
       }
-      // Use chiplet representative cluster_id so demand-paging in
-      // done_tlb_req() allocates PT nodes and data pages on this chiplet.
+      // The chiplet's first cluster stands for the requester (placement is per chiplet).
       gmmu_ptr->translate(va,
           m_chiplets[chiplet_id]->get_cluster_global_begin(), cycle);
-      // XLATLAT: t5 -- the PWQ accepted it. Keyed by the REQUESTING cluster, not
-      // the chiplet representative that translate() takes for page placement.
+      // Latency breakdown: PWQ entry time, keyed by the requesting cluster.
       l2tlb->xlat_mark_pwq_enq(cluster_id, page_vpn(va, pshift), cycle);
-      if (FILE* lf = l2miss_log_file()) {  // L2MISSLOG (s29): new walk
+      if (FILE* lf = l2miss_log_file()) {  // L2 miss log: new walk
         const gpu_pte_t* cur_pte = m_page_table->walk(va);  // read-only; pass B has no PT writer
         fprintf(lf, "M %llu %u %u 0x%llx 0 %d\n", (unsigned long long)cycle, chiplet_id,
                 cluster_id, (unsigned long long)page_vpn(va, pshift),
@@ -659,7 +639,7 @@ bool gpu_module::l2_tlb_request(uint64_t va, unsigned cluster_id,
 
     case gpu_l2_tlb::MSHR_HIT:
       // VPN already in-flight; cluster_id merged into existing MSHR entry.
-      if (FILE* lf = l2miss_log_file()) {  // L2MISSLOG (s29): merge into the walk in flight
+      if (FILE* lf = l2miss_log_file()) {  // L2 miss log: merge into the walk in flight
         const gpu_pte_t* cur_pte = m_page_table->walk(va);
         fprintf(lf, "M %llu %u %u 0x%llx 1 %d\n", (unsigned long long)cycle, chiplet_id,
                 cluster_id, (unsigned long long)page_vpn(va, pshift),
@@ -675,9 +655,7 @@ bool gpu_module::l2_tlb_request(uint64_t va, unsigned cluster_id,
       return false;   // lookup latency still elapsing -> SM stalls and retries
 
     case gpu_l2_tlb::PORT_BUSY:
-      // All L2 lookup ports occupied. Nothing was armed and no resource is held,
-      // so the caller just retries; this is a bandwidth limit, distinct from
-      // LOOKUP_PENDING (which means THIS request is already being probed).
+      // All lookup ports busy (a bandwidth limit); nothing is held, the caller retries.
       return false;
 
     default:
@@ -691,8 +669,7 @@ void* gpu_module::icnt_pop(unsigned output_deviceID) {
   void* data = ::icnt_pop(output_deviceID);
   if (data) {
     mem_fetch* mf = static_cast<mem_fetch*>(data);
-    // PTW reply arrived at the requester chiplet via the reply-ring (round-trip
-    // latency paid). Route to this chiplet's GMMU; hide from the SM.
+    // PT read reply: hand it to this chiplet's GMMU, never to the SM.
     if (mf->get_type() == TLB_FILL_REPLY) {
       unsigned chiplet_id = cluster_to_chiplet(device2cluster(output_deviceID));
       uint64_t cur = m_top->gpu_sim_cycle + m_top->gpu_tot_sim_cycle;
@@ -704,12 +681,8 @@ void* gpu_module::icnt_pop(unsigned output_deviceID) {
   return data;
 }
 
-// Classifies a DATA packet (READ/WRITE request or its reply) as crossing a
-// chiplet boundary. Both directions are counted, so mcm_remote/local_accesses
-// are packet counts (a completed remote read contributes 2), and PTW packets
-// (TLB_FILL_ACC/REPLY) are excluded on purpose -- their locality is reported
-// by [GMMU_STAT] local/remote steps. mcm_remote_ratio is therefore the remote
-// share of data-packet traffic, not a unique-access or all-traffic ratio.
+// True if a data packet (request or reply) crosses chiplets. Counts are per packet;
+// PT reads are excluded ([GMMU_STAT] reports their local/remote steps).
 bool gpu_module::is_remote_access(unsigned inputDeviceID,
                                   unsigned outputDeviceID,
                                   void* data) const {
@@ -733,8 +706,7 @@ bool gpu_module::is_remote_access(unsigned inputDeviceID,
 
     return (src_chiplet_id != dst_chiplet_id);
   }
-  // TLB_FILL and other control messages route through icnt;
-  // chiplet routing is handled by the address itself, not by src/dst IDs.
+  // PT reads and other packets are not data traffic.
   return false;
 }
 
@@ -745,11 +717,7 @@ unsigned gpu_module::cluster_to_chiplet(unsigned global_id) const {
 }
 
 unsigned gpu_module::mem_sub_partition_to_chiplet(unsigned global_id) const {
-  // Static owner map built in init() from the contiguous split_range() split
-  // (NOT from addrdec -- see SMELL-3); authoritative for which chiplet owns a
-  // given sub-partition. LASP is a CTA scheduling policy and deliberately does
-  // not change physical DRAM ownership (an abandoned experiment that remapped
-  // ownership per LASP policy was deleted here; see git history).
+  // Static map from init()'s contiguous split; LASP does not change DRAM ownership.
   assert(global_id < m_mem_sub_partition_to_chiplet.size());
   return m_mem_sub_partition_to_chiplet[global_id];
 }
@@ -807,7 +775,7 @@ void gpu_module::dump_mapping(unsigned sub_partition_per_mem,
                                  FILE* fout) const {
   if (!fout) fout = stdout;
 
-  fprintf(fout, "==== gpu_module owner maps (Phase 1) ====\n");
+  fprintf(fout, "==== gpu_module owner maps ====\n");
 
   // Cluster -> chiplet
   if (!verbose_per_id) {
@@ -827,7 +795,7 @@ void gpu_module::dump_mapping(unsigned sub_partition_per_mem,
     }
   }
 
-  // L2 slice -> chiplet (inherits mem partition owner in Phase 1)
+  // L2 slice -> chiplet (inherits the owner of its mem partition)
   if (sub_partition_per_mem > 0 && !m_mem_to_chiplet.empty()) {
     const unsigned total_l2 =
         (unsigned)m_mem_to_chiplet.size() * sub_partition_per_mem;
@@ -861,7 +829,6 @@ void gpu_module::dump_mapping(unsigned sub_partition_per_mem,
   fprintf(fout, "========================================\n");
 }
 
-// new
 uint64_t gpu_module::pmm_alloc_page(unsigned chiplet_id) {
   uint64_t pfn = m_chiplets[chiplet_id]->alloc_page();
   #ifdef LOG_PMM
@@ -904,14 +871,7 @@ const gpu_pte_t* gpu_module::walk_va(uint64_t va, int* walk_depth) const {
 }
 
 
-// MISNOMER (kept for now, findings.ko.md SMELL-3): despite the name this does
-// NOT consult addrdec -- it splits the PFN space linearly, mirroring exactly
-// the per-chiplet ranges pmm_set_range() built in init() (remainder to the
-// last chiplet). It answers "which chiplet's PMM owns this frame", which is
-// only the same thing as "which chiplet's DRAM channel serves this PA" if the
-// config's addrdec chip bits agree with the linear split -- that agreement is
-// a config obligation, not enforced here. An earlier addrdec-based version
-// was replaced by this one; see git history.
+// Despite the name, a linear split matching pmm_set_range(); init() checks it against addrdec.
 unsigned gpu_module::pfn_to_chiplet_via_addrdec(uint64_t pa) const {
   uint64_t total_pages       = (uint64_t)m_top->get_config().get_gpu_mem_size_mb()
                                * 1024ULL * 1024ULL / GPU_PAGE_SIZE;
@@ -925,13 +885,7 @@ unsigned gpu_module::pfn_to_chiplet_via_addrdec(uint64_t pa) const {
 
 gpu_page_table::gpu_page_table(gpu_module* mod)
     : m_mod(mod), m_pml4(NULL) {
-  // Allocate PML4 root immediately, mirroring real hardware where CR3 is set
-  // at process creation time before any memory access occurs.
-  // with_replicas=false: the root's per-chiplet copies are allocated later by
-  // alloc_root_replicas(), AFTER premap reserves the data PFNs. Allocating them
-  // here would drain one page from every chiplet pool first and shift every data
-  // PFN by one, breaking the "same data placement" invariant.
-  // (local_ptw_experiment_design.ko.md 2.4 -- a trap that was actually hit.)
+  // Root now (like CR3); its per-chiplet copies come later from alloc_root_replicas().
   m_pml4 = alloc_node(0, /*with_replicas=*/false);
   assert(m_pml4 != NULL && "gpu_page_table: failed to allocate PML4 root");
 }
@@ -952,17 +906,13 @@ bool gpu_module::local_ptw_enabled() const {
 }
 
 unsigned gpu_module::uniform_page_shift() const {
-  // Fixed policies (0-2) answer the same shift for any size; automatic policies
-  // (3-5) do not. Probing the two extremes distinguishes them without having to
-  // duplicate the policy table here.
+  // Fixed policies give the same shift for the smallest and a 2MB allocation.
   const unsigned small = m_top->decide_page_shift(1);
   const unsigned big   = m_top->decide_page_shift(GPU_HUGE_PAGE_SIZE);
   return (small == big) ? small : 0;
 }
 
-// Give `node` one page per OTHER chiplet so every chiplet can walk it locally.
-// No-op unless -gmmu_local_ptw. The pages are genuinely consumed, so
-// pt_page_count() reports the n_chiplets-fold cost.
+// -gmmu_local_ptw: give `node` a page on every other chiplet so each walks it locally.
 bool gpu_page_table::alloc_replicas(pt_node_t* node, unsigned owner) {
   if (!m_mod->local_ptw_enabled()) return true;   // baseline: nothing to do
   const unsigned n_chip = m_mod->get_num_chiplets();
@@ -991,25 +941,19 @@ size_t gpu_page_table::pt_page_count() const {
 }
 
 pt_node_t* gpu_page_table::alloc_node(unsigned chiplet_id, bool with_replicas) {
-  // Allocate one 4KB page from the target chiplet's PMM for this PT node.
-  // A PT node page is 4KB for every page size -- a 64KB leaf node is still a
-  // 512-entry table, not a 64KB data page.
+  // A PT node is one 4KB page for every page size.
   uint64_t pfn = m_mod->pmm_alloc_page(chiplet_id);
   if (pfn == (uint64_t)-1) {
     printf("[PAGE_TABLE] alloc_node: PMM exhausted on chiplet %u\n", chiplet_id);
     return NULL;
   }
   pt_node_t* node = new pt_node_t();
-  node->base_pa = pfn << GPU_PAGE_SHIFT;  // record PA for Phase 6 PTW latency
+  node->base_pa = pfn << GPU_PAGE_SHIFT;  // page walks read this PA (local vs remote)
 
-  // Per-chiplet view. Baseline: every chiplet sees the single page just
-  // allocated, so a foreign-chiplet walk reads it remotely -- exactly the
-  // behaviour before this option existed.
+  // Per-chiplet PAs; all the same page unless replicated below.
   node->base_pa_rep.assign(m_mod->get_num_chiplets(), node->base_pa);
 
-  // Replicating here (rather than in a later bulk pass) means EVERY node, at
-  // every level and for every page size -- PML4/PDP/PD/PT/PT64K -- is covered
-  // automatically, because they all come through this one function.
+  // Every node is created here, so replicating here covers all levels.
   if (with_replicas && !alloc_replicas(node, chiplet_id)) return NULL;
   return node;
 }
@@ -1048,17 +992,13 @@ const gpu_pte_t* gpu_page_table::walk(uint64_t va, int* walk_depth) const {
     if (walk_depth) *walk_depth = depth;
     return NULL;
   }
-  // 2MB huge page: PS=1 makes this PDE the leaf, so there is no PT level.
-  // Decided from the PTE bit alone, exactly like a hardware walk would.
+  // 2MB huge page: PS=1 makes this PDE the leaf.
   if (pde->huge_page()) {
     if (walk_depth) *walk_depth = depth;  // 3: PML4 -> PDP -> PD
     return pde;
   }
 
-  // Level 3: PT (leaf). 4KB and 64KB both land here but read different nodes:
-  // the 512-entry 4KB PT vs the 32-entry 64KB big PT. Unlike the 2MB case there
-  // is no PTE bit to tell them apart (real HW follows the PDE's small/big pointer
-  // pair), so the page size comes from the VA's allocation record.
+  // Level 3: 4KB PT or 64KB big PT, picked by the VA's page size (no PTE bit tells them apart).
   const bool is_64k = (m_mod->page_shift_for_va(va) == GPU_64K_SHIFT);
   uint64_t pt_key = ((uint64_t)pt_pml4_idx(va) << 18) |
                     ((uint64_t)pt_pdp_idx(va)   <<  9) |
@@ -1074,73 +1014,8 @@ const gpu_pte_t* gpu_page_table::walk(uint64_t va, int* walk_depth) const {
   return pte->present() ? pte : NULL;
 }
 
-// void gpu_page_table::map(uint64_t va, unsigned chiplet_id) {
-//   // PML4: single global root for the entire GPU, always on chiplet 0.
-//   // Every GMMU must access it at the start of every PTW regardless of
-//   // which chiplet owns the data, so one unavoidable remote hop per walk.
-//   assert(m_pml4 != NULL);  // always pre-allocated in constructor
-
-//   gpu_pte_t* pml4e = &m_pml4->entries[pt_pml4_idx(va)];
-
-//   // PDP: first-touch placement ??? allocate on chiplet_id so that the GMMU
-//   // on chiplet_id can read this node locally during PTW.
-//   uint64_t pdp_key = pt_pml4_idx(va);
-//   if (m_pdp_nodes.find(pdp_key) == m_pdp_nodes.end()) {
-//     pt_node_t* node = alloc_node(chiplet_id);   // ?�� 0 ?�� chiplet_id
-//     assert(node != NULL);
-//     m_pdp_nodes[pdp_key] = node;
-//     pml4e->set_pfn(node->base_pa >> GPU_PAGE_SHIFT);
-//     pml4e->set_present(true);
-//     pml4e->set_writable(true);
-//   }
-//   gpu_pte_t* pdpe = &m_pdp_nodes[pdp_key]->entries[pt_pdp_idx(va)];
-
-//   // PD: first-touch placement ??? same chiplet as data.
-//   uint64_t pd_key = (pt_pml4_idx(va) << 9) | pt_pdp_idx(va);
-//   if (m_pd_nodes.find(pd_key) == m_pd_nodes.end()) {
-//     pt_node_t* node = alloc_node(chiplet_id);   // ?�� 0 ?�� chiplet_id
-//     assert(node != NULL);
-//     m_pd_nodes[pd_key] = node;
-//     pdpe->set_pfn(node->base_pa >> GPU_PAGE_SHIFT);
-//     pdpe->set_present(true);
-//     pdpe->set_writable(true);
-//   }
-//   gpu_pte_t* pde = &m_pd_nodes[pd_key]->entries[pt_pd_idx(va)];
-
-//   // PT: first-touch placement ??? same chiplet as data.
-//   uint64_t pt_key = ((uint64_t)pt_pml4_idx(va) << 18) |
-//                     ((uint64_t)pt_pdp_idx(va)   <<  9) |
-//                      (uint64_t)pt_pd_idx(va);
-//   if (m_pt_nodes.find(pt_key) == m_pt_nodes.end()) {
-//     pt_node_t* node = alloc_node(chiplet_id);   // ?�� 0 ?�� chiplet_id
-//     assert(node != NULL);
-//     m_pt_nodes[pt_key] = node;
-//     pde->set_pfn(node->base_pa >> GPU_PAGE_SHIFT);
-//     pde->set_present(true);
-//     pde->set_writable(true);
-//   }
-//   gpu_pte_t* pte = &m_pt_nodes[pt_key]->entries[pt_pt_idx(va)];
-
-//   // Leaf PTE: allocate data page from target chiplet.
-//   assert(!pte->present() && "double map: VA already mapped");
-//   uint64_t data_pfn = m_mod->pmm_alloc_page(chiplet_id);
-//   assert(data_pfn != (uint64_t)-1 && "PMM exhausted for data page");
-//   pte->set_pfn(data_pfn);
-//   pte->set_present(true);
-//   pte->set_writable(true);
-
-//   printf("[PAGE_TABLE] map: va=0x%llx -> chiplet=%u "
-//          "pdp_pa=0x%llx pd_pa=0x%llx pt_pa=0x%llx data_pfn=0x%llx\n",
-//          (unsigned long long)va, chiplet_id,
-//          (unsigned long long)m_pdp_nodes[pdp_key]->base_pa,
-//          (unsigned long long)m_pd_nodes[pd_key]->base_pa,
-//          (unsigned long long)m_pt_nodes[pt_key]->base_pa,
-//          (unsigned long long)data_pfn);
-// }
-
 uint64_t gpu_page_table::ensure_node(uint64_t va, int level, unsigned chiplet_id) {
-  // P5-2: structural change to the GPU-wide page table. Only reachable when
-  // the node/leaf is absent, i.e. never under frozen placement.
+  // Counts as a page table change (never at runtime under frozen placement).
   note_mutation();
   switch (level) {
     case 1: {
@@ -1187,8 +1062,7 @@ uint64_t gpu_page_table::ensure_node(uint64_t va, int level, unsigned chiplet_id
       // A 2MB page has no level-3 node at all: its PD entry is the leaf.
       assert(m_mod->page_shift_for_va(va) != GPU_HUGE_SHIFT &&
              "ensure_node(3): a 2MB page must not create a level-3 node");
-      // 4KB -> 512-entry PT, 64KB -> 32-entry big PT. Both are keyed by the PD
-      // prefix and both may exist under the same PD entry.
+      // 4KB -> PT, 64KB -> big PT; same key, and both may hang off one PD entry.
       const bool is_64k = (m_mod->page_shift_for_va(va) == GPU_64K_SHIFT);
       auto& nodes = is_64k ? m_pt64k_nodes : m_pt_nodes;
       uint64_t key = ((uint64_t)pt_pml4_idx(va) << 18) |
@@ -1200,10 +1074,7 @@ uint64_t gpu_page_table::ensure_node(uint64_t va, int level, unsigned chiplet_id
         nodes[key] = node;
         uint64_t pd_key = ((uint64_t)pt_pml4_idx(va) << 9) | pt_pdp_idx(va);
         assert(m_pd_nodes.count(pd_key) && "ensure_node(3): PD must exist first");
-        // The PDE carries a single pfn while Pascal's PDE0 has small+big pointers.
-        // Harmless here: nothing traverses the PDE's pfn -- walk() and
-        // get_node_base_pa() resolve nodes through the maps above, and present()
-        // is correct for either child.
+        // One pfn per PDE (Pascal has small + big): harmless, walks resolve nodes via the maps.
         gpu_pte_t* pde = &m_pd_nodes[pd_key]->entries[pt_pd_idx(va)];
         pde->set_pfn(node->base_pa >> GPU_PAGE_SHIFT);
         pde->set_present(true);
@@ -1226,8 +1097,7 @@ uint64_t gpu_page_table::ensure_node(uint64_t va, int level, unsigned chiplet_id
 uint64_t gpu_page_table::ensure_node_shift(uint64_t va, int level,
                                            unsigned chiplet_id,
                                            unsigned page_shift) {
-  // P5-2: structural change to the GPU-wide page table. Only reachable when
-  // the node/leaf is absent, i.e. never under frozen placement.
+  // Counts as a page table change (never at runtime under frozen placement).
   note_mutation();
   // Levels 1 and 2 are page-size independent.
   if (level != 3) return ensure_node(va, level, chiplet_id);
@@ -1253,11 +1123,9 @@ uint64_t gpu_page_table::ensure_node_shift(uint64_t va, int level,
 }
 
 void gpu_page_table::map_leaf(uint64_t va, unsigned chiplet_id) {
-  // P5-2: structural change to the GPU-wide page table. Only reachable when
-  // the node/leaf is absent, i.e. never under frozen placement.
+  // Counts as a page table change (never at runtime under frozen placement).
   note_mutation();
-  // 2MB huge page: the PD entry is the leaf, so no PT node is created and the
-  // data page needs 512 physically contiguous frames.
+  // 2MB: the PD entry is the leaf; the data page takes 512 contiguous frames.
   if (m_mod->page_shift_for_va(va) == GPU_HUGE_SHIFT) {
     uint64_t pd_key = ((uint64_t)pt_pml4_idx(va) << 9) | pt_pdp_idx(va);
     assert(m_pd_nodes.count(pd_key) && "map_leaf(2M): PD node must exist first");
@@ -1282,8 +1150,7 @@ void gpu_page_table::map_leaf(uint64_t va, unsigned chiplet_id) {
     return;
   }
 
-  // 64KB big page: the leaf lives in the 32-entry big PT, and the data page needs
-  // 16 physically contiguous frames.
+  // 64KB: the leaf is in the big PT; the data page takes 16 contiguous frames.
   if (m_mod->page_shift_for_va(va) == GPU_64K_SHIFT) {
     uint64_t pt64k_key = ((uint64_t)pt_pml4_idx(va) << 18) |
                          ((uint64_t)pt_pdp_idx(va)   <<  9) |
@@ -1302,8 +1169,7 @@ void gpu_page_table::map_leaf(uint64_t va, unsigned chiplet_id) {
     pte64k->set_pfn(base_pfn64k);
     pte64k->set_present(true);
     pte64k->set_writable(true);
-    // Deliberately no set_huge_page(): that bit would make walk() stop at the PD
-    // and treat this as a 2MB page. 64KB is identified by its node, not a bit.
+    // No PS bit: it would make walk() treat this as a 2MB page.
 
     #ifdef LOG_PAGE_TABLE
     printf("[PAGE_TABLE] map_leaf(64K): va=0x%llx chiplet=%u base_pfn=0x%llx\n",
@@ -1337,14 +1203,8 @@ void gpu_page_table::map_leaf(uint64_t va, unsigned chiplet_id) {
 
 bool gpu_page_table::record_first_touch(uint64_t va, unsigned chiplet) {
   uint64_t pml4 = pt_pml4_idx(va), pdp = pt_pdp_idx(va), pd = pt_pd_idx(va);
-  // P5-1: emplace() is a non-const call even when the key is already present,
-  // so calling it from several chiplets at once is a data race regardless of
-  // whether anything is inserted. Probe with find() first: under frozen
-  // placement every key exists, the whole function becomes read-only, and
-  // concurrent chiplets are safe. The insert path keeps first-write-wins
-  // semantics, byte for byte what emplace() did.
-  // Key by the page-size-aligned VPN so one huge page has exactly one owner.
-  // Must stay in sync with first_touch_data_owner().
+  // find() first, so the call is read-only (thread-safe) when every key exists.
+  // Data key = VPN at the page size, as in first_touch_data_owner().
   const uint64_t k_data = page_vpn(va, m_mod->page_shift_for_va(va));
   const uint64_t k_pd   = (pml4 << 9) | pdp;
   const uint64_t k_pt   = (pml4 << 18) | (pdp << 9) | pd;
@@ -1357,9 +1217,7 @@ bool gpu_page_table::record_first_touch(uint64_t va, unsigned chiplet) {
 }
 
 void gpu_page_table::note_first_touch(uint64_t va, unsigned chiplet) {
-  // A1: in reference mode the insert is deferred so the parallel CORE phase
-  // never mutates the table (see the header comment). Frozen-placement and
-  // 1-thread non-reference runs keep the immediate path, byte for byte.
+  // Buffered when deferral is on (from every kernel launch); immediate otherwise.
   if (m_defer_ft) {
     assert(chiplet < m_ft_buf.size());
     m_ft_buf[chiplet].push_back(va);
@@ -1375,12 +1233,7 @@ void gpu_page_table::enable_deferred_first_touch(unsigned n_chiplets) {
 
 void gpu_page_table::commit_deferred_first_touch() {
   if (!m_defer_ft) return;
-  // Canonical order: chiplet index ascending, arrival order within a chiplet.
-  // The 1-thread pass-B loop walks chiplet groups in exactly this order, so
-  // committing here reproduces its owner maps bit for bit. Runs in the
-  // sequential part of the cycle -- the pt-guard has already re-sampled the
-  // mutation counter, and every owner-map reader (done_tlb_req, level faults)
-  // executes at least one cycle after the translate that buffered the entry.
+  // Chiplet order, then arrival order: the same order as a 1-thread run.
   unsigned long long batch = 0;
   for (unsigned c = 0; c < m_ft_buf.size(); c++) {
     for (uint64_t va : m_ft_buf[c]) {
@@ -1415,19 +1268,11 @@ unsigned gpu_page_table::first_touch_data_owner(uint64_t va) const {
   return it->second;
 }
 
-// ===================== placement snapshot (local-PTW experiment) =============
-// Freezing placement turns first-touch into a pure placement policy: the owner
-// maps are filled from a file, every page is mapped before kernel 1, and the
-// measured region therefore takes zero faults.
-//
-// PAGE SIZE. The map is keyed by vpn = va >> page_shift, so a 4KB map and a
-// 64KB map are different files that must never be crossed. The header records
-// the shift and load_placement() aborts on a mismatch rather than silently
-// producing a wrong experiment.
+// ===================== placement snapshot ====================================
+// A placement map fixes owners from a file and maps every page before kernel 1.
+// It is keyed by vpn = va >> page_shift, so load aborts on a page_shift mismatch.
 
-// The one page shift this configuration uses for every allocation, or 0 if the
-// policy is size-dependent (mixed pages), which premap cannot replay: premap
-// runs before any cudaMalloc, so allocation sizes are not known yet.
+// Page shift of every allocation, or 0 if size-dependent (premap cannot replay mixed sizes).
 unsigned gpu_page_table::config_uniform_page_shift() const {
   return m_mod->uniform_page_shift();
 }
@@ -1455,8 +1300,7 @@ void gpu_page_table::map_leaf_with_pfn(uint64_t va, uint64_t pfn,
                      (uint64_t)pt_pd_idx(va);
 
   if (page_shift == GPU_64K_SHIFT) {
-    // 64KB: leaf lives in the 32-entry big PT. No set_huge_page() -- that bit
-    // would make walk() stop at the PD and read this as a 2MB page.
+    // 64KB: leaf in the big PT, without the PS bit (that would mean 2MB).
     assert(m_pt64k_nodes.count(pt_key) &&
            "map_leaf_with_pfn(64K): big PT node must exist first");
     gpu_pte_t* pte = &m_pt64k_nodes[pt_key]->entries[pt_pt64k_idx(va)];
@@ -1493,13 +1337,10 @@ bool gpu_page_table::dump_placement(const char* path) const {
   fprintf(f, "# D <vpn> <owner_chiplet> <data_pfn>   (data page, vpn = va >> page_shift)\n");
   fprintf(f, "# N <level> <region_key> <owner_chiplet> <node_pfn>   (PT node, level 1=PDP 2=PD 3=PT)\n");
   fprintf(f, "# R <root_pfn>   (PML4 root)\n");
-  // s30: the root frame, so an exact replay can check it got the same one.
+  // The root frame, so an exact replay can check it got the same one.
   fprintf(f, "R 0x%llx\n", (unsigned long long)(m_pml4 ? (m_pml4->base_pa >> GPU_PAGE_SHIFT) : (uint64_t)-1));
 
-  // Sorted output so the file is byte-reproducible for diffing between runs.
-  // s30 (v3): each node line also carries the node's frame, so -gmmu_placement_exact can
-  // replay it. A level-3 key names the 64KB big PT under -gpgpu_page_size_policy 1 and
-  // the 4KB PT otherwise; -1 if the owner was recorded but the node never created.
+  // Sorted, so the file is reproducible. Node lines carry the node's frame (-1 if never created).
   auto node_pfn = [&](int level, uint64_t key) -> unsigned long long {
     const std::unordered_map<uint64_t, pt_node_t*>* m =
         (level == 1) ? &m_pdp_nodes : (level == 2) ? &m_pd_nodes
@@ -1518,7 +1359,8 @@ bool gpu_page_table::dump_placement(const char* path) const {
   };
   dump_owner_map(m_pdp_owner, 1);
   dump_owner_map(m_pd_owner,  2);
-  dump_owner_map(m_pt_owner,  3);
+  // A 2MB page is a PD-level leaf: its region has a recorded owner but no PT node.
+  if (shift != GPU_HUGE_SHIFT) dump_owner_map(m_pt_owner,  3);
 
   std::vector<uint64_t> vpns;
   vpns.reserve(m_data_owner.size());
@@ -1528,8 +1370,7 @@ bool gpu_page_table::dump_placement(const char* path) const {
   for (uint64_t vpn : vpns) {
     uint64_t va = vpn << shift;   // m_data_owner is keyed by the same shift
     const gpu_pte_t* pte = walk(va);
-    // A vpn can be recorded by translate() and yet never reach map_leaf() if the
-    // run ended mid-walk; emit -1 so the reader can tell.
+    // -1 if the run ended before this page was mapped.
     unsigned long long pfn = (pte && pte->present())
                            ? (unsigned long long)pte->pfn() : (unsigned long long)-1;
     if (pte && pte->present()) mapped++;
@@ -1540,16 +1381,24 @@ bool gpu_page_table::dump_placement(const char* path) const {
   printf("[PLACEMENT] dump: %s  page_shift=%u data_vpns=%zu (mapped=%zu) "
          "pdp=%zu pd=%zu pt=%zu\n",
          path, shift, m_data_owner.size(), mapped,
-         m_pdp_owner.size(), m_pd_owner.size(), m_pt_owner.size()); 
+         m_pdp_owner.size(), m_pd_owner.size(),
+         shift == GPU_HUGE_SHIFT ? (size_t)0 : m_pt_owner.size());  // 2MB: no PT level
   return true;
+}
+
+// A bad map must stop the run: skipping it or a line would replay a different placement silently.
+static void placement_load_fatal(const char* path, unsigned line_no, const char* why, const char* line) {
+  if (line_no) printf("[PLACEMENT] load: FATAL -- %s line %u: %s", path, line_no, why);
+  else         printf("[PLACEMENT] load: FATAL -- %s: %s", path, why);
+  if (line) printf(": %s", line);
+  if (!line || !line[0] || line[strlen(line) - 1] != '\n') printf("\n");
+  fflush(stdout);
+  abort();
 }
 
 bool gpu_page_table::load_placement(const char* path) {
   FILE* f = fopen(path, "r");
-  if (!f) {
-    printf("[PLACEMENT] load: cannot open %s\n", path); 
-    return false;
-  }
+  if (!f) placement_load_fatal(path, 0, "cannot open the -gmmu_placement_load file", NULL);
   const unsigned want = config_uniform_page_shift();
   if (want == 0) {
     printf("[PLACEMENT] load: FATAL -- -gpgpu_page_size_policy is size-dependent; "
@@ -1561,21 +1410,28 @@ bool gpu_page_table::load_placement(const char* path) {
   char line[256];
   size_t n_data = 0, n_node = 0, n_node_pfn = 0;
   int file_shift = -1;
+  unsigned line_no = 0;
+  const unsigned n_chip = m_mod->get_num_chiplets();
   while (fgets(line, sizeof(line), f)) {
+    line_no++;
+    const size_t len = strlen(line);
+    if (len == sizeof(line) - 1 && line[len - 1] != '\n')
+      placement_load_fatal(path, line_no, "line too long", line);
     if (line[0] == '#') {
       unsigned sh = 0;
       if (sscanf(line, "# page_shift %u", &sh) == 1) file_shift = (int)sh;
       continue;
     }
-    if (line[0] == '\n') continue;
+    if (line[0] == '\n' || (line[0] == '\r' && line[1] == '\n')) continue;
     if (line[0] == 'D') {
       unsigned long long vpn = 0, pfn = 0;
       unsigned owner = 0;
-      if (sscanf(line, "D 0x%llx %u 0x%llx", &vpn, &owner, &pfn) != 3) continue;
-      // Only the owner is replayed; the PFN in the file is for auditing. The
-      // measurement run re-derives PFNs deterministically in premap_from_placement().
-      // s30: premap_exact() replays the PFN instead.
-      m_data_owner.emplace((uint64_t)vpn, owner);
+      if (sscanf(line, "D 0x%llx %u 0x%llx", &vpn, &owner, &pfn) != 3)
+        placement_load_fatal(path, line_no, "malformed data line", line);
+      if (owner >= n_chip) placement_load_fatal(path, line_no, "owner chiplet out of range", line);
+      // The PFN is used only by premap_exact().
+      if (!m_data_owner.emplace((uint64_t)vpn, owner).second)
+        placement_load_fatal(path, line_no, "duplicate data vpn", line);
       m_file_data_pfn.emplace((uint64_t)vpn, (uint64_t)pfn);
       n_data++;
     } else if (line[0] == 'N') {
@@ -1583,27 +1439,33 @@ bool gpu_page_table::load_placement(const char* path) {
       unsigned long long key = 0, npfn = 0;
       unsigned owner = 0;
       const int got = sscanf(line, "N %d 0x%llx %u 0x%llx", &level, &key, &owner, &npfn);
-      if (got < 3) continue;
-      if      (level == 1) m_pdp_owner.emplace((uint64_t)key, owner);
-      else if (level == 2) m_pd_owner.emplace((uint64_t)key, owner);
-      else if (level == 3) m_pt_owner.emplace((uint64_t)key, owner);
-      else continue;
+      if (got < 3 || level < 1 || level > 3)
+        placement_load_fatal(path, line_no, "malformed node line", line);
+      if (owner >= n_chip) placement_load_fatal(path, line_no, "owner chiplet out of range", line);
+      bool fresh;
+      if      (level == 1) fresh = m_pdp_owner.emplace((uint64_t)key, owner).second;
+      else if (level == 2) fresh = m_pd_owner.emplace((uint64_t)key, owner).second;
+      else                 fresh = m_pt_owner.emplace((uint64_t)key, owner).second;
+      if (!fresh) placement_load_fatal(path, line_no, "duplicate node key", line);
       n_node++;
-      if (got == 4) {   // s30: v3 map
+      if (got == 4) {   // v3 map: the node line carries its PFN
         n_node_pfn++;
         if      (level == 1) m_file_pdp_pfn.emplace((uint64_t)key, (uint64_t)npfn);
         else if (level == 2) m_file_pd_pfn.emplace((uint64_t)key, (uint64_t)npfn);
         else                 m_file_pt_pfn.emplace((uint64_t)key, (uint64_t)npfn);
       }
-    } else if (line[0] == 'R') {   // s30: v3 root frame
+    } else if (line[0] == 'R') {   // v3 map: root frame
       unsigned long long rpfn = 0;
-      if (sscanf(line, "R 0x%llx", &rpfn) == 1) m_file_root_pfn = (uint64_t)rpfn;
+      if (sscanf(line, "R 0x%llx", &rpfn) != 1)
+        placement_load_fatal(path, line_no, "malformed root line", line);
+      m_file_root_pfn = (uint64_t)rpfn;
+    } else {
+      placement_load_fatal(path, line_no, "unknown line", line);
     }
   }
   fclose(f);
 
-  // Hard-fail, never warn-and-continue: a vpn means a different VA under a
-  // different shift, so a crossed map silently produces a bogus experiment.
+  // Abort on a missing or different page_shift: vpns would mean other VAs.
   if (file_shift < 0) {
     printf("[PLACEMENT] load: FATAL -- %s has no '# page_shift' header "
            "(v1 map from a 4KB-only build?). Regenerate the reference run.\n",
@@ -1629,8 +1491,7 @@ void gpu_page_table::premap_from_placement() {
   assert(m_placement_frozen && "premap_from_placement: load_placement() first");
   assert(m_placement_page_shift > 0);
   const unsigned shift = (unsigned)m_placement_page_shift;
-  // Frames per data page: 1 for 4KB, 16 for 64KB, 512 for 2MB. A PT NODE page is
-  // always 4KB regardless -- only the data page scales.
+  // 4KB frames per data page (PT nodes always take one).
   const uint64_t frames = 1ULL << (shift - GPU_PAGE_SHIFT);
 
   std::vector<uint64_t> vpns;
@@ -1638,10 +1499,7 @@ void gpu_page_table::premap_from_placement() {
   for (const auto& kv : m_data_owner) vpns.push_back(kv.first);
   std::sort(vpns.begin(), vpns.end());
 
-  // (A) Reserve every data-page PFN first, in ascending vpn order. Doing this
-  // before any PT node is allocated is what makes the data-page PFNs identical
-  // between the baseline and local-PTW runs (the latter allocates n_chiplets x
-  // the PT node pages, which would otherwise shift every subsequent PFN).
+  // (A) Data PFNs first, in vpn order, so they do not depend on -gmmu_local_ptw node copies.
   std::vector<uint64_t> data_pfn(vpns.size());
   for (size_t i = 0; i < vpns.size(); i++) {
     unsigned owner = m_data_owner.at(vpns[i]);
@@ -1651,15 +1509,10 @@ void gpu_page_table::premap_from_placement() {
     assert(data_pfn[i] != (uint64_t)-1 && "premap: PMM exhausted for data page");
   }
 
-  // Only now may the root's per-chiplet copies consume pages. Doing it earlier
-  // (e.g. in the constructor) would take one page from each chiplet pool ahead
-  // of phase (A), shifting every data-page PFN relative to the baseline run.
+  // Root copies only after (A), for the same reason.
   alloc_root_replicas();
 
-  // (B) PT node chains, then (C) leaf PTEs pointing at the reserved PFNs.
-  // ensure_node()/map_leaf() consult page_shift_for_va(), which cannot work here
-  // (no cudaMalloc yet), so level 3 is selected from `shift` directly and the
-  // leaf is installed by the shift-aware map_leaf_with_pfn().
+  // (B) PT nodes, then (C) leaves at the reserved PFNs; `shift` is explicit (no cudaMalloc yet).
   for (size_t i = 0; i < vpns.size(); i++) {
     uint64_t va = vpns[i] << shift;
     ensure_node(va, 1, first_touch_node_owner(va, 1));
@@ -1676,8 +1529,7 @@ void gpu_page_table::premap_from_placement() {
 }
 // ============================================================================
 
-// s30: a PT node at a frame chosen by the caller (premap_exact); the frame was
-// already taken out of the owner's PMM by finalize_exact_reservations().
+// PT node at a given frame, already reserved by finalize_exact_reservations().
 pt_node_t* gpu_page_table::make_node_at(uint64_t pfn) {
   note_mutation();
   pt_node_t* node = new pt_node_t();
@@ -1686,9 +1538,7 @@ pt_node_t* gpu_page_table::make_node_at(uint64_t pfn) {
   return node;
 }
 
-// s30 (-gmmu_placement_exact 1): rebuild the reference run's page table frame for
-// frame. Every check aborts: a partially exact replay would be a silently different
-// experiment.
+// -gmmu_placement_exact 1: rebuild the reference page table frame for frame; any mismatch aborts.
 void gpu_page_table::premap_exact() {
   auto fatal = [](const char* what, unsigned long long a, unsigned long long b) {
     printf("[PLACEMENT] premap_exact: FATAL -- %s (0x%llx, 0x%llx)\n", what, a, b);
@@ -1699,12 +1549,10 @@ void gpu_page_table::premap_exact() {
   if (!m_placement_has_pfns) fatal("map has no node PFNs / root line (v2 map?) -- re-dump the reference with a v3 build", 0, 0);
   if (m_mod->local_ptw_enabled()) fatal("-gmmu_local_ptw replicas are not in the map", 0, 0);
   const unsigned shift = (unsigned)m_placement_page_shift;
-  if (shift == GPU_HUGE_SHIFT) fatal("2MB pages are not supported by premap_exact", shift, 0);
   const uint64_t frames = 1ULL << (shift - GPU_PAGE_SHIFT);
   const unsigned n_chip = m_mod->get_num_chiplets();
 
-  // Root: allocated by the constructor before any map was read; it must be the frame
-  // the reference run had (same PMM, nothing allocated before it).
+  // The constructor allocated the root first, so it must match the recorded frame.
   const uint64_t root_pfn = m_pml4->base_pa >> GPU_PAGE_SHIFT;
   if (root_pfn != m_file_root_pfn) fatal("root frame differs from the map", root_pfn, m_file_root_pfn);
 
@@ -1724,12 +1572,14 @@ void gpu_page_table::premap_exact() {
                  const std::unordered_map<uint64_t, uint64_t>* pfn; };
   const lvl_t lv[3] = {{1, &m_pdp_owner, &m_file_pdp_pfn}, {2, &m_pd_owner, &m_file_pd_pfn},
                        {3, &m_pt_owner, &m_file_pt_pfn}};
-  for (const lvl_t& L : lv)
+  for (const lvl_t& L : lv) {
+    if (L.level == 3 && shift == GPU_HUGE_SHIFT) continue;  // 2MB: the PD entry is the leaf
     for (const auto& kv : *L.owner) {
       auto p = L.pfn->find(kv.first);
       if (p == L.pfn->end() || p->second == (uint64_t)-1) fatal("node without a PFN", (unsigned long long)L.level, kv.first);
       if (!m_mod->pmm_reserve_exact(kv.second, p->second, 1)) fatal("node PFN outside its owner's frame range", kv.first, p->second);
     }
+  }
   for (unsigned c = 0; c < n_chip; c++)
     if (!m_mod->pmm_finalize_exact(c)) fatal("duplicate or already-allocated frame on chiplet", c, 0);
 
@@ -1759,6 +1609,7 @@ void gpu_page_table::premap_exact() {
   }
   auto& leaf_nodes = (shift == GPU_64K_SHIFT) ? m_pt64k_nodes : m_pt_nodes;
   for (uint64_t k : sorted_keys(m_pt_owner)) {
+    if (shift == GPU_HUGE_SHIFT) break;  // 2MB: no PT nodes
     auto parent = m_pd_nodes.find(k >> 9);
     if (parent == m_pd_nodes.end()) fatal("PT node without its PD", k, 0);
     pt_node_t* n = make_node_at(m_file_pt_pfn.at(k));
@@ -1778,8 +1629,7 @@ void gpu_page_table::premap_exact() {
 }
 
 void gpu_page_table::unmap(uint64_t va) {
-  // Walk to the leaf PTE and clear present bit.
-  // Does not free the physical page or any PT node (Phase 3 cudaFree hook will handle that).
+  // 4KB leaves only; frees nothing.
   uint64_t pt_key = ((uint64_t)pt_pml4_idx(va) << 18) |
                     ((uint64_t)pt_pdp_idx(va)   <<  9) |
                      (uint64_t)pt_pd_idx(va);
@@ -1822,8 +1672,7 @@ uint64_t gpu_page_table::get_node_base_pa(uint64_t va, int level) const {
       uint64_t key = ((uint64_t)pt_pml4_idx(va) << 18)
                    | ((uint64_t)pt_pdp_idx(va)   <<  9)
                    | pt_pd_idx(va);
-      // 64KB reads its own big PT node; 4KB reads the 512-entry PT. The GMMU uses
-      // this to address the level-3 DRAM read, so it must agree with walk().
+      // 64KB -> big PT, 4KB -> PT; must match walk().
       const auto& nodes = (m_mod->page_shift_for_va(va) == GPU_64K_SHIFT)
                         ? m_pt64k_nodes : m_pt_nodes;
       auto it = nodes.find(key);
@@ -1834,8 +1683,7 @@ uint64_t gpu_page_table::get_node_base_pa(uint64_t va, int level) const {
   }
 }
 
-// Per-chiplet variant. MUST mirror the 2-arg form's page-size dispatch exactly;
-// if level 3 picked the wrong map, a 64KB walk would read a 4KB node's address.
+// Per-chiplet variant; level 3 must pick the same map as the 2-arg form.
 uint64_t gpu_page_table::get_node_base_pa(uint64_t va, int level,
                                           unsigned chiplet) const {
   switch (level) {
@@ -1857,8 +1705,7 @@ uint64_t gpu_page_table::get_node_base_pa(uint64_t va, int level,
       uint64_t key = ((uint64_t)pt_pml4_idx(va) << 18)
                    | ((uint64_t)pt_pdp_idx(va)   <<  9)
                    | pt_pd_idx(va);
-      // 2MB never reaches level 3 (its leaf is the PD), so -1 here is correct
-      // for it, same as the 2-arg form.
+      // 2MB never reaches level 3.
       const auto& nodes = (m_mod->page_shift_for_va(va) == GPU_64K_SHIFT)
                         ? m_pt64k_nodes : m_pt_nodes;
       auto it = nodes.find(key);
@@ -1870,12 +1717,9 @@ uint64_t gpu_page_table::get_node_base_pa(uint64_t va, int level,
   }
 }
 
-// P3
 void gpu_module::on_malloc(uint64_t va_base, size_t aligned_size,
                            unsigned page_shift) {
-  // A trace can carry several MemcpyHtoD into the same buffer; registering it
-  // twice would leave two overlapping ranges and make page_shift_for_va()
-  // depend on insertion order.
+  // Register once: a trace may copy into the same buffer several times.
   if (is_va_allocated(va_base)) return;
   m_va_alloc_list.push_back({va_base, aligned_size, page_shift});
   printf("[MALLOC_HOOK] va=0x%llx aligned_size=%zu page=%lluKB\n",
@@ -1883,7 +1727,6 @@ void gpu_module::on_malloc(uint64_t va_base, size_t aligned_size,
          (unsigned long long)((1ULL << page_shift) >> 10));
 }
 
-// P3
 bool gpu_module::is_va_allocated(uint64_t va) const {
   for (const auto& a : m_va_alloc_list) {
     if (va >= a.va_base && va < a.va_base + (uint64_t)a.aligned_size)
@@ -1892,32 +1735,19 @@ bool gpu_module::is_va_allocated(uint64_t va) const {
   return false;
 }
 
-// Linear scan is fine here: a benchmark registers on the order of tens of
-// allocations. If that ever grows into the thousands, switch m_va_alloc_list to
-// a std::map keyed by va_base and use upper_bound.
+// Linear scan: benchmarks register only tens of allocations.
 unsigned gpu_module::page_shift_for_va(uint64_t va) const {
-  // P-6 fast path: under a fixed policy every registered allocation carries
-  // m_uniform_shift (decide_page_shift() is size-independent then) and the
-  // fallback below returns it as well -- so the answer is m_uniform_shift for
-  // every va and the scan is redundant. This function sits on the translation
-  // hot path (per distinct page per access scan, per walk level, per L1->L2
-  // drain probe), which is what makes the shortcut worth having.
+  // Fast path: under a fixed policy every va gets the same shift.
   if (m_uniform_shift) return m_uniform_shift;
   for (const auto& a : m_va_alloc_list) {
     if (va >= a.va_base && va < a.va_base + (uint64_t)a.aligned_size)
       return a.page_shift;
   }
-  // Unregistered VA (local memory, kernel params, an output buffer that never
-  // got a MemcpyHtoD, ...). Under a FIXED policy the config states that every
-  // allocation has one size, so answering 4KB here would manufacture a mixed
-  // page-size run that nobody asked for -- inputs 64KB, outputs 4KB. Answer the
-  // configured size instead. uniform_page_shift() returns 0 for the automatic
-  // policies (3-5), where the size is genuinely unknown, and 4KB stays correct.
+  // Unregistered VA (local memory, params, ...): the fixed policy's size, else 4KB.
   const unsigned uniform = uniform_page_shift();
   return uniform ? uniform : GPU_PAGE_SHIFT;
 }
 
-// P3
 gmmu* gpu_module::get_gmmu(unsigned chiplet_id) const {
   assert(chiplet_id < m_gmmus.size() && "GMMU not initialized yet");
   return m_gmmus[chiplet_id];
@@ -1925,16 +1755,10 @@ gmmu* gpu_module::get_gmmu(unsigned chiplet_id) const {
 
 #ifdef ADDR_XLAT_VERIFY
 // ===========================================================================
-// Address Translation Verification harness.
-// Every step is a pure checking function: asserts invariants and prints one
-// [XLAT_VERIFY] ... PASS line. Kept isolated in this single block at the end
-// of the file so production code stays untouched.
+// Address translation verification: each step asserts invariants and prints one PASS line.
 // ===========================================================================
 
-// (step functions accumulate here)
-
-// Build a canonical VA from 9-bit level indices (x4) + 12-bit offset.
-// Inverse of pt_*_idx().
+// VA from four 9-bit level indices and a 12-bit offset (inverse of pt_*_idx()).
 static uint64_t build_va(unsigned pml4, unsigned pdp, unsigned pd,
                          unsigned pt, uint64_t off) {
   return ((uint64_t)(pml4 & 0x1FF) << 39) |
@@ -1999,9 +1823,7 @@ static void verify_va_index_decode() {
   printf("[XLAT_VERIFY V-PT-1] all index patterns OK : PASS\n");
 }
 
-// V-PT-3: PTE bit-field correctness (gpu_pte_t).
-// Oracle = the bit-layout spec itself (explicit raw literals), independent of
-// the struct's own getters/setters.
+// V-PT-3: PTE bit fields, checked against raw literals.
 static void verify_pte_bitfields() {
   printf("[XLAT_VERIFY V-PT-3] --- PTE bit-fields ---\n");
 
@@ -2055,12 +1877,8 @@ static void verify_pte_bitfields() {
   printf("[XLAT_VERIFY V-PT-3] all PTE bit-field cases OK : PASS\n");
 }
 
-// V-PT-2: page-table build via the REAL demand-paging path (ensure_node x3 +
-// map_leaf), exactly as gmmu::done_tlb_req does per fault, but synchronous here.
-// map_va()/map() (eager) is the dead path and is intentionally NOT used.
-// VA region pml4=256 cannot collide with real cudaMalloc (pml4=1 upward).
-// unmap() does not free pages -> permanently consumes 10 pages on chiplet 0
-// (negligible); keep ADDR_XLAT_VERIFY OFF for measurement runs.
+// V-PT-2: demand build through ensure_node x3 + map_leaf, as done_tlb_req does.
+// Uses pml4 = 256 (above device VAs) and leaks 10 pages on chiplet 0.
 static void verify_pt_demand_build(gpu_module* mod) {
   printf("[XLAT_VERIFY V-PT-2] --- demand build (ensure_node + map_leaf) ---\n");
 
@@ -2137,10 +1955,8 @@ static void verify_pt_demand_build(gpu_module* mod) {
   printf("[XLAT_VERIFY V-PT-2] demand build + reuse + conservation OK : PASS\n");
 }
 
-// V-PWC: Page Walk Cache key / lookup / insert / LRU correctness.
-// Uses throwaway gmmu instances (small PWC) so live GMMUs are untouched.
-// pwc_lookup() is const and does NOT refresh lru_time, so eviction is by
-// insertion/update time -- verified here as the code actually behaves.
+// V-PWC: PWC key, lookup, insert and LRU, on throwaway GMMUs.
+// pwc_lookup() does not refresh lru_time, so eviction here follows insert time.
 static void verify_pwc(gpu_module* mod) {
   printf("[XLAT_VERIFY V-PWC] --- PWC key / lookup / insert / LRU ---\n");
 
@@ -2197,15 +2013,12 @@ static void verify_pwc(gpu_module* mod) {
   printf("[XLAT_VERIFY V-PWC] key/lookup/insert/LRU OK : PASS\n");
 }
 
-// V-L1: L1 TLB fully-assoc/LRU + 10-cycle lookup gate + MSHR entries/max_merge.
-// Standalone instances with controlled cycles; independent of live SMs.
+// V-L1: L1 TLB associativity/LRU, lookup latency, MSHR entries and merge cap (standalone).
 static void verify_l1_tlb() {
   printf("[XLAT_VERIFY V-L1] --- L1 TLB FA/LRU/latency/MSHR/merge ---\n");
   const unsigned SETS=1, ASSOC=32, MSHR_E=32, MAXMERGE=192, LAT=10;
 
-  // (1) lookup latency gate: a cached hit still takes exactly LAT cycles.
-  //     New model: access() injects into the pipe; cycle() advances it; resolve
-  //     happens at the pipe head after LAT cycle() calls.
+  // (1) a cached hit still takes exactly LAT cycle() calls.
   {
     gpu_l1_tlb tlb(SETS, ASSOC, MSHR_E, MAXMERGE, LAT, /*sm_id=*/0, GPU_PAGE_SHIFT);
     gpu_pte_t p; p.raw=0; p.set_pfn(0xABCULL); p.set_present(true);
@@ -2220,9 +2033,7 @@ static void verify_l1_tlb() {
     assert(tlb.access(va,0,out,100+LAT)==gpu_l1_tlb::HIT && out.pfn()==0xABCULL && "V-L1: hit after LAT cycles");
   }
 
-  // (2) fully-associative + 32-entry capacity + LRU (all VPNs map to set 0).
-  //     New model: an uncached (evicted) VPN resolves to MSHR_HIT (allocated /
-  //     in-flight), not MISS; cached survivors resolve to HIT.
+  // (2) fully associative, 32 entries, LRU; an evicted VPN resolves to MSHR_HIT (in flight).
   {
     gpu_l1_tlb tlb(SETS, ASSOC, MSHR_E, MAXMERGE, LAT, 0, GPU_PAGE_SHIFT);
     for (unsigned i=0;i<ASSOC+1;i++){              // 33 fills into a 32-way single set
@@ -2267,9 +2078,7 @@ static void verify_l1_tlb() {
     mshr.add(9999, 0);                          // new VPN now accepted (no crash)
   }
 
-  // (6) one logical miss is determined/counted exactly once across retries.
-  //     New model: miss resolves to MSHR_HIT (allocated/in-flight); re-polls
-  //     (without further cycle()) stay MSHR_HIT with no re-gate / re-count.
+  // (6) a miss is counted once; re-polls stay MSHR_HIT without a new lookup.
   {
     gpu_l1_tlb tlb(SETS, ASSOC, MSHR_E, MAXMERGE, LAT, 0, GPU_PAGE_SHIFT);
     uint64_t va = 0x5000ULL << GPU_PAGE_SHIFT; gpu_pte_t out;
@@ -2288,8 +2097,7 @@ static void verify_l1_tlb() {
   printf("[XLAT_VERIFY V-L1] FA/LRU/latency/MSHR/merge OK : PASS\n");
 }
 
-// V-L2: L2 TLB set-assoc/LRU + 80-cycle lookup gate + MSHR table/merge + overflow recovery.
-// Standalone instances with controlled cycles; independent of live chiplets.
+// V-L2: L2 TLB sets/LRU, lookup latency, MSHR table, merge cap and recovery (standalone).
 static void verify_l2_tlb() {
   printf("[XLAT_VERIFY V-L2] --- L2 TLB set-assoc/LRU/latency/MSHR/merge/overflow ---\n");
   const unsigned SETS=128, ASSOC=8, MSHR_E=128, MAXMERGE=46, LAT=80, CH=0;
@@ -2354,9 +2162,7 @@ static void verify_l2_tlb() {
   printf("[XLAT_VERIFY V-L2] set-assoc/LRU/latency/MSHR/merge/overflow OK : PASS\n");
 }
 
-// V-PS-6: 64KB big-page table index decode (pt_pt64k_idx).
-// Oracle = the spec bit-field (VA[20:16]), spelled out with literals, never the
-// function under test.
+// V-PS-6: 64KB big-PT index (pt_pt64k_idx) = VA[20:16], checked against literals.
 static void verify_pt64k_index_decode() {
   printf("[XLAT_VERIFY V-PS-6] --- 64KB PT index (VA[20:16]) ---\n");
 
@@ -2376,10 +2182,8 @@ static void verify_pt64k_index_decode() {
   printf("[XLAT_VERIFY V-PS-6] 64KB index decode OK : PASS\n");
 }
 
-// V-PS-7/8/9: 64KB demand build via the real path (ensure_node x3 + map_leaf),
-// exactly as done_tlb_req does per fault. Proves: leaf lives at level 3 in a
-// SEPARATE big-PT node (not the PDE, not the 4KB PT), no PS bit, 16 contiguous
-// data frames, and true 64KB coverage.
+// V-PS-7/8/9: 64KB demand build: leaf at level 3 in a separate big PT, no PS bit,
+// 16 contiguous frames, and one translation for the whole 64KB.
 static void verify_64k_demand_build(gpu_module* mod) {
   printf("[XLAT_VERIFY V-PS-7] --- 64KB demand build ---\n");
 
@@ -2388,8 +2192,7 @@ static void verify_64k_demand_build(gpu_module* mod) {
   chiplet*        chip0 = mod->get_chiplet(C);
   gpu_page_table* pt    = mod->get_page_table();
 
-  // Register the whole 2MB region as 64KB pages so page_shift_for_va() -> 16.
-  // This is the real mechanism a 64KB cudaMalloc would use (input, not oracle).
+  // Register the 2MB region as 64KB pages, as a 64KB cudaMalloc would.
   uint64_t region = build_va(P, 0, 0, 0, 0);
   mod->on_malloc(region, GPU_HUGE_PAGE_SIZE, GPU_64K_SHIFT);
 
@@ -2402,8 +2205,7 @@ static void verify_64k_demand_build(gpu_module* mod) {
   pt->map_leaf(va, C);         // 16 contiguous data frames
   size_t f1 = chip0->free_page_count();
 
-  // V-PS-8: conservation -> PDP + PD + big-PT + 16 data = 19 (oracle: 3 nodes +
-  // GPU_64K_FRAMES from the spec, independent of the allocator internals).
+  // V-PS-8: PDP + PD + big PT + 16 data frames = 19 pages.
   assert(f0 - f1 == 3 + GPU_64K_FRAMES && "V-PS-8: 64KB build consumes 3 nodes + 16 frames");
 
   int d = 0;
@@ -2412,8 +2214,7 @@ static void verify_64k_demand_build(gpu_module* mod) {
   assert(d == 4 && "V-PS-7: 64KB walk depth 4 (leaf at level 3, like 4KB)");
   assert(!w->huge_page() && "V-PS-7: 64KB leaf must NOT set the PS bit");
 
-  // Leaf sits in the big-PT node, addressed by the 5-bit index (independent
-  // recompute of the PA the GMMU would issue for the level-3 read).
+  // The level-3 node the GMMU would read is the big PT.
   uint64_t node_pa = pt->get_node_base_pa(va, 3);
   assert(node_pa == big_pt && "V-PS-7: get_node_base_pa(3) == ensure_node(3)");
   assert(node_pa != (uint64_t)-1 && "V-PS-7: big-PT node exists");
@@ -2421,8 +2222,7 @@ static void verify_64k_demand_build(gpu_module* mod) {
   // V-PS-8: data frame is 64KB-aligned (16-frame aligned).
   assert((w->pfn() % GPU_64K_FRAMES) == 0 && "V-PS-8: 64KB data base is 16-frame aligned");
 
-  // V-PS-9: 64KB coverage -- every 4KB offset inside the page shares one
-  // translation; the next 64KB slot does not (oracle: definition of a 64KB page).
+  // V-PS-9: every 4KB offset shares one translation; the next 64KB slot does not.
   for (uint64_t off = 0; off < GPU_64K_PAGE_SIZE; off += GPU_PAGE_SIZE) {
     const gpu_pte_t* wi = mod->walk_va(va + off);
     assert(wi && wi->pfn() == w->pfn() && "V-PS-9: whole 64KB maps to one leaf");
@@ -2433,8 +2233,7 @@ static void verify_64k_demand_build(gpu_module* mod) {
   printf("[XLAT_VERIFY V-PS-7] 64KB build/depth/coverage/PMM OK : PASS\n");
 }
 
-// V-PS-10: 4KB PT and 64KB big-PT coexisting under ONE PD entry. This is the
-// case K6 never exercises, and the one most likely to silently mistranslate.
+// V-PS-10: a 4KB PT and a 64KB big PT under one PD entry.
 static void verify_pagesize_coexistence(gpu_module* mod) {
   printf("[XLAT_VERIFY V-PS-10] --- 4KB + 64KB under one PD entry ---\n");
 
@@ -2487,9 +2286,7 @@ static void verify_pagesize_coexistence(gpu_module* mod) {
   printf("[XLAT_VERIFY V-PS-10] coexistence (no cross-corruption) OK : PASS\n");
 }
 
-// V-PS-11: three page sizes side by side (fresh subtrees). Proves walk depth and
-// PS bit differ exactly as the spec says: 4KB/64KB stop at level 3 (depth 4),
-// 2MB stops at the PD (depth 3, PS=1).
+// V-PS-11: 4KB / 64KB / 2MB side by side: walk depth 4 / 4 / 3, PS bit only for 2MB.
 static void verify_mixed_pagesizes(gpu_module* mod) {
   printf("[XLAT_VERIFY V-PS-11] --- 4KB / 64KB / 2MB side by side ---\n");
 
@@ -2528,9 +2325,9 @@ static void verify_mixed_pagesizes(gpu_module* mod) {
 }
 
 static void run_address_translation_verify(gpu_module* mod) {
-  (void)mod;  // V-PT-1 needs no live state; later steps will use mod.
+  (void)mod;  // harmless: several steps below use mod
   printf("\n[XLAT_VERIFY] ===== Address Translation Verification =====\n");
-  verify_va_index_decode();   // V-PT-1  <- add new step calls here as they grow
+  verify_va_index_decode();   // V-PT-1
   verify_pte_bitfields();     // V-PT-3
   verify_pt_demand_build(mod); // V-PT-2
   verify_pwc(mod);             // V-PWC

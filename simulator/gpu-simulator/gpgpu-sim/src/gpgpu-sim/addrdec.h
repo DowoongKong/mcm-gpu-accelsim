@@ -69,9 +69,8 @@ class linear_to_raw_address_translation {
   // accessors
   void addrdec_tlx(new_addr_type addr, addrdec_t *tlx) const;
   new_addr_type partition_address(new_addr_type addr) const;
-  // S2 (llm_exp/docs/s31_sim_speed_review_llm.ko.md): true when addrdec_tlx()'s
-  // sub_partition cannot change inside an aligned 2^line_bits-byte block, i.e. no
-  // chip or bank bit and no hash input lies below line_bits, and no RNG is used.
+  // True when no chip or bank bit lies below line_bits and the mapping is not random (memcpy
+  // L2 warm-up memo). Hash inputs are not checked.
   bool sub_partition_fixed_within(unsigned line_bits) const {
     if (memory_partition_indexing == RANDOM) return false;
     if (ADDR_CHIP_S >= 0 && (unsigned)ADDR_CHIP_S < line_bits) return false;

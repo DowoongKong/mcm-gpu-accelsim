@@ -93,8 +93,7 @@ dram_t::dram_t(unsigned int partition_id, const memory_config *config,
   rwq_limit = 0;
   write_to_read_ratio_blp_rw_average = 0;
   bkgrp_parallsim_rw = 0;
-  // BUG-2 fix: these two were never initialized (no memset covers them), so
-  // the bank-level-parallelism report depended on heap contents.
+  // No memset covers these two, so zero them here.
   banks_time_rw = 0;
   banks_access_rw_total = 0;
 
@@ -434,11 +433,11 @@ void dram_t::cycle() {
       }
     }
   } else {
-    // single bus interface
-    // issue only one row/column command
+    // single bus interface: at most one row or column command per cycle
     for (unsigned i = 0; i < m_config->nbk; i++) {
       unsigned j = (i + prio) % m_config->nbk;
-      if (!issued_col_cmd) issued_col_cmd = issue_col_command(j);
+      if (!issued_col_cmd && !issued_row_cmd)
+        issued_col_cmd = issue_col_command(j);
 
       if (!issued_col_cmd && !issued_row_cmd)
         issued_row_cmd = issue_row_command(j);

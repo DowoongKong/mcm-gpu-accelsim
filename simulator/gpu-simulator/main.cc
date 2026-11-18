@@ -5,10 +5,7 @@
 #include <execinfo.h>
 #include <unistd.h>
 
-// XLATDBG: print a backtrace on SIGSEGV. gdb cannot catch this particular crash --
-// it changes the process environment (and therefore the heap/stack layout) and the
-// fault does not reproduce under it. Handling the signal in-process keeps the
-// layout byte-identical to the failing run.
+// Backtrace on SIGSEGV, printed in-process: unlike gdb it keeps the failing run's heap/stack layout.
 static void xlatdbg_segv_handler(int sig) {
   void* frames[40];
   int n = backtrace(frames, 40);
@@ -44,7 +41,7 @@ static void xlatdbg_segv_handler(int sig) {
  */
 
 int main(int argc, const char **argv) {
-  signal(SIGSEGV, xlatdbg_segv_handler);  // XLATDBG
+  signal(SIGSEGV, xlatdbg_segv_handler);  // backtrace on crash
 
   accel_sim_framework accel_sim(argc, argv);
   accel_sim.simulation_loop();

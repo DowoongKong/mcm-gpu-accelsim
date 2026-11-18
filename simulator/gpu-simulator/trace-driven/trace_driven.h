@@ -93,7 +93,7 @@ class trace_kernel_info_t : public kernel_info_t {
 
   void get_next_threadblock_traces(
       std::vector<std::vector<inst_trace_t> *> threadblock_traces);
-  // PCC: read thread block `want_lin` through this chiplet's own reader.
+  // Distributed CTA scheduling: read thread block `want_lin` through this chiplet's own reader.
   void get_threadblock_traces_pcc(
       std::vector<std::vector<inst_trace_t> *> threadblock_traces,
       unsigned chiplet, unsigned want_lin);
@@ -114,7 +114,7 @@ class trace_kernel_info_t : public kernel_info_t {
   trace_parser *m_parser;
   kernel_trace_t *m_kernel_trace_info;
   bool m_was_launched;
-  std::vector<std::unique_ptr<PipeReader>> m_pcc_readers;   // PCC, lazily opened
+  std::vector<std::unique_ptr<PipeReader>> m_pcc_readers;   // per chiplet, lazily opened
 
   friend class trace_shd_warp_t;
 };

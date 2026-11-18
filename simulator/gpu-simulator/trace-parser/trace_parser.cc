@@ -82,10 +82,10 @@ unsigned inst_trace_t::get_datawidth_from_opcode(
   return 4;  // default is 4 bytes
 }
 
-kernel_trace_t::kernel_trace_t(const std::string &filePath)
-    : pipeReader(filePath) {
-  this->filePath = filePath;
-  kernel_name = filePath;
+kernel_trace_t::kernel_trace_t(const std::string &path)
+    : pipeReader(path) {
+  filePath = path;
+  kernel_name = path;
   shmem_base_addr = 0;
   local_base_addr = 0;
   binary_verion = 0;
@@ -231,32 +231,25 @@ bool inst_trace_t::parse_from_string_slow(std::string trace,
 
 
 // ---------------------------------------------------------------------------
-// S1 fast path. Emulates, for well-formed lines, exactly what the stringstream
-// parser above stores: the same fields, the same radix per field (including the
-// radix inherited by the final immediate), "R%d" semantics for registers (value
-// left untouched when the token does not start with R<number>), and the
-// end-of-line behaviour of the base_delta loop (it asks for one delta per active
-// lane, so the last request consumes the immediate and the immediate read then
-// fails and leaves imm unchanged). Anything else -- a token not fully consumed,
-// a sign on an unsigned field, an out-of-range value, a missing mandatory field,
-// older trace versions or line info -- returns false WITHOUT touching the object,
-// and the caller runs the original parser instead.
+// Fast path: stores exactly what the stringstream parser stores for well-formed lines (fields, radix,
+// "R%d" rules, base_delta end of line). Anything else returns false untouched; the caller then
+// runs the original parser.
 namespace {
-inline bool s1_ws(char c) {
+inline bool fast_ws(char c) {
   return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r';
 }
-struct s1_tokens {
+struct fast_tokens {
   const char *p, *e;
   bool next(const char *&b, const char *&t) {
-    while (p < e && s1_ws(*p)) ++p;
+    while (p < e && fast_ws(*p)) ++p;
     if (p >= e) return false;
     b = p;
-    while (p < e && !s1_ws(*p)) ++p;
+    while (p < e && !fast_ws(*p)) ++p;
     t = p;
     return true;
   }
 };
-inline int s1_digit(char c, int base) {
+inline int fast_digit(char c, int base) {
   int d;
   if (c >= '0' && c <= '9') d = c - '0';
   else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
@@ -265,14 +258,14 @@ inline int s1_digit(char c, int base) {
   return d < base ? d : -1;
 }
 // Unsigned token in base 10 or 16 (hex may carry 0x/0X), whole token, <= max.
-inline bool s1_unsigned(const char *b, const char *t, int base,
+inline bool fast_unsigned(const char *b, const char *t, int base,
                         unsigned long long max, unsigned long long &v) {
   if (b < t && (*b == '+' || *b == '-')) return false;
   if (base == 16 && t - b > 2 && b[0] == '0' && (b[1] == 'x' || b[1] == 'X')) b += 2;
   if (b >= t) return false;
   unsigned long long x = 0;
   for (const char *q = b; q < t; ++q) {
-    const int d = s1_digit(*q, base);
+    const int d = fast_digit(*q, base);
     if (d < 0) return false;
     if (x > (max - (unsigned long long)d) / (unsigned long long)base) return false;
     x = x * base + d;
@@ -281,7 +274,7 @@ inline bool s1_unsigned(const char *b, const char *t, int base,
   return true;
 }
 // Signed decimal token, whole token, within [lo, hi].
-inline bool s1_signed(const char *b, const char *t, long long lo, long long hi,
+inline bool fast_signed(const char *b, const char *t, long long lo, long long hi,
                       long long &v) {
   bool neg = false;
   if (b < t && (*b == '+' || *b == '-')) { neg = (*b == '-'); ++b; }
@@ -297,7 +290,7 @@ inline bool s1_signed(const char *b, const char *t, long long lo, long long hi,
   return true;
 }
 // sscanf(token, "R%d", &r): 1 = stored, 0 = no conversion (r untouched), -1 = give up.
-inline int s1_reg(const char *b, const char *t, unsigned &r) {
+inline int fast_reg(const char *b, const char *t, unsigned &r) {
   if (b >= t || *b != 'R') return 0;
   const char *q = b + 1;
   bool neg = false;
@@ -318,7 +311,7 @@ inline int s1_reg(const char *b, const char *t, unsigned &r) {
 bool inst_trace_t::parse_fast(const std::string &trace, unsigned trace_version,
                               unsigned enable_lineinfo) {
   if (trace_version < 3 || enable_lineinfo) return false;
-  s1_tokens tk{trace.data(), trace.data() + trace.size()};
+  fast_tokens tk{trace.data(), trace.data() + trace.size()};
   const char *b, *t;
   unsigned long long u;
   long long sv;
@@ -326,29 +319,29 @@ bool inst_trace_t::parse_fast(const std::string &trace, unsigned trace_version,
   unsigned pc, msk, ndst, nsrc, memw;
   unsigned dst[MAX_DST], src[MAX_SRC];
   bool dst_set[MAX_DST], src_set[MAX_SRC];
-  if (!tk.next(b, t) || !s1_unsigned(b, t, 16, 0xffffffffULL, u)) return false;
+  if (!tk.next(b, t) || !fast_unsigned(b, t, 16, 0xffffffffULL, u)) return false;
   pc = (unsigned)u;
-  if (!tk.next(b, t) || !s1_unsigned(b, t, 16, 0xffffffffULL, u)) return false;
+  if (!tk.next(b, t) || !fast_unsigned(b, t, 16, 0xffffffffULL, u)) return false;
   msk = (unsigned)u;
-  if (!tk.next(b, t) || !s1_unsigned(b, t, 10, 0xffffffffULL, u) || u > MAX_DST) return false;
+  if (!tk.next(b, t) || !fast_unsigned(b, t, 10, 0xffffffffULL, u) || u > MAX_DST) return false;
   ndst = (unsigned)u;
   for (unsigned i = 0; i < ndst; ++i) {
     if (!tk.next(b, t)) return false;
-    const int r = s1_reg(b, t, dst[i]);
+    const int r = fast_reg(b, t, dst[i]);
     if (r < 0) return false;
     dst_set[i] = (r == 1);
   }
   const char *ob, *ot;
   if (!tk.next(ob, ot)) return false;
-  if (!tk.next(b, t) || !s1_unsigned(b, t, 10, 0xffffffffULL, u) || u > MAX_SRC) return false;
+  if (!tk.next(b, t) || !fast_unsigned(b, t, 10, 0xffffffffULL, u) || u > MAX_SRC) return false;
   nsrc = (unsigned)u;
   for (unsigned i = 0; i < nsrc; ++i) {
     if (!tk.next(b, t)) return false;
-    const int r = s1_reg(b, t, src[i]);
+    const int r = fast_reg(b, t, src[i]);
     if (r < 0) return false;
     src_set[i] = (r == 1);
   }
-  if (!tk.next(b, t) || !s1_unsigned(b, t, 10, 0xffffffffULL, u)) return false;
+  if (!tk.next(b, t) || !fast_unsigned(b, t, 10, 0xffffffffULL, u)) return false;
   memw = (unsigned)u;
 
   const std::bitset<WARP_SIZE> mask_bits(msk);
@@ -357,26 +350,26 @@ bool inst_trace_t::parse_fast(const std::string &trace, unsigned trace_version,
   inst_memadd_info_t *mi = NULL;
   if (memw > 0) {
     unsigned amode;
-    if (!tk.next(b, t) || !s1_unsigned(b, t, 10, 0xffffffffULL, u)) return false;
+    if (!tk.next(b, t) || !fast_unsigned(b, t, 10, 0xffffffffULL, u)) return false;
     amode = (unsigned)u;
     mi = new inst_memadd_info_t();
     if (amode == address_format::list_all) {
       for (int s = 0; s < WARP_SIZE; s++) {
         if (mask_bits.test(s)) {
           imm_hex = true;
-          if (!tk.next(b, t) || !s1_unsigned(b, t, 16, ~0ULL, u)) { delete mi; return false; }
+          if (!tk.next(b, t) || !fast_unsigned(b, t, 16, ~0ULL, u)) { delete mi; return false; }
           mi->addrs[s] = u;
         } else
           mi->addrs[s] = 0;
       }
     } else if (amode == address_format::base_stride) {
       unsigned long long base;
-      if (!tk.next(b, t) || !s1_unsigned(b, t, 16, ~0ULL, base)) { delete mi; return false; }
-      if (!tk.next(b, t) || !s1_signed(b, t, INT_MIN, INT_MAX, sv)) { delete mi; return false; }
+      if (!tk.next(b, t) || !fast_unsigned(b, t, 16, ~0ULL, base)) { delete mi; return false; }
+      if (!tk.next(b, t) || !fast_signed(b, t, INT_MIN, INT_MAX, sv)) { delete mi; return false; }
       mi->base_stride_decompress(base, (int)sv, mask_bits);
     } else if (amode == address_format::base_delta) {
       unsigned long long base;
-      if (!tk.next(b, t) || !s1_unsigned(b, t, 16, ~0ULL, base)) { delete mi; return false; }
+      if (!tk.next(b, t) || !fast_unsigned(b, t, 16, ~0ULL, base)) { delete mi; return false; }
       imm_hex = true;
       static thread_local std::vector<long long> deltas;
       deltas.clear();
@@ -386,7 +379,7 @@ bool inst_trace_t::parse_fast(const std::string &trace, unsigned trace_version,
         long long d = 0;
         if (!eof) {
           if (!tk.next(b, t)) eof = true;
-          else if (!s1_signed(b, t, LLONG_MIN + 1, LLONG_MAX, d)) { delete mi; return false; }
+          else if (!fast_signed(b, t, LLONG_MIN + 1, LLONG_MAX, d)) { delete mi; return false; }
         }
         deltas.push_back(d);
       }
@@ -400,7 +393,7 @@ bool inst_trace_t::parse_fast(const std::string &trace, unsigned trace_version,
     // (strtoull rules): "-1" -> 0xffffffffffffffff. Decimal only; hex keeps the fallback.
     bool neg = false;
     if (!imm_hex && b < t && (*b == '-' || *b == '+')) { neg = (*b == '-'); ++b; }
-    if (!s1_unsigned(b, t, imm_hex ? 16 : 10, ~0ULL, immv)) { delete mi; return false; }
+    if (!fast_unsigned(b, t, imm_hex ? 16 : 10, ~0ULL, immv)) { delete mi; return false; }
     if (neg) immv = 0ULL - immv;
     imm_set = true;
   }
@@ -426,7 +419,7 @@ bool inst_trace_t::parse_fast(const std::string &trace, unsigned trace_version,
   return true;
 }
 
-static bool s1_parse_check_enabled() {
+static bool fast_parse_check_enabled() {
   static const bool on = [] {
     const char *e = getenv("ACCELSIM_PARSE_CHECK");
     return e && e[0] == '1';
@@ -437,7 +430,7 @@ static bool s1_parse_check_enabled() {
 bool inst_trace_t::parse_from_string(const std::string &trace,
                                      unsigned trace_version,
                                      unsigned enable_lineinfo) {
-  if (!s1_parse_check_enabled()) {
+  if (!fast_parse_check_enabled()) {
     if (parse_fast(trace, trace_version, enable_lineinfo)) return true;
     return parse_from_string_slow(trace, trace_version, enable_lineinfo);
   }
@@ -641,10 +634,9 @@ void trace_parser::get_next_threadblock_traces(
     if (line.length() == 0) {
       continue;
     } else {
-      // S1: the first two whitespace-separated tokens, as `ss >> string1 >> string2`
-      // produced them, without building a stringstream for every line.
+      // First two whitespace-separated tokens, as `ss >> string1 >> string2` gives, without a stringstream.
       {
-        s1_tokens tk{line.data(), line.data() + line.size()};
+        fast_tokens tk{line.data(), line.data() + line.size()};
         const char *b, *t;
         if (tk.next(b, t)) string1.assign(b, t); else string1.clear();
         if (tk.next(b, t)) string2.assign(b, t); else string2.clear();
@@ -663,11 +655,11 @@ void trace_parser::get_next_threadblock_traces(
         assert(start_of_tb_stream_found);
         sscanf(line.c_str(), "thread block = %d,%d,%d", &block_id_x,
                &block_id_y, &block_id_z);
-        if (want_lin >= 0) {   // PCC: only the requested block is parsed
+        if (want_lin >= 0) {   // per-chiplet reader: only the requested block is parsed
           const long long lin = (long long)block_id_x +
                                 (long long)grid_x * block_id_y +
                                 (long long)grid_x * grid_y * block_id_z;
-          assert(lin <= want_lin && "PCC: trace thread-block order is not ascending");
+          assert(lin <= want_lin && "per-chiplet reader: trace thread-block order is not ascending");
           if (lin != want_lin) {   // foreign block: drain to #END_TB, keep looking
             while (pipeReader.readLine(line)) {
               if (line.rfind("#END_TB", 0) == 0) break;

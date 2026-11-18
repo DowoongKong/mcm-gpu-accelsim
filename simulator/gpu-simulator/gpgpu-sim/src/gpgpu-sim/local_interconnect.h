@@ -49,15 +49,13 @@ struct inct_config {
   unsigned grant_cycles;
   unsigned use_ring;   // 1 = inter-chiplet ring, 0 = direct handoff
   unsigned ring_buf;   // ring per-link / eject buffer depth (packets)
-  unsigned ring_hop_latency;  // ring per-hop latency in cycles (paper: 32)
+  unsigned ring_hop_latency;  // ring per-hop wire latency, ICNT cycles
   int      ring_hop_latency_ptw;  // same, for page-table-walk packets; <0 = inherit
   unsigned ring_link_width;  // flits drained per cycle per link (BW = LW * flit * freq)
   unsigned xbar_port_width;  // intra-chiplet xbar: flits drained per cycle per OUTPUT port
-                             // (per-port BW = xbar_port_width * flit_size * icnt_freq).
 };
 
-// P-5: (temp) diagnostic-counter gate (defined in gpu-sim.cc); the inline
-// ring code below uses it to skip RINGLAT_/RINGLINK_/BUCKET_ accounting.
+// True under ACCELSIM_DIAG (gpu-sim.cc); only then does the ring update its diagnostic counters.
 extern const bool g_accelsim_diag;
 
 class xbar_router {
@@ -67,17 +65,13 @@ class xbar_router {
               const struct inct_config& m_localinct_config,
               unsigned n_icp = 0,
               bool inter_via_ring = false,  // true -> xbar uses LOCAL flit size only
-              bool both_dirs = false);      // H1-A: one router carries REQ+REPLY
-                                            // (-icnt_subnets 1) -> every node is
-                                            // a destination candidate
+              bool both_dirs = false);      // one router carries REQ+REPLY (-icnt_subnets 1)
   ~xbar_router();
   void Push(unsigned input_deviceID, unsigned output_deviceID, void* data,
             unsigned int size);
   void* Pop(unsigned ouput_deviceID);
   void Advance();
-  // H3-3b (speed): 출력 포트 out 에 패킷을 넣을 때마다 켤 미러 바이트(없으면 nullptr).
-  // Advance() 는 칩렛 x 서브넷 병렬이지만 한 출력 포트는 한 라우터에만 있으므로 바이트마다
-  // 쓰는 스레드는 하나다.
+  // Busy flag set when a packet enters output `out` (nullptr = none); one router thread writes it.
   void set_out_mirror(unsigned out, unsigned char *slot) { m_out_mirror[out] = slot; }
   bool out_empty(unsigned out) const { return out_buffers[out].empty(); }
 
@@ -86,24 +80,21 @@ class xbar_router {
                      bool update_counter = false);
   bool Has_Buffer_Out(unsigned output_deviceID, unsigned size);
 
-  // Inter-chiplet port (ICP) helpers, used by LocalInterconnect::handoff().
-  // Inspect the ICP egress out-buffer front without popping it.
+  // Inter-chiplet port (ICP) helpers for handoff(). TopOut() peeks the egress front without popping.
   void* TopOut(unsigned output_deviceID) const;
   bool  HasOut(unsigned output_deviceID) const;
   // Flit count of one mem_fetch, using the same rule as Push(); for buffer checks.
   unsigned flits_of(void* data) const;
   // ICP is the last node index in this router (clusters, then mems, then ICP).
   unsigned icp_index() const { return _n_shader + _n_mem; }
-  // H1-A: is `o` one of the outputs a packet on this router can be addressed to?
-  // Used by the XBAR_CAND_CHECK assert in Push(); cheap enough to keep public.
+  // Can output `o` be a packet's destination on the router? Used by the XBAR_CAND_CHECK assert.
   bool is_out_candidate(unsigned o) const {
     for (unsigned c : m_out_cand) if (c == o) return true;
     return false;
   }
   bool     has_icp() const { return _n_icp != 0; }
 
-  // Fix B: ICP ingress VOQ (per-destination-output queues) — removes head-of-line
-  // blocking of the single ICP ingress FIFO. Shared budget = in_buffer_limit (D1).
+  // ICP ingress VOQ: one queue per output (no head-of-line blocking), sharing one in_buffer_limit.
   bool has_icp_voq_room(unsigned flits) const {
     return m_icp_voq_flits + flits <= in_buffer_limit;
   }
@@ -133,8 +124,7 @@ class xbar_router {
       data = m_data;
       output_deviceID = m_output_deviceID;
       remaining_flits = m_flits;
-      orig_flits = m_flits;  // BUG-9 fix: kept so the egress push can restore
-                             // the packet's full size for out-buffer occupancy
+      orig_flits = m_flits;  // full size, restored for out-buffer occupancy
     }
 
     void* data;
@@ -142,12 +132,7 @@ class xbar_router {
     unsigned remaining_flits;
     unsigned orig_flits;
   };
-  // 44-1: FIFO with an O(1) running total of remaining_flits. queue_flits()
-  // used to COPY the whole std::queue and walk it on every Has_Buffer_* call
-  // (up to nodes x port_width times per xbar per icnt cycle). Invariant:
-  // flits == sum of remaining_flits over q, kept at the three mutation points
-  // (push / pop / dec_front_flits). Plain data, no virtuals, no allocation
-  // beyond the queue itself.
+  // FIFO that keeps flits == sum of remaining_flits, so queue_flits() is O(1).
   struct flit_queue {
     queue<Packet> q;
     unsigned flits;
@@ -169,10 +154,9 @@ class xbar_router {
   };
   vector<flit_queue> in_buffers;
   vector<flit_queue> out_buffers;
-  vector<unsigned char*> m_out_mirror;   // H3-3b: [local out] -> mirror byte or nullptr
+  vector<unsigned char*> m_out_mirror;   // [local out] -> busy flag or nullptr
   void mark_out(unsigned out) { if (m_out_mirror[out]) *m_out_mirror[out] = 1; }
-  // Fix B: per-output-destination ICP ingress queues (VOQ) + shared-budget flit count
-  // + per-output RR turn (alternate VOQ vs local inputs, starvation-free).
+  // ICP ingress VOQ, its flit total, and a per-output turn alternating VOQ and local inputs.
   vector<queue<Packet> > m_icp_voq;
   unsigned m_icp_voq_flits;
   vector<unsigned> m_icp_voq_rr;
@@ -180,29 +164,13 @@ class xbar_router {
   unsigned in_buffer_limit, out_buffer_limit;
   vector<unsigned> next_node;  // used for iSLIP arbit
   unsigned next_node_id;       // used for RR arbit
-  // H1-A (speed): outputs that can EVER be a packet's destination on this router.
-  // Local index layout is clusters [0,_n_shader), mems [_n_shader,_n_shader+_n_mem),
-  // then the ICP. Push() sends a local packet to m_local_idx[dst] and a remote one to
-  // icp_index(), and handoff_ring() ejects to m_local_idx[final_dev] -- so in REQ_NET
-  // a destination is a mem or the ICP, and in REPLY_NET a cluster or the ICP. The other
-  // outputs can never be granted (nothing ever carries their index) and their
-  // out_buffers stay empty, so Has_Buffer_Out() never fails on them either: skipping
-  // them in the grant loop changes no state and no counter. Ascending order, so the
-  // surviving outputs keep the order the full 0..total_nodes loop visited them in.
+  // Outputs that can ever be a destination here, ascending: mems + ICP in REQ_NET, clusters + ICP
+  // in REPLY_NET. Skipping the others in the grant loop is exact: nothing is addressed to them.
   vector<unsigned> m_out_cand;
-  // H1-B (speed): per-output count of inputs whose FRONT packet is addressed to that
-  // output. Arbitration only ever inspects an input's front, so a zero here (with an
-  // empty ICP VOQ) means the O(total_nodes) input scan cannot grant -- the scan is
-  // then skipped, which is what removes the empty-scan cost. Rebuilt once per
-  // iSLIP_Advance() inside the conflict-count pass that already walks every input,
-  // and kept exact for the rest of that cycle by the delta update at the pop site.
-  // Deliberately NOT maintained from Push(): Push() is reachable from several SM
-  // threads at once, and a shared counter there would be a data race (the per-cycle
-  // rebuild inside Advance() needs no synchronisation at all).
+  // Per output: inputs whose front packet goes there; 0 with an empty VOQ skips the input scan.
+  // Rebuilt in iSLIP_Advance(), not kept in Push(): Push() runs on several SM threads at once.
   vector<unsigned> m_out_pending;
-  // H1-D (speed): per-cycle "already seen this destination" marks for the conflict
-  // count, replacing a heap-allocated vector + std::find scan. Stamp equality means
-  // "seen this cycle", so no clearing pass is needed.
+  // Per-cycle seen-destination marks for the conflict count (stamp == m_seen_cur means seen).
   vector<unsigned long long> m_seen_stamp;
   unsigned long long m_seen_cur;
   unsigned m_id;
@@ -214,19 +182,18 @@ class xbar_router {
   unsigned grant_cycles;
   unsigned grant_cycles_count;
 
-  unsigned m_port_width;  // flits drained per cycle per OUTPUT port (>=1). Sets the
-                          // per-port intra-chiplet BW = m_port_width * flit * icnt_freq.
+  unsigned m_port_width;  // flits drained per cycle per OUTPUT port (>=1)
   unsigned _n_icp;  // number of inter-chiplet ports on this router (0 or 1)
   bool m_inter_via_ring;  // when true, do NOT inflate remote flits (ring owns inter BW)
 
  public:
-  unsigned queue_flits(const flit_queue& q) const;  // 44-1: O(1)
+  unsigned queue_flits(const flit_queue& q) const;  // O(1)
   
   friend class LocalInterconnect;
 };
 
-// Inter-chiplet ring. One instance per subnet. Bandwidth (link, 1 flit/cycle)
-// and wire latency (hop_latency cycles, non-blocking) are modeled separately.
+// Inter-chiplet ring, one per subnet: a link sends link_width flits per cycle, then the wire adds
+// hop_latency. The wire stage is unbounded, so a blocked delivery never stalls the link.
 class ring_net {
  public:
   ring_net(unsigned n_nodes, unsigned buf_depth, unsigned hop_latency,
@@ -238,13 +205,13 @@ class ring_net {
     wire.assign(N, std::vector<std::queue<RingPkt> >(2));  // [node][dir] (wire latency, in-flight)
     wire_ptw.assign(N, std::vector<std::queue<RingPkt> >(2));  // same, page-table-walk class
     eject_buf.assign(N, std::queue<RingPkt>());
-    link_flits.assign(N, std::vector<unsigned long long>(2, 0));   // RINGLINK_ (temp)
-    link_occ_sum.assign(N, std::vector<unsigned long long>(2, 0)); // RINGLINK_ (temp)
+    link_flits.assign(N, std::vector<unsigned long long>(2, 0));   // [RINGLINK]
+    link_occ_sum.assign(N, std::vector<unsigned long long>(2, 0)); // [RINGLINK]
     for (unsigned k = 0; k < RING_CLS; ++k) {   // 0 = data, 1 = page-table walk
-      ringlat_src_sum[k].assign(N, 0);   // RINGSRC_ (temp)
-      ringlat_src_cnt[k].assign(N, 0);   // RINGSRC_ (temp)
-      bkt_bw_sum[k].assign(N, 0);        // BUCKET_ (temp)
-      bkt_ej_sum[k].assign(N, 0);        // BUCKET_ (temp)
+      ringlat_src_sum[k].assign(N, 0);   // [RINGSRC]
+      ringlat_src_cnt[k].assign(N, 0);   // [RINGSRC]
+      bkt_bw_sum[k].assign(N, 0);        // [RINGSRC] bw/ejwait
+      bkt_ej_sum[k].assign(N, 0);        // [RINGSRC] bw/ejwait
     }
   }
   // Inject at node src toward dst. false (no-op) if the outgoing link buffer is full.
@@ -255,33 +222,31 @@ class ring_net {
     RingPkt p; p.data = data; p.final_dev = final_dev; p.dst = dst;
     p.dir = dir; p.flits = flits; p.remaining = flits; p.arrival = 0;
     p.cls = cls; p.wire_seq = 0;   // seq is stamped when the packet enters the wire stage
-    p.src = src;                                    /*RINGSRC_*/
-    p.inject_cycle = m_cycle;                       /*RINGLAT_*/
-    p.enter_link = m_cycle;                         /*BUCKET_*/
-    p.enter_wire = 0; p.t_bw_sum = 0; p.t_ej_sum = 0; /*BUCKET_*/
+    p.src = src;                                    /*[RINGSRC]*/
+    p.inject_cycle = m_cycle;                       /*[RINGLAT]*/
+    p.enter_link = m_cycle;                         /*[RINGSRC] bw/ejwait*/
+    p.enter_wire = 0; p.t_bw_sum = 0; p.t_ej_sum = 0; /*[RINGSRC] bw/ejwait*/
     link[src][dir].push(p);
     return true;
   }
   // One cycle: (A) bandwidth on each link head, (B) wire-latency delivery.
   void advance() {
     ++m_cycle;
-    if (g_accelsim_diag) ++link_occ_samples;   // RINGLINK_ (temp, P-5 gated)
-    // Phase A: drain up to m_link_width flits per link per cycle, spanning packets
-    // (so small packets can pass multiple-per-cycle -> high link bandwidth).
-    // BW(per link/dir) = m_link_width * inter_flit_size * freq.
+    if (g_accelsim_diag) ++link_occ_samples;   // [RINGLINK]
+    // Phase A: each link drains up to m_link_width flits per cycle, across packet boundaries.
     for (unsigned c = 0; c < N; ++c)
       for (unsigned d = 0; d < 2; ++d) {
         if (g_accelsim_diag)
-          link_occ_sum[c][d] += link[c][d].size();  // RINGLINK_ (temp, P-5 gated)
+          link_occ_sum[c][d] += link[c][d].size();  // [RINGLINK]
         unsigned budget = m_link_width;
         while (budget > 0 && !link[c][d].empty()) {
           RingPkt& p = link[c][d].front();
           unsigned take = (p.remaining < budget) ? p.remaining : budget;
-          if (g_accelsim_diag) link_flits[c][d] += take;  // RINGLINK_ (temp, P-5 gated)
+          if (g_accelsim_diag) link_flits[c][d] += take;  // [RINGLINK]
           p.remaining -= take;
           budget      -= take;
           if (p.remaining == 0) {              // finished on this link -> wire (latency) stage
-            if (g_accelsim_diag) {                   /*BUCKET_ (P-5 gated)*/
+            if (g_accelsim_diag) {                   /*[RINGSRC] bw/ejwait*/
               p.t_bw_sum += (m_cycle - p.enter_link);
               p.enter_wire = m_cycle;
             }
@@ -294,23 +259,19 @@ class ring_net {
           }
         }
       }
-    // Phase B: deliver wire packets whose arrival<=now to the next node. A delivered
-    // packet enters link[next] (xmit) with remaining=flits, so it is never advanced
-    // twice in one cycle (Phase A already ran) -> deterministic.
+    // Phase B: deliver arrived wire packets; runs after Phase A, so no packet moves twice a cycle.
     for (unsigned c = 0; c < N; ++c)
       for (unsigned d = 0; d < 2; ++d) {
         while (std::queue<RingPkt>* wq = wire_head(c, d)) {
           RingPkt p = wq->front();
           unsigned next = neighbor(c, d);
-          // BUCKET_ (temp, P-5 gated): wait beyond the legit hop latency here. The
-          // legit latency is per class, so a PTW packet is not credited with the data
-          // class's wire time (that would make its ejwait come out negative-biased).
+          // [RINGSRC] ejwait: wait beyond the packet class's own hop latency.
           const unsigned hl = hop_lat_of(p.cls);
           unsigned long long ejw = (g_accelsim_diag && m_cycle - p.enter_wire > hl)
                                    ? (m_cycle - p.enter_wire - hl) : 0;
           if (next == p.dst) {                          // arrived at destination chiplet
             if (eject_buf[next].size() >= m_buf) break; // eject full -> wait
-            if (g_accelsim_diag) {  /*RINGLAT_/RINGSRC_/BUCKET_ (P-5 gated)*/
+            if (g_accelsim_diag) {  /*[RINGLAT], [RINGSRC]*/
               unsigned long long rt = m_cycle - p.inject_cycle;
               ringlat_sum[p.cls] += rt; ringlat_cnt[p.cls]++;
               if (rt > ringlat_max[p.cls]) ringlat_max[p.cls] = rt;
@@ -321,15 +282,15 @@ class ring_net {
                 bkt_ej_sum[p.cls][p.src] += p.t_ej_sum;
               }
             }
-            xlatdbg_wire_note(p.cls, m_cycle - p.enter_wire);   // XLATDBG_ (temp)
+            xlatdbg_wire_note(p.cls, m_cycle - p.enter_wire);   // [XLATDBG_WIRE]
             eject_buf[next].push(p); wq->pop();
           } else {                                      // forward to next hop's link
             if (link[next][d].size() >= m_buf) break;   // downstream link full -> wait
-            if (g_accelsim_diag) {                      /*BUCKET_ (P-5 gated)*/
+            if (g_accelsim_diag) {                      /*[RINGSRC] bw/ejwait*/
               p.t_ej_sum += ejw;
               p.enter_link = m_cycle;
             }
-            xlatdbg_wire_note(p.cls, m_cycle - p.enter_wire);   // XLATDBG_ (temp)
+            xlatdbg_wire_note(p.cls, m_cycle - p.enter_wire);   // [XLATDBG_WIRE]
             p.remaining = p.flits;                      // re-transmit (bandwidth) on next link
             link[next][d].push(p); wq->pop();
           }
@@ -350,20 +311,10 @@ class ring_net {
     return false;
   }
  public:
-  // RINGLAT_ (temp): ring traversal-time stats (inject -> eject), inter-chiplet only.
-  // Indexed by packet class: [0] = data, [1] = page-table walk. Once the two
-  // classes can carry different hop latencies (-icnt_ptw_ring_hop_latency), one
-  // combined average is a blend of two populations and cannot answer "did data
-  // traffic get faster?". The combined value is still reported, recomputed as the
-  // sum over classes, so existing logs stay comparable.
+  // [RINGLAT]: ring inject -> eject time per packet class ([0] data, [1] page-table walk).
   enum { RING_CLS = 2 };
-  // XLATDBG_ (temp): per-hop wire residency, MEASURED directly as
-  // (delivery cycle - wire entry cycle), not derived by subtracting other stats.
-  // A packet that is never blocked leaves the wire stage exactly hop_lat_of(cls)
-  // cycles after entering it, so `min` must equal the configured latency for that
-  // class. A larger min means the wire stage still blocks one class behind the
-  // other; avg > min is ordinary eject/link backpressure and is reported by ejwait.
-  // Recorded only under ACCELSIM_DIAG, because enter_wire is stamped only there.
+  // [XLATDBG_WIRE]: measured per-hop wire time per class (ACCELSIM_DIAG only). An unblocked
+  // packet stays exactly hop_lat_of(cls), so min must equal the configured latency.
   unsigned long long xlatdbg_wire_sum[RING_CLS] = {0, 0};
   unsigned long long xlatdbg_wire_cnt[RING_CLS] = {0, 0};
   unsigned long long xlatdbg_wire_min[RING_CLS] = {~0ULL, ~0ULL};
@@ -374,26 +325,20 @@ class ring_net {
     if (w < xlatdbg_wire_min[cls]) xlatdbg_wire_min[cls] = w;
     if (w > xlatdbg_wire_max[cls]) xlatdbg_wire_max[cls] = w;
   }
-  // Configured latency for a class, so the report can print the expected value
-  // beside the measured one instead of the reader having to look it up.
+  // Configured hop latency of a class, printed beside the measured one.
   unsigned hop_lat_cfg(unsigned cls) const { return hop_lat_of(cls); }
   unsigned long long ringlat_sum[RING_CLS] = {0, 0};
   unsigned long long ringlat_cnt[RING_CLS] = {0, 0};
   unsigned long long ringlat_max[RING_CLS] = {0, 0};
-  // RINGLINK_ (temp): per-(node,dir) link load. link_flits = flits transmitted (throughput),
-  // link_occ_sum/link_occ_samples = avg queue occupancy. Shows tie-break CW/CCW imbalance.
+  // [RINGLINK]: per-(node,dir) flits sent and queue occupancy sum (avg = sum / samples).
   std::vector<std::vector<unsigned long long> > link_flits;
   std::vector<std::vector<unsigned long long> > link_occ_sum;
   unsigned long long link_occ_samples = 0;
   unsigned ring_N() const { return N; }
-  // RINGSRC_ (temp): per-SOURCE-chiplet ring residency (inject->eject). Isolates
-  // whether a source's ring time is high (e.g. eject-order unfairness at the hub).
+  // [RINGSRC]: ring time (inject -> eject) per source chiplet.
   std::vector<unsigned long long> ringlat_src_sum[RING_CLS];
   std::vector<unsigned long long> ringlat_src_cnt[RING_CLS];
-  // BUCKET_ (temp): per-source ring-residency breakdown. t_wire = total - bw - ejwait.
-  //   bw     = time in link[] bandwidth stage (serialization/queue for the link)
-  //   ejwait = time in wire[] AFTER arrival passed but blocked from eject/forward
-  //            (this is the artifact shadow: ICP-ingress/downstream backpressure).
+  // [RINGSRC] per source: bw = time in link[], ejwait = time blocked in wire[] (wire = the rest).
   std::vector<unsigned long long> bkt_bw_sum[RING_CLS];
   std::vector<unsigned long long> bkt_ej_sum[RING_CLS];
  private:
@@ -401,9 +346,9 @@ class ring_net {
                    unsigned cls;                 // packet class: 0 = data, 1 = page-table walk
                    unsigned long long wire_seq;  // stamped on wire entry; orders the class merge
                    unsigned long long arrival;
-                   unsigned long long inject_cycle; /*RINGLAT_*/
-                   unsigned long long enter_link, enter_wire; /*BUCKET_*/
-                   unsigned long long t_bw_sum, t_ej_sum;     /*BUCKET_*/ };
+                   unsigned long long inject_cycle; /*[RINGLAT]*/
+                   unsigned long long enter_link, enter_wire; /*[RINGSRC] bw/ejwait*/
+                   unsigned long long t_bw_sum, t_ej_sum;     /*[RINGSRC] bw/ejwait*/ };
   unsigned N, m_buf, m_hop_latency;
   unsigned m_hop_latency_ptw;          // wire latency for the page-table-walk class
   unsigned long long m_wire_seq = 0;   // monotonic, stamped when a packet enters the wire
@@ -417,9 +362,7 @@ class ring_net {
   unsigned hop_lat_of(unsigned cls) const {
     return cls ? m_hop_latency_ptw : m_hop_latency;
   }
-  // Earliest deliverable packet on (c,d): (arrival, wire_seq) order. The sequence
-  // number is stamped on wire entry, so when both classes share one hop latency the
-  // merged order is exactly the order the single wire FIFO used to deliver in.
+  // Earliest deliverable packet on (c,d) over both classes, by (arrival, wire_seq).
   std::queue<RingPkt>* wire_head(unsigned c, unsigned d) {
     std::queue<RingPkt>* best = NULL;
     std::queue<RingPkt>* qs[2] = { &wire[c][d], &wire_ptw[c][d] };
@@ -440,11 +383,7 @@ class ring_net {
     unsigned cw = (d + N - s) % N, ccw = (s + N - d) % N;
     if (cw < ccw) return 0u;                              // strictly shorter CW
     if (ccw < cw) return 1u;                              // strictly shorter CCW
-    // Equidistant (distance N/2, e.g. 0<->2 on a 4-node ring): a fixed CW tie-break
-    // overloads one direction (2-hop traffic always rides the CW link out of the hub).
-    // Deterministic round-robin -> split equidistant traffic 50/50 across CW/CCW.
-    // (A queue-occupancy adaptive rule is near-useless here: with a wide link_width the
-    //  bandwidth-stage queue drains almost every cycle, so its size ~0 and never tips.)
+    // Equidistant: alternate CW/CCW so one direction does not take all half-ring traffic.
     return (m_tie_rr++ & 1u);
   }
 };
@@ -463,13 +402,11 @@ class LocalInterconnect {
   void* Pop(unsigned ouput_deviceID);
   void Advance();
   bool Busy() const;
-  // Can a packet of `bytes` bytes enter deviceID's input buffer? Input buffers count
-  // flits, so the size is converted with bytes_to_flits() before the check.
+  // Room for a `bytes`-byte packet in deviceID's input buffer (converted to flits)?
   bool HasBuffer(unsigned deviceID, unsigned int bytes) const;
-  // Flit sizes in bytes that mem_fetch::get_num_flits() uses (-icnt_flit_size,
-  // -icnt_inter_flit_size). Set once at init, before the first HasBuffer().
+  // Flit sizes (bytes) as mem_fetch uses them; set at init, before the first HasBuffer().
   void set_flit_sizes(unsigned local_flit_bytes, unsigned inter_flit_bytes);
-  // H3-3b: Pop(dev) 이 읽는 바로 그 출력 버퍼에 대한 미러 등록 / 비었는지 확인.
+  // Register / query the busy flag of the exact output buffer Pop(dev) reads.
   void SetOutMirror(unsigned dev, unsigned char *slot);
   bool OutEmpty(unsigned dev) const;
   void DisplayStats() const;
@@ -488,11 +425,10 @@ class LocalInterconnect {
   unsigned n_shader, n_mem;
   unsigned n_subnets;
 
-  // One local crossbar per chiplet: net[subnet][chiplet]. (Phase 1)
+  // One local crossbar per chiplet: net[subnet][chiplet].
   std::vector<std::vector<xbar_router*> > net;
 
-  // Inter-chiplet egress -> ingress transfer. Zero latency in Phase 1;
-  // the ring is inserted here in Phase 2.
+  // No ring: move ICP egress packets straight to the destination ICP ingress (no latency).
   void handoff();
 
   // Device->chiplet owner maps and O(1) lookups, built by configure_chiplets().
@@ -503,7 +439,7 @@ class LocalInterconnect {
   std::vector<unsigned> m_n_local_cluster;  // [n_chiplets] cluster count per chiplet
   std::vector<unsigned> m_n_local_mem;      // [n_chiplets] mem-sub count per chiplet
 
-  bool m_use_ring = false;                 // ring vs Phase-1 direct handoff
+  bool m_use_ring = false;                 // ring, or direct handoff when -icnt_use_ring 0
   unsigned m_flit_bytes_local = 0;         // -icnt_flit_size
   unsigned m_flit_bytes_inter = 0;         // -icnt_inter_flit_size
   // Flits a packet of `bytes` bytes occupies in a router input buffer.
@@ -511,10 +447,7 @@ class LocalInterconnect {
   std::vector<ring_net*> m_ring;           // one ring per subnet (when m_use_ring)
   void handoff_ring();                     // ICP egress<->ring<->ICP ingress
 
-  // RINGINJ_ (temp): per-(subnet,src chiplet) source-side ring egress accounting.
-  // egress_busy: cycles the icp egress had >=1 packet pending at handoff time.
-  // inj_stall:   cycles inject() failed (ring link buffer full) -> ring-BW bound.
-  // inj_ok:      successful injects. handoff_advances: total handoff_ring() calls.
+  // [RINGINJ]: egress-busy cycles and failed/successful injects per (subnet, src chiplet).
   std::vector<std::vector<unsigned long long> > m_rinj_egress_busy;
   std::vector<std::vector<unsigned long long> > m_rinj_stall;
   std::vector<std::vector<unsigned long long> > m_rinj_ok;

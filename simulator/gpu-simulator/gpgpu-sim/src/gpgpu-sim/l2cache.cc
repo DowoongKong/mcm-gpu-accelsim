@@ -98,8 +98,7 @@ memory_partition_unit::memory_partition_unit(unsigned partition_id,
 void memory_partition_unit::handle_memcpy_to_gpu(
     size_t addr, unsigned global_subpart_id, mem_access_sector_mask_t mask) {
   unsigned p = global_sub_partition_id_to_local_id(global_subpart_id);
-  // S2: build the debug string only when this trace stream is on (it was built
-  // for every 32 B of every memcpy and thrown away).
+  // Build the debug string only when traced (runs for every 32 B of every memcpy).
   if (MEMPART_DTRACE(MEMORY_PARTITION_UNIT)) {
     std::string mystring = mask.to_string<char, std::string::traits_type,
                                           std::string::allocator_type>();
@@ -614,19 +613,11 @@ bool memory_sub_partition::dram_L2_queue_full() const {
 
 void memory_sub_partition::dram_L2_queue_push(class mem_fetch *mf) {
   m_dram_L2_queue->push(mf);
-  // Called from the parallel DRAM loop. A sub-partition belongs to one memory
-  // partition, so only one thread writes this flag.
+  // Parallel DRAM loop: only the owning partition's thread writes the flag.
   if (m_l2loop_mirror) *m_l2loop_mirror = 1;
 }
 
-// A cache_cycle() visit only takes one L2-port sample when all of these hold:
-//  - not full(sector): otherwise the caller counts gpu_stall_dramfull.
-//  - fill responses: access_ready() is false.
-//  - DRAM -> L2: m_dram_L2_queue is empty.
-//  - L2cache->cycle(): miss queue empty and both ports free -> one (false,false) sample.
-//  - new accesses: m_icnt_L2_queue is empty.
-//  - ROP: m_rop is empty (entries that are not ready yet still count as work).
-// m_L2_icnt_queue and m_L2_dram_queue do not matter here (block 2 and the DRAM drain them).
+// True if cache_cycle() would only take an idle L2-port sample; output queues drain elsewhere.
 bool memory_sub_partition::l2loop_idle(unsigned sector_chunk) const {
   if (full(sector_chunk)) return false;
   if (!m_dram_L2_queue->empty() || !m_icnt_L2_queue->empty() || !m_rop.empty()) return false;
@@ -848,9 +839,8 @@ mem_fetch *memory_sub_partition::pop() {
 
 mem_fetch *memory_sub_partition::top() {
   mem_fetch *mf = m_L2_icnt_queue->top();
-  // Writebacks need no reply: drop every one at the head and report the next real packet.
-  // NULL must keep meaning "the head slot is empty", because cycle() pops the queue on NULL;
-  // returning NULL right after dropping a writeback made that pop remove the next packet unsent.
+  // Drop the writebacks at the head (they need no reply) and return the next real packet.
+  // Return NULL only for an empty queue: cycle() pops the queue on NULL.
   while (mf && (mf->get_access_type() == L2_WRBK_ACC ||
                 mf->get_access_type() == L1_WRBK_ACC)) {
     m_L2_icnt_queue->pop();

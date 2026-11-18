@@ -65,22 +65,18 @@ extern unsigned g_network_mode;
 enum network_mode { INTERSIM = 1, LOCAL_XBAR = 2, N_NETWORK_MODE };
 
 void icnt_wrapper_init();
-// H3-3b (speed): 로컬 xbar 인터커넥트일 때만 쓸 수 있는 출력 버퍼 미러 훅.
+// Output-buffer busy flags; available only with the local xbar interconnect.
 bool icnt_out_mirror_supported();
 void icnt_set_out_mirror(unsigned out, unsigned char *slot);
 bool icnt_out_empty(unsigned out);
 void icnt_reg_options(class OptionParser* opp);
 
-// Phase 1 (inter-chiplet split): inject the device->chiplet owner maps into the
-// LocalInterconnect before icnt_create(), so the crossbar is split per chiplet.
-// No-op unless g_network_mode == LOCAL_XBAR. Encapsulates g_localicnt_interface
-// (defined in icnt_wrapper.cc) so callers need no access to that global.
+// Splits the local xbar per chiplet; call before icnt_create(). No-op unless LOCAL_XBAR.
 void icnt_configure_chiplets(unsigned n_chiplets,
                              const std::vector<unsigned>& cluster_to_chiplet,
                              const std::vector<unsigned>& mem_sub_to_chiplet);
 bool icnt_ring_enabled();
-// No-op unless g_network_mode == LOCAL_XBAR. Hands the flit sizes (bytes) that mem_fetch uses
-// to the local interconnect, which converts icnt_has_buffer() sizes from bytes to flits.
+// Flit sizes (bytes) for converting icnt_has_buffer() sizes to flits. No-op unless LOCAL_XBAR.
 void icnt_set_flit_sizes(unsigned local_flit_bytes, unsigned inter_flit_bytes);
 
 #endif

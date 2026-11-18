@@ -267,7 +267,7 @@ class kernel_info_t {
   dim3 get_cta_dim() const { return m_block_dim; }
 
   void increment_cta_id() {
-    if (m_pcc_on) pcc_advance();   // PCC: advance the home chiplet's cursor
+    if (m_pcc_on) pcc_advance();   // distributed scheduling: advance the home chiplet's cursor
     else increment_x_then_y_then_z(m_next_cta, m_grid_dim);
     m_next_tid.x = 0;
     m_next_tid.y = 0;
@@ -279,17 +279,14 @@ class kernel_info_t {
            m_grid_dim.x * m_grid_dim.y * m_next_cta.z;
   }
   bool no_more_ctas_to_run() const {
-    if (m_pcc_on) return pcc_all_exhausted();   // PCC: every chiplet cursor done
+    if (m_pcc_on) return pcc_all_exhausted();   // distributed scheduling: every cursor done
     return (m_next_cta.x >= m_grid_dim.x || m_next_cta.y >= m_grid_dim.y ||
             m_next_cta.z >= m_grid_dim.z);
   }
 
-  // PCC (per-chiplet CTA cursors, docs/cta_chiplet_cursor.ko.md). The home
-  // chiplet of a CTA is a pure function of its linear id (same rule the
-  // cluster issue path applied); each chiplet walks its own CTAs in ascending
-  // id order, so WHEN a CTA is issued no longer depends on other chiplets.
-  // m_next_cta keeps meaning "the CTA being issued right now": valid between
-  // pcc_select() and the last thread init (which calls increment_cta_id()).
+  // Distributed CTA scheduling (MCM-GPU, ISCA'17): each chiplet issues its own CTAs (home chiplet =
+  // f(CTA id)) in ascending order through a per-chiplet cursor (pcc_*), independent of other chiplets.
+  // m_next_cta is the CTA being issued, valid from pcc_select() to the last thread init.
   bool     pcc_on() const { return m_pcc_on; }
   unsigned pcc_n() const { return m_pcc_n; }
   void     pcc_init(unsigned n_chiplets, bool static_binding);
@@ -404,7 +401,7 @@ class kernel_info_t {
   // LASP configuration for CTA scheduling
   lasp::kernel_lasp_config_t m_lasp_config;
 
-  // PCC state (see pcc_* above)
+  // Distributed CTA scheduling state (see pcc_* above)
   void     pcc_advance();
   bool     pcc_all_exhausted() const;
   unsigned pcc_lin(const dim3 &d) const;
@@ -521,10 +518,8 @@ class simt_stack {
 // Let's just upgrade to C++11 so we can use constexpr here...
 // start allocating from this address (lower values used for allocating globals
 // in .ptx file)
-// Device-heap VA base (3GB): cudaMalloc hands out VAs from here upward, and
-// whichspace() classifies any address >= this as global_space. (An experiment
-// that moved the VA base to 512GB to force 4-level page walks was abandoned;
-// see git history.)
+// Device-heap VA base (3GB): cudaMalloc hands out VAs from here up; whichspace()
+// treats any address >= this as global_space.
 const unsigned long long GLOBAL_HEAP_START = 0xC0000000ULL;
 
 // Volta max shmem size is 96kB
@@ -1148,12 +1143,8 @@ class warp_inst_t : public inst_t {
     m_depbar_group_no = 0;
   }
   virtual ~warp_inst_t() {}
-  // A user-declared destructor suppresses the implicit move operations, so
-  // every assignment of a warp_inst_t was a deep copy of m_per_scalar_thread
-  // (32 entries) and m_accessq. The decoupled-TLB park/replay path assigns
-  // these millions of times per run; making the moves explicit keeps that path
-  // from deep-copying. Semantics are unchanged -- moved-from objects are always
-  // cleared or overwritten right after.
+  // Explicit moves: the user-declared destructor would otherwise make every assignment a deep copy
+  // (park/replay assigns these very often). Moved-from objects are always cleared or overwritten.
   warp_inst_t(warp_inst_t &&) = default;
   warp_inst_t &operator=(warp_inst_t &&) = default;
   warp_inst_t(const warp_inst_t &) = default;
@@ -1504,7 +1495,7 @@ class register_set {
   void move_in(warp_inst_t *&src) {
     warp_inst_t **free = get_free();
     move_warp(*free, src);
-    m_occupied++;  // T6
+    m_occupied++;
   }
   // void copy_in( warp_inst_t* src ){
   //   src->copy_contents_to(*get_free());
@@ -1518,13 +1509,13 @@ class register_set {
       free = get_free(sub_core_model, reg_id);
     }
     move_warp(*free, src);
-    m_occupied++;  // T6
+    m_occupied++;
   }
 
   void move_out_to(warp_inst_t *&dest) {
     warp_inst_t **ready = get_ready();
     move_warp(dest, *ready);
-    m_occupied--;  // T6
+    m_occupied--;
   }
   void move_out_to(bool sub_core_model, unsigned reg_id, warp_inst_t *&dest) {
     if (!sub_core_model) {
@@ -1533,7 +1524,7 @@ class register_set {
     warp_inst_t **ready = get_ready(sub_core_model, reg_id);
     assert(ready != NULL);
     move_warp(dest, *ready);
-    m_occupied--;  // T6
+    m_occupied--;
   }
 
   warp_inst_t **get_ready() {
@@ -1593,12 +1584,8 @@ class register_set {
 
   unsigned get_size() { return regs.size(); }
 
-  // T6 (P4-5): number of non-empty slots. Maintained by every path that fills
-  // or empties a slot: move_in / move_out_to above, plus the two sites that
-  // touch a slot directly (shader_core_ctx::issue_warp copies into a free
-  // ID_OC slot -> note_external_fill; shader_core_ctx::writeback clears an
-  // EX_WB slot in place -> note_external_clear). Lets a hot caller answer
-  // "is anything here?" with one load instead of dereferencing each slot.
+  // Non-empty slot count, kept by move_in/move_out_to and the two in-place users
+  // (issue_warp -> note_external_fill, writeback -> note_external_clear).
   bool any_occupied() const { return m_occupied != 0; }
   void note_external_fill() { m_occupied++; }
   void note_external_clear() {
@@ -1616,7 +1603,7 @@ class register_set {
  private:
   std::vector<warp_inst_t *> regs;
   const char *m_name;
-  unsigned m_occupied = 0;  // T6
+  unsigned m_occupied = 0;
 };
 
 #endif  // #ifdef __cplusplus

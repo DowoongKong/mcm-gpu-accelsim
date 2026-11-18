@@ -346,10 +346,8 @@ enum cache_request_status tag_array::access(new_addr_type addr, unsigned time,
                                             evicted_block_info &evicted,
                                             mem_fetch *mf) {
   m_access++;
-  // H2-C: mirror the flag on its false->true transition only. gpgpu_sim clears the
-  // mirror when it invalidates that cluster, and is_used is set true here and
-  // nowhere else, so mirror==0 implies is_used==false -- which is exactly what makes
-  // skipping the invalidate() call state-identical.
+  // Mirror only the false->true change; gpgpu_sim clears the mirror on invalidate, so
+  // mirror == 0 implies !is_used (skipping that invalidate is exact).
   if (!is_used) {
     is_used = true;
     if (m_used_mirror) *m_used_mirror = 1;

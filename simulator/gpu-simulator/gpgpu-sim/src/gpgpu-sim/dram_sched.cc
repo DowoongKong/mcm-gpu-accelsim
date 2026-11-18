@@ -213,8 +213,7 @@ void dram_t::scheduler_frfcfs() {
     // Power stats
     // if(req->data->get_type() != READ_REPLY && req->data->get_type() !=
     // WRITE_ACK)
-    // m_stats is shared by every DRAM channel, and cycle() runs the channels in
-    // parallel, so these updates must be atomic.
+    // m_stats is shared by all DRAM channels, which cycle() runs in parallel: atomic updates.
 #pragma omp atomic
     m_stats->total_n_access++;
 

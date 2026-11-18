@@ -42,11 +42,7 @@ mem_fetch::mem_fetch(const mem_access_t &access, const warp_inst_t *inst,
     : m_access(access)
 
 {
-  // G5: shared static counter bumped from every mem_fetch construction, and
-  // mem_fetch objects are built inside the CORE phase (shader.cc, gpu-cache.cc,
-  // gmmu.cc). A plain read-modify-write here is a data race. The uid itself is
-  // only consumed by mem_fetch::print(), so ordering does not matter -- only
-  // uniqueness does. "atomic capture" gives that at no measurable cost.
+  // Atomic: mem_fetch objects are built in the parallel CORE passes; the uid is only printed.
 #pragma omp atomic capture
   m_request_uid = sm_next_mf_request_uid++;
   m_access = access;
@@ -83,10 +79,10 @@ mem_fetch::mem_fetch(const mem_access_t &access, const warp_inst_t *inst,
     m_raw_addr.sub_partition = m_original_mf->get_tlx_addr().sub_partition;
   }
   m_local_access = false;
-  m_va = access.get_addr();  // preserve VA; equals PA until TLB is connected
+  m_va = access.get_addr();  // the VA; set_pa() replaces the routing address after translation
   m_translated = false;
-  m_tlb_depth = -1;       // -1 = not a page table walk fetch (P3-1)
-  m_parent_mf = nullptr;  // no parent for regular SM requests (P3-1)
+  m_tlb_depth = -1;       // -1 = not a page table walk fetch
+  m_parent_mf = nullptr;  // no parent for regular SM requests
 }
 
 mem_fetch::~mem_fetch() { m_status = MEM_FETCH_DELETED; }

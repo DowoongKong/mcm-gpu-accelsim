@@ -10,10 +10,7 @@ namespace lasp {
 // ============================================================================
 // Scheduling Policy Enum
 // ============================================================================
-// Defines the CTA scheduling strategies for LASP
-//
-// Formulas below are the LIVE implementation's (simt_core_cluster::
-// issue_block2core); an earlier version of this comment had ROW/COL swapped.
+// Defines the CTA scheduling strategies for LASP (formulas as in simt_core_cluster::issue_block2core).
 //
 // ROW_BINDING:
 //   - Same y-coordinate CTAs are assigned to the same chiplet
@@ -59,7 +56,7 @@ struct kernel_lasp_config_t {
 };
 
 // ============================================================================
-// Helper Functions (optional, for future use)
+// Helper functions
 // ============================================================================
 
 // Convert policy enum to string for logging

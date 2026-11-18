@@ -70,7 +70,7 @@ void Scoreboard::reserveRegister(unsigned wid, unsigned regnum) {
 
 // Unmark register as write-pending
 void Scoreboard::releaseRegister(unsigned wid, unsigned regnum) {
-  m_release_epoch++;  // 44-8 (E1)
+  m_release_epoch++;  // issue epoch: see release_epoch()
   if (!(reg_table[wid].find(regnum) != reg_table[wid].end())) return;
   SHADER_DPRINTF(SCOREBOARD, "Release register - warp:%d, reg: %d\n", wid,
                  regnum);
@@ -127,11 +127,7 @@ void Scoreboard::releaseRegisters(const class warp_inst_t* inst) {
  * true if WAW or RAW hazard (no WAR since in-order issue)
  **/
 bool Scoreboard::checkCollision(unsigned wid, const class inst_t* inst) const {
-  // 44-6 (P4-0): the verdict is "does ANY of the instruction's registers sit
-  // in reg_table[wid]" -- an existence check, so deduplicating them through a
-  // heap-allocated std::set first changed nothing but cost a malloc + O(log)
-  // inserts per call on the issue hot path. Probe each register directly.
-  // Same membership lookups, same result, no temporary container.
+  // Existence check: probe each register directly (no temporary set).
   const std::set<unsigned>& tbl = reg_table[wid];
   for (unsigned i = 0; i < inst->outcount; i++)
     if (tbl.find(inst->out[i]) != tbl.end()) return true;
