@@ -470,8 +470,7 @@ void *gpgpu_t::gpu_malloc(size_t size) {
     m_dev_malloc += (256 - size % 256);  // align to 256 byte boundaries
   }
 
-  // Notify subclass of the full padded allocation range. (P3)
-  // aligned_size = m_dev_malloc - result (includes padding).
+  // Notify the subclass of the full padded allocation range (m_dev_malloc - result).
   size_t aligned_size = (size_t)(m_dev_malloc - result);
   on_gpu_malloc(result, aligned_size, pshift);
 
@@ -501,8 +500,7 @@ void *gpgpu_t::gpu_mallocarray(size_t size) {
     m_dev_malloc += (256 - size % 256);  // align to 256 byte boundaries
   }
 
-  // Notify subclass of the full padded allocation range. (P3)
-  // aligned_size = m_dev_malloc - result (includes padding).
+  // Notify the subclass of the full padded allocation range (m_dev_malloc - result).
   size_t aligned_size = (size_t)(m_dev_malloc - result);
   on_gpu_malloc(result, aligned_size, pshift);
 
@@ -2271,10 +2269,8 @@ kernel_info_t *cuda_sim::gpgpu_opencl_ptx_sim_init_grid(
       new kernel_info_t(gridDim, blockDim, entry, gpu->getNameArrayMapping(),
                         gpu->getNameInfoMapping());
   
-  // OpenCL kernels keep the kernel_lasp_config_t ctor default (KERNEL_WIDE);
-  // CUDA/trace kernels are stamped from config in gpgpu_sim::launch(). The
-  // OpenCL-only heuristic stub that used to run here (hardcoded chiplet
-  // count, SMELL-16) was removed in the audit fix pass.
+  // OpenCL kernels keep the default LASP config (KERNEL_WIDE); CUDA/trace kernels get it in
+  // gpgpu_sim::launch().
   unsigned argcount = args.size();
   unsigned argn = 1;
   for (gpgpu_ptx_sim_arg_list_t::iterator a = args.begin(); a != args.end();

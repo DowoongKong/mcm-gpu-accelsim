@@ -88,7 +88,7 @@ class memory_partition_unit {
   void visualizer_print(gzFile visualizer_file) const;
   void print_stat(FILE *fp) { m_dram->print_stat(fp); }
   void visualize() const { m_dram->visualize(); }
-  // ACCEPT_ (temp): DRAM BW utilization of this partition (bwutil/n_cmd).
+  // DRAM bandwidth utilization of this partition (bwutil / n_cmd).
   double get_dram_bwutil() const {
     unsigned long long nc = m_dram->get_ncmd();
     return nc ? (double)m_dram->get_bwutil() / nc : 0.0;
@@ -201,7 +201,7 @@ class memory_sub_partition {
   void set_l2icnt_mirror(unsigned char *slot) { m_l2icnt_mirror = slot; }
   bool l2icnt_queue_empty() const { return m_L2_icnt_queue->empty(); }
 
-  // Busy flag of this sub-partition in gpgpu_sim's L2 loop (block 4). The paths that
+  // Busy flag of this sub-partition in gpgpu_sim's L2 loop. The paths that
   // give it work outside the loop set it to 1: dram_L2_queue_push, flushL2 and
   // force_l2_tag_update. The ICNT output buffer sets it from the router side.
   void set_l2loop_mirror(unsigned char *slot) { m_l2loop_mirror = slot; }

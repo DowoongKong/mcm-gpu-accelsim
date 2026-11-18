@@ -38,8 +38,8 @@ enum mf_type {
   WRITE_REQUEST,
   READ_REPLY,  // send to shader
   WRITE_ACK,
-  TLB_FILL_ACC,   // GMMU page table walk read request (sent to memory) (P3-1)
-  TLB_FILL_REPLY  // reply to GMMU page table walk read (intercepted before SM) (P3-1)
+  TLB_FILL_ACC,   // GMMU page table walk read request (sent to memory)
+  TLB_FILL_REPLY  // reply to GMMU page table walk read (intercepted before SM)
 };
 
 #define MF_TUP_BEGIN(X) enum X {
@@ -72,7 +72,7 @@ class mem_fetch {
     } else if (m_type == WRITE_REQUEST) {
       assert(get_is_write());
       m_type = WRITE_ACK;
-    } else if (m_type == TLB_FILL_ACC) {  // NEW: convert PTW request to reply (P3-1)
+    } else if (m_type == TLB_FILL_ACC) {  // PTW request -> reply
       m_type = TLB_FILL_REPLY;
     }
   }
@@ -93,7 +93,7 @@ class mem_fetch {
   void set_addr(new_addr_type addr) { m_access.set_addr(addr); }
   new_addr_type get_va() const { return m_va; } // Returns the original virtual address before TLB translation.
   bool is_translated() const { return m_translated; } // Returns true if TLB translation has completed for this request.
-  // (P3-1)
+  // Page-walk fields (PTW requests only)
   int        get_tlb_depth()  const { return m_tlb_depth; }
   mem_fetch* get_parent_mf()  const { return m_parent_mf; }
   void set_tlb_depth(int d)         { m_tlb_depth = d; }
@@ -192,7 +192,7 @@ class mem_fetch {
   new_addr_type m_va;    // original VA before TLB translation
   bool m_translated;     // true after set_pa() is called
 
-  // (P3-1)
+  // Page-walk fields (PTW requests only)
   int        m_tlb_depth;    // PT walk level (0=PML4, 1=PDP, 2=PD, 3=PT leaf). -1 = not a PTW mf.
   mem_fetch* m_parent_mf;    // phantom parent_mf that carries {va, cluster_id}. nullptr if not PTW.
 

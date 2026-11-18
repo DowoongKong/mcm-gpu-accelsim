@@ -121,7 +121,7 @@ void accel_sim_framework::parse_commandlist() {
       kernel_info = create_kernel_info(kernel_trace_info, m_gpgpu_context,
                                        &tconfig, &tracer);
       kernels_info.push_back(kernel_info);
-      m_gpgpu_sim->on_kernel_created(kernel_info);   // KERNEL HAND-OVER
+      m_gpgpu_sim->on_kernel_created(kernel_info);   // kernel hand-over, see on_kernel_deleted()
       std::cout << "Header info loaded for kernel command : "
                 << commandlist[commandlist_index].command_string << std::endl;
       commandlist_index++;
@@ -147,7 +147,7 @@ void accel_sim_framework::cleanup(unsigned finished_kernel) {
         }
       }
       tracer.kernel_finalizer(k->get_trace_info());
-      m_gpgpu_sim->on_kernel_deleted(k);   // KERNEL HAND-OVER: before k is freed
+      m_gpgpu_sim->on_kernel_deleted(k);   // kernel hand-over; must run before k is freed
       delete k->entry();
       delete k;
       kernels_info.erase(kernels_info.begin() + j);

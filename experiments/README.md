@@ -6,7 +6,7 @@ Qwen3-30B-A3B, Mixtral-8x7B-v0.1 (MoE) decode on a 4-chiplet MCM GPU.
 | path | contents |
 |---|---|
 | `scripts/` | trace capture (vLLM 0.19.1 + NVBit), prefill placement prediction, simulation kits and arms, context sweep, analysis |
-| `configs/` | simulator configs (`mem128_s31_20261111`, `mem256_s31_20261112`: `sim/{ref_mcm,base_mcm,ptwhop0_mcm}`, `validate/`) |
+| `configs/` | simulator configs (`mem128_s31_20261111`, `mem256_s31_20261112`: `sim/{ref_mcm,base_mcm,ptwhop0_mcm}`, `validate/`; `mem128_s32_20261118`, `mem256_s32_20261118`: next version in progress, see their `CHANGES.md`) |
 | `tracer/` | NVBit tracer patch against Accel-Sim `3016c65`, capture container Dockerfile and package list |
 
 | step | entry points in `scripts/` |

@@ -45,10 +45,7 @@
 
 void mem_access_t::init(gpgpu_context *ctx) {
   gpgpu_ctx = ctx;
-  // G6: same class of race as G5 (mem_fetch uid). mem_access_t objects are
-  // built during the parallel CORE phase (generate_mem_accesses at issue), so
-  // a plain read-modify-write on the shared counter is a data race. The uid is
-  // never compared by the model, so only uniqueness matters.
+  // Atomic: accesses are built in the parallel CORE passes; only uniqueness matters.
 #pragma omp atomic capture
   m_uid = ++(gpgpu_ctx->sm_next_access_uid);
   m_addr = 0;
@@ -60,18 +57,8 @@ void warp_inst_t::issue(const active_mask_t &mask, unsigned warp_id,
                         int sch_id, unsigned long long streamID) {
   m_warp_active_mask = mask;
   m_warp_issued_mask = mask;
-  // G6: this counter is bumped by every SM's issue stage inside the parallel
-  // CORE phase, and the uid it hands out IS model-visible: register_set::
-  // get_ready() / get_ready_reg_id() pick the OLDEST (minimum-uid) instruction
-  // among a core's pipeline registers (EX_WB writeback order among others).
-  // With a plain non-atomic ++ a stale delayed store can roll the counter
-  // BACKWARDS, so a later instruction of the SAME core can receive a smaller
-  // uid than one still in flight -- get_ready() then picks a different
-  // "oldest" and the trajectory forks (observed as one random SM falling a few
-  // cycles behind at 8/16 threads). Atomic capture makes the counter globally
-  // monotone, which restores the only property the model consumes: uids of one
-  // core's instructions strictly increase in issue order. Absolute values may
-  // differ from a 1-thread run; they are never compared across cores.
+  // Atomic (parallel CORE passes): get_ready() picks the oldest (minimum-uid) instruction, so one
+  // core's uids must increase in issue order; absolute values may differ between thread counts.
 #pragma omp atomic capture
   m_uid = ++(m_config->gpgpu_ctx->warp_inst_sm_next_uid);
   m_streamID = streamID;
@@ -823,9 +810,7 @@ kernel_info_t::kernel_info_t(
   m_next_tid = m_next_cta;
   m_num_cores_running = 0;
   m_uid = (entry->gpgpu_ctx->kernel_info_m_next_uid)++;
-  // BUG-1 fix: this ctor (texture-snapshot launch path) never received a
-  // stream id and left m_streamID uninitialized -- heap-dependent statistics
-  // keys. -1 marks "no stream", matching what callers without a stream pass.
+  // No stream on this launch path: -1 marks "no stream".
   m_streamID = (unsigned long long)-1;
   m_param_mem = new memory_space_impl<8192>("param", 64 * 1024);
 
@@ -850,7 +835,7 @@ kernel_info_t::kernel_info_t(
 }
 
 // ---------------------------------------------------------------------------
-// PCC: per-chiplet CTA cursors (docs/cta_chiplet_cursor.ko.md)
+// Distributed CTA scheduling: per-chiplet CTA cursors
 // ---------------------------------------------------------------------------
 unsigned kernel_info_t::pcc_lin(const dim3 &d) const {
   return d.x + m_grid_dim.x * d.y + m_grid_dim.x * m_grid_dim.y * d.z;
@@ -911,7 +896,7 @@ void kernel_info_t::pcc_select(unsigned c) {
 
 void kernel_info_t::pcc_advance() {
   const unsigned lin = pcc_lin(m_next_cta);
-  assert(lin < m_pcc_total && "PCC: increment without a selected CTA");
+  assert(lin < m_pcc_total && "distributed CTA scheduling: increment without a selected CTA");
   const unsigned c = pcc_home(lin);
   assert(m_pcc_cur[c] == lin);
   unsigned nxt = m_pcc_total;

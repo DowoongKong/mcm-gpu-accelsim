@@ -129,8 +129,7 @@ void trace_kernel_info_t::get_next_threadblock_traces(
       m_kernel_trace_info->enable_lineinfo, m_kernel_trace_info->pipeReader);
 }
 
-// PCC: each chiplet owns an independent reader over the same trace file and
-// consumes only its own thread blocks (ascending id order, like the cursor).
+// Distributed CTA scheduling: each chiplet reads only its own thread blocks, with its own reader.
 void trace_kernel_info_t::get_threadblock_traces_pcc(
     std::vector<std::vector<inst_trace_t> *> threadblock_traces,
     unsigned chiplet, unsigned want_lin) {
@@ -145,8 +144,7 @@ void trace_kernel_info_t::get_threadblock_traces_pcc(
       m_kernel_trace_info->enable_lineinfo, *m_pcc_readers[chiplet],
       (long long)want_lin, m_kernel_trace_info->grid_dim_x,
       m_kernel_trace_info->grid_dim_y);
-  // The cursor was already advanced (last thread init precedes init_traces):
-  // if this chiplet has nothing left, release its decompressor now.
+  // Free the reader once the chiplet has no CTAs left (the cursor is already advanced).
   if (!pcc_has_cta(chiplet)) m_pcc_readers[chiplet].reset();
 }
 
@@ -607,7 +605,9 @@ const warp_inst_t *trace_shader_core_ctx::get_next_inst(unsigned warp_id,
       static_cast<trace_shd_warp_t *>(m_warp[warp_id]);
   const trace_warp_inst_t *ret = m_trace_warp->get_next_trace_inst();
   if (ret == NULL && m_trace_warp->trace_done()) {
+    // Do not exit while waiting at a barrier, or it never releases the CTA's other warps.
     if (!m_warp[warp_id]->inst_in_pipeline() &&
+        !m_barriers.warp_waiting_at_barrier(warp_id) &&
         m_warp[warp_id]->stores_done() &&
         !m_scoreboard->pendingWrites(warp_id)) {
       for (unsigned t = 0; t < m_warp_size; t++) {
@@ -615,7 +615,8 @@ const warp_inst_t *trace_shader_core_ctx::get_next_inst(unsigned warp_id,
           m_warp[warp_id]->set_completed(t);
         }
       }
-      m_barriers.warp_exit(warp_id);
+      // An exit can release a barrier and wake other warps: note it for the scheduler skip memo.
+      if (m_barriers.warp_exit(warp_id)) note_warp_issue_event();
     }
   }
   return ret;
@@ -636,7 +637,7 @@ void trace_shader_core_ctx::init_traces(unsigned start_warp, unsigned end_warp,
   }
   trace_kernel_info_t &trace_kernel =
       static_cast<trace_kernel_info_t &>(kernel);
-  if (trace_kernel.pcc_on())   // PCC: this CTA's home chiplet reads its own block
+  if (trace_kernel.pcc_on())   // distributed scheduling: the home chiplet reads its own block
     trace_kernel.get_threadblock_traces_pcc(threadblock_traces,
                                             trace_kernel.pcc_home(ctaid), ctaid);
   else

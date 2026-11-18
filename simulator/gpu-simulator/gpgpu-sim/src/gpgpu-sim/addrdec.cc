@@ -49,10 +49,7 @@ linear_to_raw_address_translation::linear_to_raw_address_translation() {
   m_slices_per_chiplet = 0;
   memset(addrdec_mklow, 0, N_ADDRDEC);
   memset(addrdec_mkhigh, 64, N_ADDRDEC);
-  // Built-in default mapping only. Every experiment config that passes
-  // -gpgpu_mem_addr_mapping replaces all five masks in addrdec_setoption()/
-  // init(); in particular the MCM D-bit (chiplet-select) width comes from that
-  // option string, not from these values.
+  // Built-in default only: -gpgpu_mem_addr_mapping (set by every config) replaces all five masks.
   addrdec_mask[CHIP] = 0x0000000000001C00;   // bits 10-12 (3b chip select)
   addrdec_mask[BK] = 0x0000000000000300;     // bits 8-9   (2b bank select)
   addrdec_mask[ROW] = 0x000000000FFF0000;    // bits 16-27 (12b row select)
@@ -197,16 +194,8 @@ void linear_to_raw_address_translation::addrdec_tlx(new_addr_type addr,
       break;
     }
     case CHIPLET_IPOLY: {
-      // IPOLY inside one chiplet. The sub-partitions of chiplet c are the
-      // contiguous range [c * S, (c + 1) * S), S = m_slices_per_chiplet -- the
-      // same contiguous split gpu_module uses -- so the chiplet is sub / S and is
-      // never changed: the frame number alone still decides which chiplet's
-      // memory holds a page. Only the index inside the range is hashed. The hash
-      // input is every address bit that is neither a channel nor a sub-partition
-      // bit, taken from above the lowest channel bit, i.e. exactly the bits
-      // partition_address() keeps. IPOLY is index XOR f(those bits), so for a
-      // fixed partition address the index permutation is one-to-one and two
-      // addresses can share a slice only if their partition addresses differ.
+      // IPOLY per chiplet: chiplet c owns sub-partitions [c*S, (c+1)*S), S = m_slices_per_chiplet.
+      // Only the index inside that range is hashed, so the frame number alone still picks the chiplet.
       assert(!gap);
       const unsigned sub = tlx->chip * m_n_sub_partition_in_channel +
                            (tlx->bk & (m_n_sub_partition_in_channel - 1));
@@ -496,9 +485,7 @@ void linear_to_raw_address_translation::init(
   }
   printf("sub_partition_id_mask = %016llx\n", sub_partition_id_mask);
 
-  // CHIPLET_IPOLY needs whole chiplets of channels and a slice count per chiplet
-  // that ipoly_hash_function() has equations for. Checked before sweep_test(),
-  // which already decodes addresses through the hash.
+  // Check the CHIPLET_IPOLY limits before sweep_test(), which already decodes through the hash.
   if (memory_partition_indexing == CHIPLET_IPOLY) {
     if (gap || m_hash_chiplets == 0 || m_n_channel % m_hash_chiplets != 0) {
       fprintf(stderr,
