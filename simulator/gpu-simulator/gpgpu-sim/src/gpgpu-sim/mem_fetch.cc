@@ -88,10 +88,10 @@ mem_fetch::mem_fetch(const mem_access_t &access, const warp_inst_t *inst,
 mem_fetch::~mem_fetch() { m_status = MEM_FETCH_DELETED; }
 
 void mem_fetch::set_pa(new_addr_type pa) {
-  m_access.set_addr(pa);  // Replace the routing address with PA so interconnect routes to the correct memory partition
-  m_mem_config->m_address_mapping.addrdec_tlx(pa, &m_raw_addr);  // Decode PA into DRAM components (chip/row/bank/col/sub_partition) for correct chiplet routing
-  m_partition_addr = m_mem_config->m_address_mapping.partition_address(pa);  // Compute the relative address within the DRAM partition (used by L2 cache lookup)
-  m_translated = true;  // Mark translation complete so callers know this request carries a valid PA
+  m_access.set_addr(pa);
+  m_mem_config->m_address_mapping.addrdec_tlx(pa, &m_raw_addr);
+  m_partition_addr = m_mem_config->m_address_mapping.partition_address(pa);
+  m_translated = true;
 }
 
 #define MF_TUP_BEGIN(X) static const char *Status_str[] = {

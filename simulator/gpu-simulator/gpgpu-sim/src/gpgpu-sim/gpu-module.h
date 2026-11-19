@@ -13,11 +13,7 @@
 #include <algorithm>   // sort / binary_search in chiplet::finalize_exact_reservations
 #include <functional>  // std::greater
 
-// #define LOG_TLB
-// #define LOG_PAGE_TABLE
-// #define LOG_MEM_ACCESS
-// #define LOG_PTW
-// #define LOG_PMM
+// Debug logs: build with -DLOG_TLB, -DLOG_PAGE_TABLE, -DLOG_MEM_ACCESS, -DLOG_PTW or -DLOG_PMM.
 
 #define GPU_PAGE_SHIFT 12  // base (4KB) page
 #define GPU_PAGE_SIZE  (1ULL << GPU_PAGE_SHIFT)

@@ -101,17 +101,14 @@ void accel_sim_framework::parse_commandlist() {
       std::cout << "launching memcpy command : "
                 << commandlist[commandlist_index].command_string << std::endl;
       m_gpgpu_sim->perf_memcpy_to_gpu(addre, Bcount);
-      // Register the destination as a device allocation so page_shift_for_va()
-      // can answer. Execution-driven gets this from cudaMalloc (cuda-sim.cc);
-      // trace-driven has no malloc record at all, and without this the VA list
-      // stays empty for the whole run and every page silently becomes 4KB --
-      // i.e. -gpgpu_page_size_policy would have no effect in trace mode.
-      // MemcpyHtoD is the only allocation evidence a trace carries.
+      // MemcpyHtoD is a trace's only allocation record: register it for page_shift_for_va().
       {
         const unsigned pshift = m_gpgpu_sim->decide_page_shift(Bcount);
-        // Round up like cudaMalloc: a trailing partial page still needs a page.
-        const size_t aligned = ((Bcount + (1ULL << pshift) - 1) >> pshift) << pshift;
-        m_gpgpu_sim->on_gpu_malloc(addre, aligned, pshift);  // dedups internally
+        // Whole pages: start rounded down and end rounded up to this page size.
+        const size_t page = (size_t)1 << pshift;
+        const size_t base = addre & ~(page - 1);
+        const size_t aligned = ((addre + Bcount + page - 1) & ~(page - 1)) - base;
+        m_gpgpu_sim->on_gpu_malloc(base, aligned, pshift);  // dedups internally
       }
       commandlist_index++;
     } else if (commandlist[commandlist_index].m_type == command_type::kernel_launch) {
@@ -135,7 +132,7 @@ void accel_sim_framework::parse_commandlist() {
 void accel_sim_framework::cleanup(unsigned finished_kernel) {
   trace_kernel_info_t *k = NULL;
   unsigned long long finished_kernel_cuda_stream_id = -1;
-  for (unsigned j = 0; j < kernels_info.size(); j++) {
+  for (unsigned j = 0; j < kernels_info.size();) {
     k = kernels_info.at(j);
     if (k->get_uid() == finished_kernel ||
         m_gpgpu_sim->cycle_insn_cta_max_hit() || !m_gpgpu_sim->active()) {
@@ -153,18 +150,11 @@ void accel_sim_framework::cleanup(unsigned finished_kernel) {
       kernels_info.erase(kernels_info.begin() + j);
       if (!m_gpgpu_sim->cycle_insn_cta_max_hit() && m_gpgpu_sim->active())
         break;
+      continue;  // the next kernel moved into slot j
     }
+    j++;
   }
-  // kernels_info can be empty when cleanup() is invoked purely by
-  // !m_gpgpu_sim->active() (simulation_loop()'s OR-condition) after a
-  // trailing non-kernel command -- e.g. a memcpy issued after the last
-  // kernel in kernelslist.g, which the trace-driven driver still steps
-  // through even though there is no kernel left to launch. k stays NULL
-  // (the for loop above never executes) in exactly that case: there is
-  // nothing to tear down, so return instead of asserting. All real
-  // kernels' stats are already printed by their own (uid-matched) cleanup()
-  // call before this one ever runs, so nothing here is skipped or lost.
-  // Original: assert(k);
+  // No kernel left (e.g. a trailing memcpy after the last kernel): nothing to tear down.
   if (!k) return;
   m_gpgpu_sim->print_stats(finished_kernel_cuda_stream_id);
 }

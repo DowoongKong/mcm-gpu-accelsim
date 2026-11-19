@@ -646,10 +646,7 @@ class gpgpu_t {
   // size this allocation was laid out for.
   virtual void on_gpu_malloc(uint64_t va, size_t aligned_size,
                              unsigned page_shift) {}
-  // Page shift to use for an allocation of this size. Base returns 12 (4KB),
-  // which reproduces the original behaviour; gpgpu_sim overrides it from config.
-  // 12 is spelled out rather than GPU_PAGE_SHIFT because including gpu-module.h
-  // here would be circular.
+  // Page shift for an allocation of this size: 4KB here; gpgpu_sim overrides it from config.
   virtual unsigned decide_page_shift(size_t size) const { return 12; }
   void gpu_memset(size_t dst_start_addr, int c, size_t count);
   void memcpy_to_gpu(size_t dst_start_addr, const void *src, size_t count);
@@ -999,8 +996,8 @@ class inst_t {
     const_cache_operand = 0;
     num_operands = 0;
     num_regs = 0;
-    memset(out, 0, sizeof(unsigned));
-    memset(in, 0, sizeof(unsigned));
+    memset(out, 0, sizeof(out));  // whole arrays: the scoreboard scans all out[] slots
+    memset(in, 0, sizeof(in));
     is_vectorin = 0;
     is_vectorout = 0;
     space = memory_space_t();
@@ -1430,6 +1427,9 @@ class core_t {
 };
 
 // register that can hold multiple instructions.
+// Warp-instruction uids wrap at 2^32: compare by difference so the oldest pick stays right.
+inline bool uid_older(unsigned a, unsigned b) { return (int)(a - b) < 0; }
+
 class register_set {
  public:
   register_set(unsigned num, const char *name) {
@@ -1478,7 +1478,7 @@ class register_set {
     unsigned reg_id = 0;
     for (unsigned i = 0; i < regs.size(); i++) {
       if (not regs[i]->empty()) {
-        if (ready and (*ready)->get_uid() < regs[i]->get_uid()) {
+        if (ready and uid_older((*ready)->get_uid(), regs[i]->get_uid())) {
           // ready is oldest
         } else {
           ready = &regs[i];
@@ -1532,7 +1532,7 @@ class register_set {
     ready = NULL;
     for (unsigned i = 0; i < regs.size(); i++) {
       if (not regs[i]->empty()) {
-        if (ready and (*ready)->get_uid() < regs[i]->get_uid()) {
+        if (ready and uid_older((*ready)->get_uid(), regs[i]->get_uid())) {
           // ready is oldest
         } else {
           ready = &regs[i];

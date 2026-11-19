@@ -174,7 +174,7 @@ void icnt_reg_options(class OptionParser* opp) {
                          "ring per-link/eject buffer depth (packets)", "64");
   option_parser_register(opp, "-icnt_ring_hop_latency", OPT_UINT32,
                          &g_inct_config.ring_hop_latency,
-                         "ring per-hop wire latency in ICNT cycles (MCM-GPU paper: 32 ns)", "32");
+                         "ring per-hop wire latency in ICNT cycles (MCM-GPU: 32 cycles at 1 GHz)", "32");
   option_parser_register(opp, "-icnt_ptw_ring_hop_latency", OPT_INT32,
                          &g_inct_config.ring_hop_latency_ptw,
                          "ring per-hop latency in cycles for page-table-walk packets "

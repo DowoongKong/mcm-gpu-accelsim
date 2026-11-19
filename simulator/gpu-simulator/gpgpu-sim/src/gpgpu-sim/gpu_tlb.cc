@@ -91,6 +91,12 @@ gpu_l1_tlb::gpu_l1_tlb(unsigned num_sets, unsigned assoc,
       m_lookup_latency(lookup_latency),
       m_mshr(mshr_entries, mshr_max_merge),
       m_hits(0), m_misses(0), m_mshr_hits(0) {
+  if (lookup_latency == 0) {  // the lookup pipe needs at least one stage
+    fprintf(stderr, "\nFATAL: L1 TLB (%s) lookup latency 0; use 1 or more.\n",
+            page_kind_tag(page_shift));
+    fflush(stderr);
+    abort();
+  }
   m_sets.resize(num_sets, std::vector<l1_tlb_entry_t>(assoc, {false, 0, {0}, 0}));
   m_lookup_pipe.assign(m_lookup_latency, {});
 }
@@ -589,8 +595,9 @@ gpu_l2_tlb::gpu_l2_tlb(unsigned num_sets, unsigned assoc,
 
 void gpu_l2_tlb::set_set_hash(unsigned mode) {
   m_set_hash = mode;
-  if (mode != 0 && (m_num_sets & (m_num_sets - 1)) != 0) {
-    fprintf(stderr, "gpu_l2_tlb: -gpgpu_l2_tlb_set_hash needs a power-of-two set count (got %u)\n", m_num_sets);
+  if (mode != 0 && (m_num_sets < 2 || (m_num_sets & (m_num_sets - 1)) != 0)) {
+    fprintf(stderr, "FATAL: -gpgpu_l2_tlb_set_hash needs a power-of-two set count >= 2 (got %u)\n", m_num_sets);
+    fflush(stderr);
     abort();
   }
 }

@@ -77,7 +77,7 @@ struct xlat_req_rec_t {
   uint64_t t_fill = 0;             // t8: the VPN landed in this SM's L1 array
   uint64_t t_done = 0;             // t9: access() handed the PTE to the warp
 
-  uint32_t l1_resv_fail = 0;   // sub-attribution inside S2: MSHR-full re-injects
+  uint32_t l1_resv_fail = 0;   // sub-attribution inside s2: MSHR-full re-injects
   uint32_t l1_port_polls = 0;  // COUNT of PORT_BUSY answers, NOT cycles (see below)
   uint8_t  bucket = XLAT_B_L1_HIT;
   uint8_t  has_down = 0;

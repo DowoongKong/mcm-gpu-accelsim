@@ -644,16 +644,16 @@ void shader_core_stats::print(FILE *fout) const {
   fprintf(fout, "gpgpu_n_tot_thrd_icount = %lld\n", thread_icount_uarch);
   fprintf(fout, "gpgpu_n_tot_w_icount = %lld\n", warp_icount_uarch);
 
-  fprintf(fout, "gpgpu_n_stall_shd_mem = %d\n", gpgpu_n_stall_shd_mem);
-  fprintf(fout, "gpgpu_n_mem_read_local = %d\n", gpgpu_n_mem_read_local);
-  fprintf(fout, "gpgpu_n_mem_write_local = %d\n", gpgpu_n_mem_write_local);
-  fprintf(fout, "gpgpu_n_mem_read_global = %d\n", gpgpu_n_mem_read_global);
-  fprintf(fout, "gpgpu_n_mem_write_global = %d\n", gpgpu_n_mem_write_global);
-  fprintf(fout, "gpgpu_n_mem_texture = %d\n", gpgpu_n_mem_texture);
-  fprintf(fout, "gpgpu_n_mem_const = %d\n", gpgpu_n_mem_const);
+  fprintf(fout, "gpgpu_n_stall_shd_mem = %llu\n", gpgpu_n_stall_shd_mem);
+  fprintf(fout, "gpgpu_n_mem_read_local = %llu\n", gpgpu_n_mem_read_local);
+  fprintf(fout, "gpgpu_n_mem_write_local = %llu\n", gpgpu_n_mem_write_local);
+  fprintf(fout, "gpgpu_n_mem_read_global = %llu\n", gpgpu_n_mem_read_global);
+  fprintf(fout, "gpgpu_n_mem_write_global = %llu\n", gpgpu_n_mem_write_global);
+  fprintf(fout, "gpgpu_n_mem_texture = %llu\n", gpgpu_n_mem_texture);
+  fprintf(fout, "gpgpu_n_mem_const = %llu\n", gpgpu_n_mem_const);
 
-  fprintf(fout, "gpgpu_n_load_insn  = %d\n", gpgpu_n_load_insn);
-  fprintf(fout, "gpgpu_n_store_insn = %d\n", gpgpu_n_store_insn);
+  fprintf(fout, "gpgpu_n_load_insn  = %llu\n", gpgpu_n_load_insn);
+  fprintf(fout, "gpgpu_n_store_insn = %llu\n", gpgpu_n_store_insn);
   fprintf(fout, "gpgpu_n_shmem_insn = %d\n", gpgpu_n_shmem_insn);
   fprintf(fout, "gpgpu_n_sstarr_insn = %d\n", gpgpu_n_sstarr_insn);
   fprintf(fout, "gpgpu_n_tex_insn = %d\n", gpgpu_n_tex_insn);
@@ -743,11 +743,11 @@ void shader_core_stats::print(FILE *fout) const {
           gpu_reg_bank_conflict_stalls);
 
   fprintf(fout, "Warp Occupancy Distribution:\n");
-  fprintf(fout, "Stall:%d\t", shader_cycle_distro[2]);
-  fprintf(fout, "W0_Idle:%d\t", shader_cycle_distro[0]);
-  fprintf(fout, "W0_Scoreboard:%d", shader_cycle_distro[1]);
+  fprintf(fout, "Stall:%llu\t", shader_cycle_distro[2]);
+  fprintf(fout, "W0_Idle:%llu\t", shader_cycle_distro[0]);
+  fprintf(fout, "W0_Scoreboard:%llu", shader_cycle_distro[1]);
   for (unsigned i = 3; i < m_config->warp_size + 3; i++)
-    fprintf(fout, "\tW%d:%d", i - 2, shader_cycle_distro[i]);
+    fprintf(fout, "\tW%d:%llu", i - 2, shader_cycle_distro[i]);
   fprintf(fout, "\n");
   fprintf(fout, "single_issue_nums: ");
   for (unsigned i = 0; i < m_config->gpgpu_num_sched_per_core; i++)
@@ -781,21 +781,21 @@ void shader_core_stats::event_warp_issued(unsigned s_id, unsigned warp_id,
 void shader_core_stats::visualizer_print(gzFile visualizer_file) {
   // warp divergence breakdown
   gzprintf(visualizer_file, "WarpDivergenceBreakdown:");
-  unsigned int total = 0;
+  unsigned long long total = 0;
   unsigned int cf =
       (m_config->gpgpu_warpdistro_shader == -1) ? m_config->num_shader() : 1;
-  gzprintf(visualizer_file, " %d",
+  gzprintf(visualizer_file, " %llu",
            (shader_cycle_distro[0] - last_shader_cycle_distro[0]) / cf);
-  gzprintf(visualizer_file, " %d",
+  gzprintf(visualizer_file, " %llu",
            (shader_cycle_distro[1] - last_shader_cycle_distro[1]) / cf);
-  gzprintf(visualizer_file, " %d",
+  gzprintf(visualizer_file, " %llu",
            (shader_cycle_distro[2] - last_shader_cycle_distro[2]) / cf);
   for (unsigned i = 0; i < m_config->warp_size + 3; i++) {
     if (i >= 3) {
       total += (shader_cycle_distro[i] - last_shader_cycle_distro[i]);
       if (((i - 3) % (m_config->warp_size / 8)) ==
           ((m_config->warp_size / 8) - 1)) {
-        gzprintf(visualizer_file, " %d", total / cf);
+        gzprintf(visualizer_file, " %llu", total / cf);
         total = 0;
       }
     }
@@ -931,8 +931,8 @@ void shader_core_ctx::decode() {
         m_warp_issue_epoch++;  // issue epoch: ibuffer filled
         m_warp[m_inst_fetch_buffer.m_warp_id]->inc_inst_in_pipeline();
         m_stats->m_num_decoded_insn[m_sid]++;
-        if ((pI1->oprnd_type == INT_OP) ||
-            (pI1->oprnd_type == UN_OP)) {  // these counters get added up in
+        if ((pI2->oprnd_type == INT_OP) ||
+            (pI2->oprnd_type == UN_OP)) {  // these counters get added up in
                                            // mcPat to compute scheduler power
           m_stats->m_num_INTdecoded_insn[m_sid]++;
         } else if (pI2->oprnd_type == FP_OP) {
@@ -1498,6 +1498,7 @@ void scheduler_unit::cycle() {
                                   ->cdp_latency[pI->m_is_cdp] *
                               active_mask.count();
                     warp(warp_id).m_cdp_dummy = true;
+                    arm_ok = false;  // the countdown just started: keep scanning
                     break;
                   } else if (pI->m_is_cdp && warp(warp_id).m_cdp_dummy) {
                     assert(warp(warp_id).m_cdp_latency == 0);
@@ -1949,7 +1950,7 @@ void shader_core_ctx::execute_a() {
       *(m_result_bus[i]) >>= 1;
     }
   }
-  assert(m_num_function_units <= 64 && "T6: m_fu_busy_mask holds 64 units");
+  assert(m_num_function_units <= 64 && "m_fu_busy_mask holds 64 units");
   for (unsigned n = 0; n + 1 < m_num_function_units; n++) {
     register_set &issue_inst = m_pipeline_reg[m_issue_port[n]];
     const unsigned long long fu_bit = 1ull << n;
@@ -2186,8 +2187,6 @@ void shader_core_ctx::writeback() {
     m_scoreboard->releaseRegisters(pipe_reg);
     m_warp[warp_id]->dec_inst_in_pipeline();
     warp_inst_complete(*pipe_reg);
-    m_gpu->gpu_sim_insn_last_update_sid = m_sid;
-    m_gpu->gpu_sim_insn_last_update = m_gpu->gpu_sim_cycle;
     m_last_inst_gpu_sim_cycle = m_gpu->gpu_sim_cycle;
     m_last_inst_gpu_tot_sim_cycle = m_gpu->gpu_tot_sim_cycle;
     pipe_reg->clear();
@@ -2294,7 +2293,12 @@ void ldst_unit::set_pa_from_xlat(mem_fetch *mf, uint64_t va, unsigned wid) {
   const uint64_t vpn    = page_vpn(va, pshift);
   const auto &tbl = xlat_table_for(pshift, wid);
   auto it = tbl.find(vpn);
-  if (it == tbl.end()) return;  // untranslated: leave the PA unchanged
+  if (it == tbl.end()) {  // memory_cycle() translates every page first, so this is a bug
+    fprintf(stderr, "\nFATAL: SM %u warp %u: va 0x%llx reached routing untranslated.\n",
+            m_sid, wid, (unsigned long long)va);
+    fflush(stderr);
+    abort();
+  }
   mf->set_pa((it->second.pfn() << GPU_PAGE_SHIFT) | page_offset(va, pshift));
 }
 
@@ -3089,6 +3093,12 @@ ldst_unit::ldst_unit(mem_fetch_interface *icnt,
   assert(config->smem_latency > 1);
   init(icnt, mf_allocator, core, operand_collector, scoreboard, config,
        mem_config, stats, sid, tpc);
+  if (m_config->m_L1D_config.disabled()) {  // the L1 TLBs are built with the L1D
+    fprintf(stderr, "\nFATAL: the L1D is disabled, so no L1 TLB exists and addresses would not be "
+                    "translated. Enable -gpgpu_cache:dl1.\n");
+    fflush(stderr);
+    abort();
+  }
   if (!m_config->m_L1D_config.disabled()) {
     char L1D_name[STRSIZE];
     snprintf(L1D_name, STRSIZE, "L1D_%03d", m_sid);
@@ -3180,7 +3190,8 @@ ldst_unit::ldst_unit(mem_fetch_interface *icnt,
                      unsigned sid, unsigned tpc, l1_cache *new_l1d_cache)
     : pipelined_simd_unit(NULL, config, 3, core, 0),
       m_L1D(new_l1d_cache),
-      m_next_wb(config) {
+      m_next_wb(config),
+      m_gpu(NULL) {
   init(icnt, mf_allocator, core, operand_collector, scoreboard, config,
        mem_config, stats, sid, tpc);
 }
@@ -3732,6 +3743,8 @@ void ldst_unit::fill_idle_dispatch_with_replay() {
     *m_dispatch_reg = std::move(pq->front());
     pq->pop_front();
     if (pq->empty()) m_xlat_parked.erase(w);
+  } else {
+    m_replay_stale++;
   }
 }
 
@@ -3770,6 +3783,8 @@ void ldst_unit::cycle_c() {
       *m_dispatch_reg = std::move(pq->front());
       pq->pop_front();
       if (pq->empty()) m_xlat_parked.erase(w);
+    } else {
+      m_replay_stale++;
     }
   }
   // SAFETY NET: no replay queued but warps still parked -> retry one (covers lost wakeups).
@@ -3958,8 +3973,8 @@ void shader_core_ctx::register_cta_thread_exit(unsigned cta_num,
 
     // Jin: for concurrent kernels on sm
     release_shader_resource_1block(cta_num, *kernel);
-    // Serial: teardown changes kernel state shared by all SMs, and the check and the
-    // update must be one step so only one SM calls set_kernel_done().
+    // Serial: the check and the update must be one step so only one SM finishes the kernel.
+    // set_kernel_done() runs after pass C, in SM order, so it does not depend on thread timing.
 #pragma omp critical(kernel_teardown)
     {
     kernel->dec_running();
@@ -3971,7 +3986,7 @@ void shader_core_ctx::register_cta_thread_exit(unsigned cta_num,
                        kernel->get_uid(), kernel->name().c_str(), m_sid);
 
         if (m_kernel == kernel) m_kernel = NULL;
-        m_gpu->set_kernel_done(kernel);
+        m_gpu->defer_kernel_done(kernel, m_sid);
       }
     }
     }
@@ -4579,7 +4594,7 @@ unsigned int shader_core_config::max_cta(const kernel_info_t &k) const {
 void shader_core_config::set_pipeline_latency() {
   // calculate the max latency  based on the input
 
-  unsigned int_latency[6];
+  unsigned int_latency[6] = {0};  // configs give 5 values; a missing one must not read stack garbage
   unsigned fp_latency[5];
   unsigned dp_latency[5];
   unsigned sfu_latency;
@@ -4628,7 +4643,7 @@ unsigned long long shader_core_ctx::xlat_l1_fingerprint() const {
 }
 
 void shader_core_ctx::cycle_phase_a() {
-  // Decide once for all three phases: phase A can retire threads and change the answer.
+  // Decide once for all three phases, as upstream tests once per cycle (pass C can retire threads).
   m_phase_active = (isactive() || get_not_completed() != 0);
   if (!m_phase_active) return;
 
@@ -6183,6 +6198,10 @@ void ldst_unit::xlat_print_stats(FILE* fp, unsigned sid) const {
           100.0 * m_xlatlat_stalled_cycles / c,
           (double)m_xlatlat_parked_sum / c, m_xlatlat_parked_max,
           m_xlatlat_mem_issue_cycles, 100.0 * m_xlatlat_mem_issue_cycles / c);
+  // Replay pops that found nothing parked (the dispatch register stays empty that cycle).
+  if (m_replay_stale)
+    fprintf(fp, "[LDST_REPLAY] SM=%u pops=%llu stale=%llu\n", sid, m_dprobe_replay_fires,
+            m_replay_stale);
 }
 
 // Deadlock dump: warps this LDST unit parked waiting for translation.
@@ -6195,31 +6214,34 @@ void ldst_unit::xlatdbg_dump_parked(FILE* fp, unsigned sid) const {
             sid, m_xlat_parked.size(), n, m_xlat_park_order.size());
     // DPROBE row: tells a closed dispatch gate apart from an exhausted park-order queue.
     fprintf(fp, "XLATDBG_DEADLOCK:   sm=%u DPROBE dispatch_empty=%d dispatch_wid=%d "
-                "dispatch_pc=0x%x replay_q=%zu last_rc_fail=%d "
+                "dispatch_pc=0x%llx replay_q=%zu last_rc_fail=%d "
                 "replay_fires=%llu safetynet_fires=%llu safetynet_last_cycle=%llu "
                 "gate_closed_cycles=%llu\n",
             sid, m_dispatch_reg->empty() ? 1 : 0,
             m_dispatch_reg->empty() ? -1 : (int)m_dispatch_reg->warp_id(),
-            m_dispatch_reg->empty() ? 0u : m_dispatch_reg->pc,
+            m_dispatch_reg->empty() ? 0ull : (unsigned long long)m_dispatch_reg->pc,
             m_xlat_replay_q.size(), (int)m_mem_rc,
             m_dprobe_replay_fires, m_dprobe_safetynet_fires,
             m_dprobe_safetynet_last_cycle, m_dprobe_gate_closed_cycles);
     for (unsigned w = 0; w < m_xlat_parked.slots(); w++)  // warp-id order
       if (m_xlat_parked.has(w) && !m_xlat_parked.at(w).empty())
-        fprintf(fp, "XLATDBG_DEADLOCK:     wid=%u parked=%zu pc=0x%x\n",
-                w, m_xlat_parked.at(w).size(), m_xlat_parked.at(w).front().pc);
+        fprintf(fp, "XLATDBG_DEADLOCK:     wid=%u parked=%zu pc=0x%llx\n",
+                w, m_xlat_parked.at(w).size(), (unsigned long long)m_xlat_parked.at(w).front().pc);
   }
   if (m_l1_tlb_4k)  m_l1_tlb_4k->xlatdbg_dump(fp, sid, "4k");
   if (m_l1_tlb_64k) m_l1_tlb_64k->xlatdbg_dump(fp, sid, "64k");
   if (m_l1_tlb_2m)  m_l1_tlb_2m->xlatdbg_dump(fp, sid, "2m");
-  // Ask the L2 what it would answer for the request at the head of this L1's queue.
-  if (m_l1_tlb_4k && m_gpu && m_gpu->get_gpu_module()) {
-    uint64_t front_vpn = 0;
-    if (m_l1_tlb_4k->l2_req_front(front_vpn)) {
-      gpu_module* gmod = m_gpu->get_gpu_module();
-      unsigned chip = gmod->cluster_to_chiplet(m_tpc);
-      uint64_t cur = m_core->get_gpu()->gpu_sim_cycle + m_core->get_gpu()->gpu_tot_sim_cycle;
-      gmod->get_chiplet(chip)->get_l2_tlb_4k()->xlatdbg_probe(fp, front_vpn, m_tpc, cur);
+  // Ask each page size's L2 what it would answer for the request at the head of the L1 queue.
+  if (m_gpu && m_gpu->get_gpu_module()) {
+    gpu_module* gmod = m_gpu->get_gpu_module();
+    const chiplet* ch = gmod->get_chiplet(gmod->cluster_to_chiplet(m_tpc));
+    const uint64_t cur = m_core->get_gpu()->gpu_sim_cycle + m_core->get_gpu()->gpu_tot_sim_cycle;
+    gpu_l1_tlb* l1[3] = {m_l1_tlb_4k, m_l1_tlb_64k, m_l1_tlb_2m};
+    gpu_l2_tlb* l2[3] = {ch->get_l2_tlb_4k(), ch->get_l2_tlb_64k(), ch->get_l2_tlb_2m()};
+    for (unsigned k = 0; k < 3; k++) {
+      uint64_t front_vpn = 0;
+      if (l1[k] && l2[k] && l1[k]->l2_req_front(front_vpn))
+        l2[k]->xlatdbg_probe(fp, front_vpn, m_tpc, cur);
     }
   }
 }

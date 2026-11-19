@@ -230,10 +230,8 @@ bool inst_trace_t::parse_from_string_slow(std::string trace,
 }
 
 
-// ---------------------------------------------------------------------------
-// Fast path: stores exactly what the stringstream parser stores for well-formed lines (fields, radix,
-// "R%d" rules, base_delta end of line). Anything else returns false untouched; the caller then
-// runs the original parser.
+// Fast path: the same fields as the stringstream parser for well-formed lines; anything else returns
+// false untouched and the caller runs the original parser.
 namespace {
 inline bool fast_ws(char c) {
   return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r';

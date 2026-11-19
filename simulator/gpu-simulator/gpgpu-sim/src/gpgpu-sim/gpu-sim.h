@@ -414,8 +414,8 @@ extern bool g_interactive_debugger_enabled;
 enum cta_scheduling_policy_t {
   CTA_SCHED_SEQUENTIAL          = 0,  // upstream visit order
   CTA_SCHED_ROUND_ROBIN_CHIPLET = 1,  // chiplet-interleaved ordering
-  // Home chiplet = cta_id % n_chiplets, strictly (a CTA waits for its chiplet),
-  // so the CTA -> chiplet map does not depend on timing.
+  // Each CTA has a fixed home chiplet and waits for it, so the CTA -> chiplet map does not
+  // depend on timing. Home = cta_id % n_chiplets, or the LASP partition when a LASP policy is set.
   CTA_SCHED_STATIC_BINDING      = 2,
 };
 
@@ -447,7 +447,7 @@ class SequentialScheduler : public cta_scheduler_t {
   const char* policy_name() const override { return "SEQUENTIAL"; }
 };
 
-// Static binding: home chiplet = cta_id % n_chiplets; chiplet-interleaved order, no rotation.
+// Static binding: fixed home chiplet (cta_id % n_chiplets or LASP); chiplet-interleaved order, no rotation.
 // The binding is enforced in simt_core_cluster::issue_block2core().
 class StaticBindingScheduler : public cta_scheduler_t {
  public:
@@ -737,6 +737,12 @@ class gpgpu_sim : public gpgpu_t {
   bool can_start_kernel();
   unsigned finished_kernel();
   void set_kernel_done(kernel_info_t *kernel);
+  // Pass C records finished kernels; the serial part after it calls set_kernel_done() in SM order.
+  void defer_kernel_done(kernel_info_t *kernel, unsigned sid) {
+    m_kernel_done_pending.push_back(std::make_pair(sid, kernel));
+  }
+  void commit_deferred_kernel_done();
+  std::vector<std::pair<unsigned, kernel_info_t *> > m_kernel_done_pending;
   void stop_all_running_kernels();
 
   void init();
@@ -970,8 +976,6 @@ class gpgpu_sim : public gpgpu_t {
  public:
   unsigned long long gpu_sim_insn;
   unsigned long long gpu_tot_sim_insn;
-  unsigned long long gpu_sim_insn_last_update;
-  unsigned gpu_sim_insn_last_update_sid;
   occupancy_stats gpu_occupancy;
   occupancy_stats gpu_tot_occupancy;
 

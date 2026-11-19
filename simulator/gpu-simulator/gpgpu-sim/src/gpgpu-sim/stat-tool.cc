@@ -282,6 +282,8 @@ void shader_mem_acc_log(int logger_id, int dram_id, int bank, char rw) {
       assert(0);
       break;
   }
+  // DRAM channels run in parallel and share each SM's logger.
+#pragma omp critical(shader_mem_acc_log)
   s_mem_acc_logger[logger_id].log(dram_id * s_mem_acc_logger_n_bank + bank +
                                   write_offset);
 }
