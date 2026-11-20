@@ -129,6 +129,7 @@ class gpu_l1_tlb {
   static const unsigned kReqKeyWarpBits = 8;
   void set_ports(unsigned p) { m_n_ports = p; }
   void set_lookups_per_cycle(unsigned n) { m_lookups_per_cycle = n; }
+  void set_mshr_wait_fifo(bool on) { m_mshr_wait_fifo = on; }
   // -gpgpu_l1d_vipt: a hit overlaps the L1D access (see access()).
   void set_hit_overlap(bool on) { m_hit_overlap = on; }
   unsigned long long port_busy_stalls() const { return m_port_busy_stalls; }
@@ -206,6 +207,7 @@ class gpu_l1_tlb {
   // Lookups started per cycle; 0 = unlimited. Extra requests wait in m_inject_q (FIFO).
   unsigned m_lookups_per_cycle = 0;
   bool m_hit_overlap = false;  // -gpgpu_l1d_vipt
+  bool m_mshr_wait_fifo = false;  // -gpgpu_l1_tlb_mshr_wait_fifo
   uint64_t m_inject_cycle = ~0ull;   // cycle that m_inject_count refers to
   unsigned m_inject_count = 0;       // lookups started in m_inject_cycle
   std::deque<lookup_slot> m_inject_q;

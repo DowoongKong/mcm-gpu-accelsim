@@ -3159,6 +3159,9 @@ ldst_unit::ldst_unit(mem_fetch_interface *icnt,
     m_l1_tlb_2m->set_lookups_per_cycle(m_config->gpgpu_l1_tlb_lookups_per_cycle);
     m_l1_tlb_64k->set_lookups_per_cycle(m_config->gpgpu_l1_tlb_lookups_per_cycle);
     m_l1_tlb_4k->set_lookups_per_cycle(m_config->gpgpu_l1_tlb_lookups_per_cycle);
+    m_l1_tlb_2m->set_mshr_wait_fifo(m_config->gpgpu_l1_tlb_mshr_wait_fifo);
+    m_l1_tlb_64k->set_mshr_wait_fifo(m_config->gpgpu_l1_tlb_mshr_wait_fifo);
+    m_l1_tlb_4k->set_mshr_wait_fifo(m_config->gpgpu_l1_tlb_mshr_wait_fifo);
     assert(m_config->m_L1D_config.l1_latency > 0);
     if (m_config->max_warps_per_shader > (1u << gpu_l1_tlb::kReqKeyWarpBits)) {
       fprintf(stderr,
@@ -3253,6 +3256,14 @@ void ldst_unit::writeback_finish(warp_inst_t &wb) {
       }
       break;
     }
+  }
+  // -gpgpu_trace_rz_no_reg: a shared load whose only destination was RZ has no output register.
+  if (!insn_completed && m_config->gpgpu_trace_rz_no_reg &&
+      wb.space.get_type() == shared_space && !wb.m_is_ldgsts) {
+    bool any_out = false;
+    for (unsigned r = 0; r < MAX_OUTPUT_VALUES; r++)
+      if (wb.out[r] > 0) any_out = true;
+    if (!any_out) insn_completed = true;
   }
   if (insn_completed) {
     if (wb.m_is_ldgsts) {
@@ -3737,14 +3748,23 @@ bool ldst_unit::xlat_memo_hit(const warp_inst_t &inst) const {
 void ldst_unit::fill_idle_dispatch_with_replay() {
   if (!m_dispatch_reg->empty() || m_xlat_replay_q.empty()) return;
   m_dprobe_replay_fires++;
-  unsigned w = m_xlat_replay_q.front(); m_xlat_replay_q.pop_front();
-  std::deque<warp_inst_t> *pq = m_xlat_parked.find(w);
-  if (pq && !pq->empty()) {
-    *m_dispatch_reg = std::move(pq->front());
-    pq->pop_front();
-    if (pq->empty()) m_xlat_parked.erase(w);
-  } else {
+  replay_front();
+}
+
+// Pops replay ids into the empty dispatch register; a stale id (nothing parked) ends the try
+// unless -gpgpu_ldst_replay_skip_stale.
+void ldst_unit::replay_front() {
+  while (!m_xlat_replay_q.empty()) {
+    unsigned w = m_xlat_replay_q.front(); m_xlat_replay_q.pop_front();
+    std::deque<warp_inst_t> *pq = m_xlat_parked.find(w);
+    if (pq && !pq->empty()) {
+      *m_dispatch_reg = std::move(pq->front());
+      pq->pop_front();
+      if (pq->empty()) m_xlat_parked.erase(w);
+      return;
+    }
     m_replay_stale++;
+    if (!m_config->gpgpu_ldst_replay_skip_stale) return;
   }
 }
 
@@ -3776,16 +3796,7 @@ void ldst_unit::cycle_c() {
     m_dprobe_gate_closed_cycles++;  // only under ACCELSIM_DIAG
   if (m_dispatch_reg->empty() && !m_xlat_replay_q.empty()) {
     m_dprobe_replay_fires++;
-    unsigned w = m_xlat_replay_q.front(); m_xlat_replay_q.pop_front();
-    // A stale replay id (nothing parked) is dropped.
-    std::deque<warp_inst_t> *pq = m_xlat_parked.find(w);
-    if (pq && !pq->empty()) {
-      *m_dispatch_reg = std::move(pq->front());
-      pq->pop_front();
-      if (pq->empty()) m_xlat_parked.erase(w);
-    } else {
-      m_replay_stale++;
-    }
+    replay_front();
   }
   // SAFETY NET: no replay queued but warps still parked -> retry one (covers lost wakeups).
   else if (m_decouple_tlb && m_dispatch_reg->empty() &&
@@ -4981,7 +4992,8 @@ bool shader_core_ctx::warp_waiting_at_barrier(unsigned warp_id) const {
 
 bool shader_core_ctx::warp_waiting_at_mem_barrier(unsigned warp_id) {
   if (!m_warp[warp_id]->get_membar()) return false;
-  if (!m_scoreboard->pendingWrites(warp_id)) {
+  if (!m_scoreboard->pendingWrites(warp_id) &&
+      (!m_config->gpgpu_membar_wait_stores || m_warp[warp_id]->stores_done())) {
     m_warp[warp_id]->clear_membar();
     if (m_gpu->get_config().flush_l1()) {
       // Mahmoud fixed this on Nov 2019
@@ -5048,6 +5060,9 @@ void shader_core_ctx::store_ack(class mem_fetch *mf) {
           mf->get_is_write()));
   unsigned warp_id = mf->get_wid();
   m_warp[warp_id]->dec_store_req();
+  // A store ack can release a MEMBAR (-gpgpu_membar_wait_stores): note it for the scheduler skip memo.
+  if (m_config->gpgpu_membar_wait_stores && m_warp[warp_id]->get_membar())
+    m_warp_issue_epoch++;
 }
 
 void shader_core_ctx::print_cache_stats(FILE *fp, unsigned &dl1_accesses,
@@ -5102,7 +5117,7 @@ bool shd_warp_t::waiting() {
   } else if (m_shader->warp_waiting_at_mem_barrier(m_warp_id)) {
     // waiting for memory barrier
     return true;
-  } else if (m_n_atomic > 0) {
+  } else if (m_n_atomic > 0 && !m_shader->get_config()->gpgpu_trace_atomic_no_stall) {
     // waiting for atomic operation to complete at memory:
     // this stall is not required for accurate timing model, but rather we
     // stall here since if a call/return instruction occurs in the meantime

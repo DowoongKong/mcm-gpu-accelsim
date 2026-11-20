@@ -86,6 +86,10 @@ xbar_router::xbar_router(unsigned router_id, enum Interconnect_type m_type,
   out_buffer_limit = m_localinct_config.out_buffer_limit;
   arbit_type = m_localinct_config.arbiter_algo;
   m_port_width = m_localinct_config.xbar_port_width ? m_localinct_config.xbar_port_width : 1;
+  m_icp_port_width =
+      m_localinct_config.icp_port_width ? m_localinct_config.icp_port_width : m_port_width;
+  m_input_limit = m_localinct_config.xbar_input_limit;
+  m_in_sent.assign(total_nodes, 0u);
   next_node_id = 0;
   if (m_type == REQ_NET) {
     active_in_buffers = n_shader;
@@ -244,7 +248,7 @@ void xbar_router::RR_Advance() {
       Packet _packet = in_buffers[node_id].front();
       // ensure that the outbuffer has space and not issued before in this cycle
       if (Has_Buffer_Out(_packet.output_deviceID, 1)) {
-        if (issued[_packet.output_deviceID] < m_port_width) {
+        if (issued[_packet.output_deviceID] < out_width(_packet.output_deviceID)) {
           // Diagnostics: stamp the packet's out_buffer arrival (see iSLIP_Advance).
           mem_fetch* _rmf = static_cast<mem_fetch*>(_packet.data);
           if (g_accelsim_diag && _rmf) _rmf->set_icnt_receive_time((unsigned)g_icnt_now);  // diagnostics only
@@ -346,10 +350,11 @@ void xbar_router::iSLIP_Advance() {
       if (!Has_Buffer_Out(m_out_cand[oi], 1)) obf++;
     if (obf) out_buffer_full += obf;   // router-private counter
   } else {
-  // do iSLIP; each output grants up to m_port_width flits per cycle, across packets and inputs.
+  // do iSLIP; each output grants up to out_width() flits per cycle, across packets and inputs.
+  if (m_input_limit) std::fill(m_in_sent.begin(), m_in_sent.end(), 0u);
   for (unsigned oi = 0; oi < m_out_cand.size(); ++oi) {
    const unsigned i = m_out_cand[oi];   // candidate outputs only
-   for (unsigned w = 0; w < m_port_width; ++w) {
+   for (unsigned w = 0, w_end = out_width(i); w < w_end; ++w) {
     bool _did_grant = false;
     if (Has_Buffer_Out(i, 1)) {
       // Nothing addressed here: stop. Exact, since the scan would grant and change nothing.
@@ -388,7 +393,9 @@ void xbar_router::iSLIP_Advance() {
             unsigned node_id = (j + next_node[i]) % total_nodes;
             if (!in_buffers[node_id].empty()) {
               const Packet &_packet = in_buffers[node_id].front();
-              if (_packet.output_deviceID == i) {
+              if (_packet.output_deviceID == i &&
+                  (!m_input_limit || node_id == icp_index() || m_in_sent[node_id] < m_port_width)) {
+                if (m_input_limit) m_in_sent[node_id]++;
                 in_buffers[node_id].dec_front_flits();   // keeps the running total
                 if (_packet.remaining_flits == 0) {
                   mem_fetch* _rmf = static_cast<mem_fetch*>(_packet.data);

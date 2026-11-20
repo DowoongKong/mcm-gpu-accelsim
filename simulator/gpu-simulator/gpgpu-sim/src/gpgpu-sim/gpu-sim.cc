@@ -564,6 +564,38 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          "page it touches is translated, instead of when it "
                          "leaves the ldst dispatch",
                          "0");
+  option_parser_register(opp, "-gpgpu_l1_tlb_mshr_wait_fifo", OPT_BOOL,
+                         &gpgpu_l1_tlb_mshr_wait_fifo,
+                         "L1 TLB lookups blocked by a full MSHR retry oldest first "
+                         "(0 = the most recently blocked first)",
+                         "0");
+  option_parser_register(opp, "-gpgpu_trace_atomic_no_stall", OPT_BOOL,
+                         &gpgpu_trace_atomic_no_stall,
+                         "a warp keeps issuing while its atomics are in flight; only "
+                         "readers of an atomic's result wait, and the warp exits after "
+                         "every reply (0 = the warp issues nothing until all replies "
+                         "are back, a PTX functional-mode stall)",
+                         "0");
+  option_parser_register(opp, "-gpgpu_trace_rz_no_reg", OPT_BOOL,
+                         &gpgpu_trace_rz_no_reg,
+                         "R255 (RZ, the zero register) is not a register operand: no "
+                         "scoreboard entry and no register bank read (0 = register 256)",
+                         "0");
+  option_parser_register(opp, "-gpgpu_membar_wait_stores", OPT_BOOL,
+                         &gpgpu_membar_wait_stores,
+                         "MEMBAR waits for the warp's store acks as well as its "
+                         "pending register writes (0 = register writes only)",
+                         "0");
+  option_parser_register(opp, "-gpgpu_strong_store_bypass_l1", OPT_BOOL,
+                         &gpgpu_strong_store_bypass_l1,
+                         ".STRONG.GPU and .BYPASS stores skip the L1D like such "
+                         "loads, as in Accel-Sim 2.0 (0 = through the L1D)",
+                         "0");
+  option_parser_register(opp, "-gpgpu_ldst_replay_skip_stale", OPT_BOOL,
+                         &gpgpu_ldst_replay_skip_stale,
+                         "a replay-queue id whose warp has nothing parked is skipped "
+                         "in the same cycle (0 = it uses up the cycle's replay)",
+                         "0");
   option_parser_register(opp, "-gpgpu_tlb_decouple", OPT_BOOL,
                          &gpgpu_tlb_decouple,
                          "non-blocking L1 TLB via ldst park/replay "

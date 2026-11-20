@@ -53,6 +53,8 @@ struct inct_config {
   int      ring_hop_latency_ptw;  // same, for page-table-walk packets; <0 = inherit
   unsigned ring_link_width;  // flits drained per cycle per link (BW = LW * flit * freq)
   unsigned xbar_port_width;  // intra-chiplet xbar: flits drained per cycle per OUTPUT port
+  unsigned icp_port_width;   // flits per cycle of the ICP egress output; 0 = xbar_port_width
+  bool xbar_input_limit;     // SM and L2 inputs send at most xbar_port_width flits per cycle
 };
 
 // True under ACCELSIM_DIAG (gpu-sim.cc); only then does the ring update its diagnostic counters.
@@ -183,6 +185,14 @@ class xbar_router {
   unsigned grant_cycles_count;
 
   unsigned m_port_width;  // flits drained per cycle per OUTPUT port (>=1)
+  unsigned m_icp_port_width;  // flits per cycle of the ICP egress output (>=1)
+  // Grant width of output `out`: the ICP egress has its own width.
+  unsigned out_width(unsigned out) const {
+    return (_n_icp && out == icp_index()) ? m_icp_port_width : m_port_width;
+  }
+  // -icnt_xbar_input_limit: flits each input sent this cycle (the ICP ingress is not limited).
+  bool m_input_limit;
+  vector<unsigned> m_in_sent;
   unsigned _n_icp;  // number of inter-chiplet ports on this router (0 or 1)
   bool m_inter_via_ring;  // when true, do NOT inflate remote flits (ring owns inter BW)
 

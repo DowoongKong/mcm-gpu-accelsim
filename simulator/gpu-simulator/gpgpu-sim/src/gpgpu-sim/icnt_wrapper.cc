@@ -188,6 +188,15 @@ void icnt_reg_options(class OptionParser* opp) {
                          &g_inct_config.xbar_port_width,
                          "intra-chiplet xbar flits drained per cycle per OUTPUT port "
                          "(per-port BW = width*flit*freq)", "5");
+  option_parser_register(opp, "-icnt_icp_port_width", OPT_UINT32,
+                         &g_inct_config.icp_port_width,
+                         "flits per cycle of a chiplet's ICP egress port (send to the "
+                         "ring); 0 = -icnt_xbar_port_width", "0");
+  option_parser_register(opp, "-icnt_xbar_input_limit", OPT_BOOL,
+                         &g_inct_config.xbar_input_limit,
+                         "each SM and L2 input of a chiplet xbar sends at most "
+                         "-icnt_xbar_port_width flits per cycle (the ICP ingress is not "
+                         "limited; 0 = inputs unlimited)", "0");
 }
 
 void icnt_wrapper_init() {
