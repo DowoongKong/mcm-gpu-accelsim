@@ -309,9 +309,14 @@ void gpu_l1_tlb::cycle(uint64_t cur) {
       m_resv_fail_start.emplace(head.rid, cur);
     }
   }
-  // ORDER: the newest blocked group retries first; prepend this cycle's group in its own order.
-  for (auto it = this_cycle_blocked.rbegin(); it != this_cycle_blocked.rend(); ++it)
-    m_mshr_wait_q.push_front(*it);
+  // Retry order: FIFO appends this cycle's group (oldest first); otherwise it is prepended in
+  // its own order (newest group first).
+  if (m_mshr_wait_fifo) {
+    for (const auto &b : this_cycle_blocked) m_mshr_wait_q.push_back(b);
+  } else {
+    for (auto it = this_cycle_blocked.rbegin(); it != this_cycle_blocked.rend(); ++it)
+      m_mshr_wait_q.push_front(*it);
+  }
   // Advance the ring: the drained head becomes the empty new tail.
   m_pipe_live -= (unsigned)pipe_stage(0).size();
   pipe_stage(0).clear();

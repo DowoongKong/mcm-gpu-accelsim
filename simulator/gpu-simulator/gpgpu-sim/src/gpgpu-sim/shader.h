@@ -1435,6 +1435,7 @@ class ldst_unit : public pipelined_simd_unit {
   void cycle_c();
   // -gpgpu_ldst_replay_first: called after cycle_c(), before the same cycle's issue.
   void fill_idle_dispatch_with_replay();
+  void replay_front();
   // STATEHASH: the L1 TLBs of all three page sizes, position-sensitive.
   unsigned long long xlat_l1_fingerprint() const {
     unsigned long long h = 1469598103934665603ull;
@@ -1897,6 +1898,12 @@ class shader_core_config : public core_config {
   bool     gpgpu_alu_ready_queue;           // ALU units: in-order ready-cycle queue instead of a shift register
   bool     gpgpu_ldst_gate_skip_shared;     // shared-space LOAD/STORE do not take the ldst gate
   bool     gpgpu_ldst_gate_release_at_xlat; // a LOAD/STORE releases the ldst gate once translated
+  bool     gpgpu_l1_tlb_mshr_wait_fifo;     // MSHR-full L1 TLB lookups retry oldest first
+  bool     gpgpu_trace_atomic_no_stall;     // a warp keeps issuing while its atomics are in flight
+  bool     gpgpu_trace_rz_no_reg;           // R255 (RZ) is not a register operand
+  bool     gpgpu_membar_wait_stores;        // MEMBAR also waits for the warp's store acks
+  bool     gpgpu_strong_store_bypass_l1;    // .STRONG.GPU / .BYPASS stores skip the L1D
+  bool     gpgpu_ldst_replay_skip_stale;    // a stale replay id does not use up the cycle's replay
   bool     gpgpu_tlb_decouple;              // non-blocking L1 TLB (park/replay)
   bool     gpgpu_tlb_ideal;                 // ideal 0-cycle translation (timing baseline)
   bool     gpgpu_l1d_vipt;                  // L1D virtually indexed, physically tagged

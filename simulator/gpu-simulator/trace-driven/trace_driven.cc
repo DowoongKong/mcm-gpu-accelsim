@@ -250,22 +250,26 @@ bool trace_warp_inst_t::parse_from_trace_struct(
   }
 
   // fill regs information
-  num_regs = trace.reg_srcs_num + trace.reg_dsts_num;
-  num_operands = num_regs;
-  outcount = trace.reg_dsts_num;
+  const shader_core_config *sc = static_cast<const shader_core_config *>(m_config);
+  const bool rz_off = sc && sc->gpgpu_trace_rz_no_reg;  // R255 = RZ
+  outcount = 0;
   for (unsigned m = 0; m < trace.reg_dsts_num; ++m) {
-    out[m] =
-        trace.reg_dest[m] + 1;  // Increment by one because GPGPU-sim starts
-                                // from R1, while SASS starts from R0
-    arch_reg.dst[m] = trace.reg_dest[m] + 1;
+    if (rz_off && trace.reg_dest[m] == 255) continue;
+    // Increment by one because GPGPU-sim starts from R1, while SASS starts from R0
+    out[outcount] = trace.reg_dest[m] + 1;
+    arch_reg.dst[outcount] = trace.reg_dest[m] + 1;
+    outcount++;
   }
 
-  incount = trace.reg_srcs_num;
+  incount = 0;
   for (unsigned m = 0; m < trace.reg_srcs_num; ++m) {
-    in[m] = trace.reg_src[m] + 1;  // Increment by one because GPGPU-sim starts
-                                   // from R1, while SASS starts from R0
-    arch_reg.src[m] = trace.reg_src[m] + 1;
+    if (rz_off && trace.reg_src[m] == 255) continue;
+    in[incount] = trace.reg_src[m] + 1;
+    arch_reg.src[incount] = trace.reg_src[m] + 1;
+    incount++;
   }
+  num_regs = outcount + incount;
+  num_operands = num_regs;
 
   // fill latency and initl
   tconfig->set_latency(op, latency, initiation_interval);
@@ -317,6 +321,13 @@ bool trace_warp_inst_t::parse_from_trace_struct(
         space.set_type(local_space);
       else
         space.set_type(global_space);
+      // -gpgpu_strong_store_bypass_l1: GPU-scope strong or bypass stores skip the L1D, as loads do
+      if (m_config &&
+          static_cast<const shader_core_config *>(m_config)->gpgpu_strong_store_bypass_l1 &&
+          ((trace.check_opcode_contain(opcode_tokens, "STRONG") &&
+            trace.check_opcode_contain(opcode_tokens, "GPU")) ||
+           trace.check_opcode_contain(opcode_tokens, "BYPASS")))
+        cache_op = CACHE_GLOBAL;
       break;
     case OP_ATOMG:
     case OP_RED:
@@ -630,6 +641,7 @@ const warp_inst_t *trace_shader_core_ctx::get_next_inst(unsigned warp_id,
     if (!m_warp[warp_id]->inst_in_pipeline() &&
         !m_barriers.warp_waiting_at_barrier(warp_id) &&
         m_warp[warp_id]->stores_done() &&
+        (!m_config->gpgpu_trace_atomic_no_stall || m_warp[warp_id]->get_n_atomic() == 0) &&
         !m_scoreboard->pendingWrites(warp_id)) {
       for (unsigned t = 0; t < m_warp_size; t++) {
         if (m_warp[warp_id]->test_active(t)) {
