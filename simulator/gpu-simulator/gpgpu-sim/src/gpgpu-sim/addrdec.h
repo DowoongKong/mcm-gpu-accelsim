@@ -72,7 +72,7 @@ class linear_to_raw_address_translation {
   // True when no chip or bank bit lies below line_bits and the mapping is not random (memcpy
   // L2 warm-up memo). Hash inputs are not checked.
   bool sub_partition_fixed_within(unsigned line_bits) const {
-    if (memory_partition_indexing == RANDOM) return false;
+    if (memory_partition_indexing != CONSECUTIVE) return false;  // hash inputs are not checked
     if (ADDR_CHIP_S >= 0 && (unsigned)ADDR_CHIP_S < line_bits) return false;
     const new_addr_type low = ((new_addr_type)1 << line_bits) - 1;
     return ((addrdec_mask[CHIP] | addrdec_mask[BK]) & low) == 0;

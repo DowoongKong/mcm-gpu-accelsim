@@ -57,6 +57,14 @@
 #include "option_parser.h"
 #include "trace_driven.h"
 
+namespace {
+// NVBit generic windows (nvbit.h): shared and local each span [base, base + 16 MB).
+const unsigned long long kGenericWindowBytes = 1ULL << 24;
+bool in_generic_window(unsigned long long addr, unsigned long long base) {
+  return base != 0 && addr >= base && addr - base < kGenericWindowBytes;
+}
+}  // namespace
+
 const trace_warp_inst_t *trace_shd_warp_t::get_next_trace_inst() {
   if (trace_pc < warp_traces.size()) {
     trace_warp_inst_t *new_inst =
@@ -315,9 +323,22 @@ bool trace_warp_inst_t::parse_from_trace_struct(
     case OP_ATOM:
       assert(data_size > 0);
       memory_op = memory_load;
+      m_isatomic = true;
+      if (m_opcode != OP_ATOMG) {  // generic: on the shared window it is an ATOMS
+        bool on_shared = false;
+        for (unsigned i = 0; i < warp_size(); ++i)
+          if (active_mask.test(i)) {
+            on_shared = in_generic_window(trace.memadd_info->addrs[i],
+                                          kernel_trace_info->shmem_base_addr);
+            break;
+          }
+        if (on_shared) {
+          space.set_type(shared_space);
+          break;
+        }
+      }
       op = LOAD_OP;
       space.set_type(global_space);
-      m_isatomic = true;
       cache_op = CACHE_GLOBAL;  // all the atomics should be done at L2
       break;
     case OP_LDS:
@@ -357,18 +378,18 @@ bool trace_warp_inst_t::parse_from_trace_struct(
         // check the first active address
         for (unsigned i = 0; i < warp_size(); ++i)
           if (active_mask.test(i)) {
-            if (trace.memadd_info->addrs[i] >=
-                    kernel_trace_info->shmem_base_addr &&
-                trace.memadd_info->addrs[i] <
-                    kernel_trace_info->local_base_addr)
+            const unsigned long long lb = kernel_trace_info->local_base_addr;
+            if (in_generic_window(trace.memadd_info->addrs[i],
+                                  kernel_trace_info->shmem_base_addr))
               space.set_type(shared_space);
-            else if (trace.memadd_info->addrs[i] >=
-                         kernel_trace_info->local_base_addr &&
-                     trace.memadd_info->addrs[i] <
-                         kernel_trace_info->local_base_addr +
-                             LOCAL_MEM_SIZE_MAX) {
+            else if (in_generic_window(trace.memadd_info->addrs[i], lb)) {
               space.set_type(local_space);
               cache_op = CACHE_ALL;
+              // Window offset, as LDL/STL carry; translate_local_memaddr() expects it.
+              for (unsigned j = 0; j < warp_size(); ++j)
+                if (active_mask.test(j) &&
+                    in_generic_window(trace.memadd_info->addrs[j], lb))
+                  set_addr(j, trace.memadd_info->addrs[j] - lb);
             } else {
               space.set_type(global_space);
               cache_op = CACHE_ALL;

@@ -254,7 +254,8 @@ void memory_stats_t::memlatstat_dram_access(mem_fetch *mf) {
 }
 
 void memory_stats_t::memlatstat_icnt2mem_pop(mem_fetch *mf) {
-  if (m_memory_config->gpgpu_memlatency_stat) {
+  // Page-table reads are not counted in num_mfs, so keep them out of the sum too.
+  if (m_memory_config->gpgpu_memlatency_stat && mf->get_type() != TLB_FILL_ACC) {
     unsigned icnt2mem_latency;
     icnt2mem_latency =
         (m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle) - mf->get_timestamp();

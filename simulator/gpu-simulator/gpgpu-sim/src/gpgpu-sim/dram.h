@@ -232,7 +232,7 @@ class dram_t {
 
   unsigned int bwutil;
   unsigned int max_mrqs;
-  unsigned int ave_mrqs;
+  unsigned long long ave_mrqs;  // queue length summed over DRAM cycles (32 bits wrap in long runs)
 
   class frfcfs_scheduler *m_frfcfs_scheduler;
 

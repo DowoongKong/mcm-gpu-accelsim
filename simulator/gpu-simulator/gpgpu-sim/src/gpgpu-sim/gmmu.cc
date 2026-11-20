@@ -30,7 +30,9 @@ static bool accelsim_log_gmmu() {
 FILE* l2miss_log_file() {
   static FILE* const f = []() -> FILE* {
     const char* p = getenv("ACCELSIM_L2MISS_LOG");
-    return (p && p[0] != '\0') ? fopen(p, "w") : NULL;
+    FILE* f = (p && p[0] != '\0') ? fopen(p, "w") : NULL;
+    if (f) setvbuf(f, NULL, _IOLBF, 0);   // line-buffered: an aborted run keeps every line
+    return f;
   }();
   return f;
 }
@@ -499,6 +501,7 @@ bool gmmu::pwc_lookup_touch(uint64_t va, int level, uint64_t& out_next_pa, uint6
 }
 
 void gmmu::pwc_insert(uint64_t va, int level, uint64_t next_pa, uint64_t cycle) {
+  if (m_pwc.empty()) return;  // -gmmu_pwc_entries 0: no PWC
   uint64_t key = pwc_key(va, level);
   // Update if already present
   for (auto& e : m_pwc) {
@@ -556,7 +559,7 @@ void gmmu::print_stats(FILE* f) const {
   fprintf(f, "\n");
 
   #ifdef ADDR_XLAT_VERIFY
-    // With no walk in flight, each walk is 4 levels = DRAM steps + PWC hits.
+    // With no walk in flight, each 4KB/64KB walk is 4 levels = DRAM steps + PWC hits.
     if (m_active_walks.empty()) {
       assert(m_local_steps + m_remote_steps ==
             4ULL * m_ptw_complete_count - m_pwc_hits &&

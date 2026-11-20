@@ -258,8 +258,10 @@ void dram_t::scheduler_frfcfs() {
           max_seen = m_stats->max_mrq_latency;
           if (mrq_latency > max_seen) {
 #pragma omp critical(dram_max_mrq_latency)
-            if (mrq_latency > m_stats->max_mrq_latency)
+            if (mrq_latency > m_stats->max_mrq_latency) {
+#pragma omp atomic write
               m_stats->max_mrq_latency = mrq_latency;
+            }
           }
         }
 

@@ -304,6 +304,14 @@ void gpu_module::init() {
            c, n_ptw, pwq_depth, pwc_entries);
   }
   
+  // L2 TLB requests are keyed by cluster, so two SMs of one cluster would share a key.
+  if (m_top->getShaderCoreConfig()->n_simt_cores_per_cluster != 1) {
+    fprintf(stderr, "\nFATAL: %u SMs per cluster; the L2 TLB keys requests by cluster and needs "
+                    "-gpgpu_n_cores_per_cluster 1.\n",
+            m_top->getShaderCoreConfig()->n_simt_cores_per_cluster);
+    fflush(stderr);
+    abort();
+  }
   if (m_n_clusters > (1u << gpu_l2_tlb::kReqKeyClusterBits)) {
     fprintf(stderr,
             "FATAL: %u SIMT clusters, but the L2 TLB request key holds only %u "
@@ -1217,7 +1225,7 @@ bool gpu_page_table::record_first_touch(uint64_t va, unsigned chiplet) {
 }
 
 void gpu_page_table::note_first_touch(uint64_t va, unsigned chiplet) {
-  // Buffered when deferral is on (from every kernel launch); immediate otherwise.
+  // Buffered when deferral is on (from simulator start); immediate otherwise.
   if (m_defer_ft) {
     assert(chiplet < m_ft_buf.size());
     m_ft_buf[chiplet].push_back(va);
@@ -1735,8 +1743,18 @@ bool gpu_module::is_va_allocated(uint64_t va) const {
   return false;
 }
 
+// The 4-level table resolves VA[47:0] only; a wider VA would share a lower VA's PTE.
+static void va_width_fatal(uint64_t va) __attribute__((noinline, cold));
+static void va_width_fatal(uint64_t va) {
+  fprintf(stderr, "\nFATAL: va 0x%llx is wider than 48 bits; the page table would alias it.\n",
+          (unsigned long long)va);
+  fflush(stderr);
+  abort();
+}
+
 // Linear scan: benchmarks register only tens of allocations.
 unsigned gpu_module::page_shift_for_va(uint64_t va) const {
+  if (va >> 48) va_width_fatal(va);
   // Fast path: under a fixed policy every va gets the same shift.
   if (m_uniform_shift) return m_uniform_shift;
   for (const auto& a : m_va_alloc_list) {

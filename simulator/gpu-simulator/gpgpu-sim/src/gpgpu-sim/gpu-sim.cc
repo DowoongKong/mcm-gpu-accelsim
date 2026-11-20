@@ -35,6 +35,7 @@
 #endif
 #include "gpu-sim.h"
 
+#include <algorithm>
 #include <math.h>
 #include <signal.h>
 #include <stdio.h>
@@ -385,7 +386,7 @@ void memory_config::reg_options(class OptionParser *opp) {
   option_parser_register(opp, "-icnt_flit_size", OPT_UINT32, &icnt_flit_size,
                          "icnt_flit_size", "32");
   option_parser_register(opp, "-icnt_inter_flit_size", OPT_UINT32, &icnt_inter_flit_size,
-                         "icnt_inter_flit_size", "8");
+                         "flit size (bytes) of inter-chiplet ring links", "8");
   // SST mode activate
   option_parser_register(opp, "-SST_mode", OPT_BOOL, &SST_mode, "SST mode",
                          "0");
@@ -1014,7 +1015,7 @@ void gpgpu_sim_config::reg_options(option_parser_t opp) {
   // Placement map: dump first-touch placement, or load it to fix placement across configs.
   option_parser_register(opp, "-gmmu_placement_dump", OPT_CSTR,
                         &gmmu_placement_dump,
-                        "write the first-touch placement map to this file at exit "
+                        "write the placement map to this file at every stats dump "
                         "(empty = disabled)",
                         "");
   option_parser_register(opp, "-gmmu_placement_load", OPT_CSTR,
@@ -1388,6 +1389,15 @@ unsigned gpgpu_sim::finished_kernel() {
   return result;
 }
 
+void gpgpu_sim::commit_deferred_kernel_done() {
+  if (m_kernel_done_pending.empty()) return;
+  std::stable_sort(m_kernel_done_pending.begin(), m_kernel_done_pending.end(),
+                   [](const std::pair<unsigned, kernel_info_t *> &a,
+                      const std::pair<unsigned, kernel_info_t *> &b) { return a.first < b.first; });
+  for (const auto &p : m_kernel_done_pending) set_kernel_done(p.second);
+  m_kernel_done_pending.clear();
+}
+
 void gpgpu_sim::set_kernel_done(kernel_info_t *kernel) {
   if (kernel->pcc_on()) {   // PCC: per-chiplet issue summary ([PCC] rows)
     for (unsigned c = 0; c < kernel->pcc_n(); c++)
@@ -1505,6 +1515,15 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
     m_gpu_module->dump_partitioning();
   }
 
+  // Instruction and constant fetches are not translated; a real I/C cache would send them as PAs.
+  if (!m_shader_config->perfect_inst_const_cache) {
+    fprintf(stderr,
+            "\nFATAL: -gpgpu_perfect_inst_const_cache 0 is not supported: instruction and "
+            "constant fetch addresses are not translated and would alias physical frames.\n");
+    fflush(stderr);
+    abort();
+  }
+
   // TODO: somehow move this logic to the sst_gpgpu_sim constructor?
   if (!m_config.is_SST_mode()) {
     // Init memory if not in SST mode
@@ -1542,6 +1561,13 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
   m_last_cluster_issue = m_shader_config->n_simt_clusters -
                          1;  // this causes first launch to use simt cluster 0
   // CTA scheduler from -gpgpu_cta_scheduling_policy (0 = upstream order).
+  // Valid LASP policies are 0-4; a larger value would silently act as CHUNK binding.
+  if (m_config.get_lasp_policy() > 4) {
+    fprintf(stderr, "\nFATAL: -gpgpu_lasp_policy %u; valid values are 0-4.\n",
+            m_config.get_lasp_policy());
+    fflush(stderr);
+    abort();
+  }
   m_cta_scheduler = cta_scheduler_t::create(
       static_cast<cta_scheduling_policy_t>(m_config.m_cta_sched_policy));
   printf("[CTA_SCHED] policy=%s\n", m_cta_scheduler->policy_name());
@@ -1699,7 +1725,7 @@ void gpgpu_sim::init() {
       fprintf(stderr,
               "\nFATAL: OMP_NUM_THREADS=%d exceeds the verified ceiling of 16.\n"
               "       Thread counts 1/2/4/8/16 reproduce the sequential result "
-              "exactly (G6);\n"
+              "exactly;\n"
               "       higher counts have never been validated, and this class "
               "of failure is\n"
               "       silent (exit 0, wrong statistics).\n"
@@ -1777,8 +1803,8 @@ void gpgpu_sim::init() {
     insn_warp_occ_create(m_config.num_shader(), m_shader_config->warp_size);
     shader_warp_occ_create(m_config.num_shader(), m_shader_config->warp_size,
                            m_config.gpgpu_cflog_interval);
-    shader_mem_acc_create(m_config.num_shader(), m_memory_config->m_n_mem, 4,
-                          m_config.gpgpu_cflog_interval);
+    shader_mem_acc_create(m_config.num_shader(), m_memory_config->m_n_mem,
+                          m_memory_config->nbk, m_config.gpgpu_cflog_interval);
     shader_mem_lat_create(m_config.num_shader(), m_config.gpgpu_cflog_interval);
     shader_cache_access_create(m_config.num_shader(), 3,
                                m_config.gpgpu_cflog_interval);
@@ -1844,14 +1870,14 @@ void gpgpu_sim::print_stats(unsigned long long streamID) {
       const bool pinned = m_gpu_module->get_page_table() &&
                           m_gpu_module->get_page_table()->placement_frozen();
       const char* mode;
-      if (dumping && loading)
+      if (dumping && loading && strcmp(pd, pl) == 0)
         mode = "INVALID_dump+load";  // the map would be read and overwritten
+      else if (loading)  // a dump to another file is the end-state check map
+        mode = !pinned ? "INVALID_map_not_loaded"
+                       : (lptw ? "LOCAL_PTW" : "BASELINE");
       else if (dumping)
         mode = pinned ? "INVALID_ref_pinned"  // a reference must place by first touch
                       : "REFERENCE";          // builds the map, stats discarded
-      else if (loading)
-        mode = !pinned ? "INVALID_map_not_loaded"
-                       : (lptw ? "LOCAL_PTW" : "BASELINE");
       else
         mode = "INVALID_no_placement";  // uncontrolled: neither dumped nor pinned
       printf("[RUN_MODE] mode=%s  local_ptw=%d  pinned=%d  page_shift=%u  "
@@ -1940,7 +1966,7 @@ void gpgpu_sim::print_stats(unsigned long long streamID) {
       unsigned long long icnt_cycles = 0, gated = 0;
       m_cluster[repr]->get_popgate_stats(icnt_cycles, gated);
       printf("[POPGATE] repr_cluster=%u chiplet=%u icnt_cycles=%llu gated=%llu (%.1f%%) "
-             "[repr-cluster share only; lower bound since Fix-A]\n",
+             "[repr-cluster share only; a lower bound with round-robin PTW endpoints]\n",
              repr, c, icnt_cycles, gated,
              icnt_cycles ? 100.0 * gated / icnt_cycles : 0.0);
     }
@@ -2069,12 +2095,22 @@ void gpgpu_sim::print_stats(unsigned long long streamID) {
 void gpgpu_sim::deadlock_check() {
   if (m_config.gpu_deadlock_detect && gpu_deadlock) {
     fflush(stdout);
+    // Last writeback over all SMs (lowest SM id on a tie), from per-SM cycles.
+    unsigned long long last_wb = 0;
+    unsigned last_wb_sid = 0;
+    for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++)
+      for (unsigned j = 0; j < m_shader_config->n_simt_cores_per_cluster; j++) {
+        const shader_core_ctx *core = m_cluster[i]->get_core(j);
+        if (core->last_writeback_cycle() > last_wb) {
+          last_wb = core->last_writeback_cycle();
+          last_wb_sid = core->get_sid();
+        }
+      }
+    const unsigned long long now = gpu_tot_sim_cycle + gpu_sim_cycle;
     printf(
         "\n\nGPGPU-Sim uArch: ERROR ** deadlock detected: last writeback core "
-        "%u @ gpu_sim_cycle %u (+ gpu_tot_sim_cycle %u) (%u cycles ago)\n",
-        gpu_sim_insn_last_update_sid, (unsigned)gpu_sim_insn_last_update,
-        (unsigned)(gpu_tot_sim_cycle - gpu_sim_cycle),
-        (unsigned)(gpu_sim_cycle - gpu_sim_insn_last_update));
+        "%u @ cycle %llu (%llu cycles ago)\n",
+        last_wb_sid, last_wb, now >= last_wb ? now - last_wb : 0ULL);
     unsigned num_cores = 0;
     for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
       unsigned not_completed = m_cluster[i]->get_not_completed();
@@ -2117,7 +2153,11 @@ void gpgpu_sim::deadlock_check() {
       if (m_gpu_module)
         for (unsigned c = 0; c < m_gpu_module->get_num_chiplets(); c++) {
           m_gpu_module->get_gmmu(c)->xlatdbg_dump_pending(stdout);
-          m_gpu_module->get_chiplet(c)->get_l2_tlb_4k()->xlatdbg_dump(stdout, c, "4k");
+          const chiplet *ch = m_gpu_module->get_chiplet(c);
+          const gpu_l2_tlb *l2[3] = {ch->get_l2_tlb_4k(), ch->get_l2_tlb_64k(), ch->get_l2_tlb_2m()};
+          const char *tag[3] = {"4k", "64k", "2m"};
+          for (unsigned k = 0; k < 3; k++)
+            if (l2[k]) l2[k]->xlatdbg_dump(stdout, c, tag[k]);
         }
       printf("XLATDBG_DEADLOCK: ===== end =====\n");
       fflush(stdout);
@@ -2842,9 +2882,9 @@ cta_scheduler_t* cta_scheduler_t::create(cta_scheduling_policy_t policy) {
     case CTA_SCHED_STATIC_BINDING:
       return new StaticBindingScheduler();
     default:
-      fprintf(stderr, "ERROR: unknown cta_scheduling_policy %d\n", (int)policy);
-      assert(0);
-      return nullptr;
+      fprintf(stderr, "\nFATAL: unknown -gpgpu_cta_scheduling_policy %d (valid: 0-2)\n", (int)policy);
+      fflush(stderr);
+      abort();
   }
 }
 
@@ -3021,9 +3061,8 @@ void gpgpu_sim::cycle() {
     }
     if (g_phase_timing_on) {
       const unsigned long long icnt_pop_wall_end = phase_now_ns();
-      // icnt_ns also includes icnt_transfer() below; g_icnt_pop_ns is this loop only.
+      // icnt_ns also includes icnt_transfer() below (which counts the call); g_icnt_pop_ns is this loop only.
       g_phase_timers.icnt_ns += icnt_pop_wall_end - icnt_pop_wall_start;
-      g_phase_timers.icnt_calls++;
       g_icnt_pop_ns += icnt_pop_wall_end - icnt_pop_wall_start;
       g_icnt_pop_calls++;
     }
@@ -3155,8 +3194,7 @@ void gpgpu_sim::cycle() {
     }
     // L1 cache + shader core pipeline stages
     m_power_stats->pwr_mem_stat->core_cache_stats[CURRENT_STAT_IDX].clear();
-    // Hoisted out of the loop. Same value: pass A only clears a kernel slot that already
-    // contributes false, and CTA issue happens after the loop.
+    // Hoisted out of the loop: kernel slots change only after the passes and CTA issue comes later.
     const bool more_cta_left = get_more_cta_left();
     unsigned long long active_sms_this_cycle = 0;
     // The GPU-wide page table must not change during the parallel passes (its maps are not
@@ -3172,7 +3210,7 @@ void gpgpu_sim::cycle() {
 
     // CORE = three passes: A (writeback, non-ldst units, ldst cycle_a; per SM), B (ldst cycle_b:
     // chiplet L2 TLB / GMMU; one chiplet per thread), C (ldst cycle_c, issue, fetch; per SM).
-    // Pass A's run/skip decision is reused by B and C: A retires threads, so a re-test could differ.
+    // Pass A's run/skip decision is reused by B and C, as upstream tests once per cycle.
     if (m_cluster_ran.size() != m_shader_config->n_simt_clusters)
       m_cluster_ran.assign(m_shader_config->n_simt_clusters, 0);
 
@@ -3293,6 +3331,8 @@ void gpgpu_sim::cycle() {
       abort();
     }
 #endif
+    // Kernels that finished in pass C, in SM order (the 1-thread order).
+    commit_deferred_kernel_done();
     // Commit this cycle's deferred first-touch inserts, after the parallel passes and the guard.
     if (m_gpu_module && m_gpu_module->get_page_table())
       m_gpu_module->get_page_table()->commit_deferred_first_touch();
@@ -3339,7 +3379,7 @@ void gpgpu_sim::cycle() {
       const unsigned long long now = gpu_sim_cycle + gpu_tot_sim_cycle;
       if (win_hi && now >= win_lo && now <= win_hi) {
         for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++)
-          printf("[SMDETAIL] cyc=%llu sm=%u winsn=%u cyc_cnt=%u l1=%llu\n",
+          printf("[SMDETAIL] cyc=%llu sm=%u winsn=%u cyc_cnt=%llu l1=%llu\n",
                  now, i, m_shader_stats->m_num_sim_winsn[i],
                  m_shader_stats->shader_cycles[i],
                  m_cluster[i]->xlat_l1_fingerprint());
@@ -3410,7 +3450,7 @@ void gpgpu_sim::cycle() {
         printf("Flushed L2 caches...\n");
         if (m_memory_config->m_L2_config.get_num_lines()) {
           int dlc = 0;
-          for (unsigned i = 0; i < m_memory_config->m_n_mem; i++) {
+          for (unsigned i = 0; i < m_memory_config->m_n_mem_sub_partition; i++) {
             dlc = m_memory_sub_partition[i]->flushL2();
             assert(dlc == 0);  // TODO: need to model actual writes to DRAM here
             printf("Dirty lines flushed from L2 %d is %d\n", i, dlc);

@@ -63,7 +63,6 @@
 #include "gpu_tlb.h"
 
 
-// #define LOG_TLB
 #define NO_OP_FLAG 0xFF
 
 /* READ_PACKET_SIZE:
@@ -1554,7 +1553,7 @@ class ldst_unit : public pipelined_simd_unit {
   gpu_l1_tlb *m_l1_tlb_4k;  // 4KB page per-SM L1 TLB
   gpu_l1_tlb *m_l1_tlb_64k = nullptr;  // 64KB page per-SM L1 TLB
   gpu_l1_tlb *m_l1_tlb_2m  = nullptr;  // 2MB page per-SM L1 TLB
-  // Per-warp FIFO of parked insts: a warp may have more than one memory inst in flight.
+  // Per-warp FIFO of parked insts (with the ldst gate a warp parks at most one LOAD/STORE).
  public:
   // Deadlock dump (XLATDBG_DEADLOCK rows): warps parked waiting for a translation.
   void xlatdbg_dump_parked(FILE* fp, unsigned sid) const;
@@ -1621,6 +1620,7 @@ class ldst_unit : public pipelined_simd_unit {
 
   // Deadlock-dump DPROBE counters (unused by the model): did the replay path / SAFETY NET run?
   unsigned long long m_dprobe_replay_fires = 0;
+  unsigned long long m_replay_stale = 0;  // replay pops with nothing parked (dispatch idles)
   unsigned long long m_dprobe_safetynet_fires = 0;
   unsigned long long m_dprobe_safetynet_last_cycle = 0;
   unsigned long long m_dprobe_gate_closed_cycles = 0;
@@ -2038,8 +2038,8 @@ struct shader_core_stats_pod {
   double *m_active_exu_threads;  // For power model
   double *m_active_exu_warps;    // For power model
   unsigned *m_n_diverge;  // number of divergence occurring in this shader
-  unsigned gpgpu_n_load_insn;
-  unsigned gpgpu_n_store_insn;
+  unsigned long long gpgpu_n_load_insn;  // thread-level counts: 64-bit, 32 bits wrap in long runs
+  unsigned long long gpgpu_n_store_insn;
   unsigned gpgpu_n_shmem_insn;
   unsigned gpgpu_n_sstarr_insn;
   unsigned gpgpu_n_tex_insn;
@@ -2052,29 +2052,29 @@ struct shader_core_stats_pod {
   unsigned gpu_stall_shd_mem_breakdown[N_MEM_STAGE_ACCESS_TYPE]
                                       [N_MEM_STAGE_STALL_TYPE];
   unsigned gpu_reg_bank_conflict_stalls;
-  unsigned *shader_cycle_distro;
-  unsigned *last_shader_cycle_distro;
+  unsigned long long *shader_cycle_distro;
+  unsigned long long *last_shader_cycle_distro;
   unsigned *num_warps_issuable;
-  unsigned gpgpu_n_stall_shd_mem;
+  unsigned long long gpgpu_n_stall_shd_mem;
   unsigned *single_issue_nums;
   unsigned *dual_issue_nums;
 
   unsigned ctas_completed;
   // memory access classification
-  int gpgpu_n_mem_read_local;
-  int gpgpu_n_mem_write_local;
-  int gpgpu_n_mem_texture;
-  int gpgpu_n_mem_const;
-  int gpgpu_n_mem_read_global;
-  int gpgpu_n_mem_write_global;
-  int gpgpu_n_mem_read_inst;
+  unsigned long long gpgpu_n_mem_read_local;
+  unsigned long long gpgpu_n_mem_write_local;
+  unsigned long long gpgpu_n_mem_texture;
+  unsigned long long gpgpu_n_mem_const;
+  unsigned long long gpgpu_n_mem_read_global;
+  unsigned long long gpgpu_n_mem_write_global;
+  unsigned long long gpgpu_n_mem_read_inst;
 
-  int gpgpu_n_mem_l2_writeback;
-  int gpgpu_n_mem_l1_write_allocate;
-  int gpgpu_n_mem_l2_write_allocate;
+  unsigned long long gpgpu_n_mem_l2_writeback;
+  unsigned long long gpgpu_n_mem_l1_write_allocate;
+  unsigned long long gpgpu_n_mem_l2_write_allocate;
 
-  unsigned made_write_mfs;
-  unsigned made_read_mfs;
+  unsigned long long made_write_mfs;
+  unsigned long long made_read_mfs;
 
   unsigned *gpgpu_n_shmem_bank_access;
   long *n_simt_to_mem;  // Interconnect power stats
@@ -2170,10 +2170,10 @@ class shader_core_stats : public shader_core_stats_pod {
     m_non_rf_operands =
         (unsigned *)calloc(config->num_shader(), sizeof(unsigned));
     m_n_diverge = (unsigned *)calloc(config->num_shader(), sizeof(unsigned));
-    shader_cycle_distro =
-        (unsigned *)calloc(config->warp_size + 3, sizeof(unsigned));
-    last_shader_cycle_distro =
-        (unsigned *)calloc(m_config->warp_size + 3, sizeof(unsigned));
+    shader_cycle_distro = (unsigned long long *)calloc(
+        config->warp_size + 3, sizeof(unsigned long long));
+    last_shader_cycle_distro = (unsigned long long *)calloc(
+        m_config->warp_size + 3, sizeof(unsigned long long));
     single_issue_nums =
         (unsigned *)calloc(config->gpgpu_num_sched_per_core, sizeof(unsigned));
     dual_issue_nums =
@@ -2370,6 +2370,10 @@ class shader_core_ctx : public core_t {
   void forget_kernel(const kernel_info_t *k) { if (m_kernel == k) m_kernel = NULL; }
   void retarget_kernel(const kernel_info_t *from, kernel_info_t *to) { if (m_kernel == from) m_kernel = to; }
   unsigned get_sid() const { return m_sid; }
+  // Absolute cycle of this SM's last writeback (deadlock message).
+  unsigned long long last_writeback_cycle() const {
+    return m_last_inst_gpu_tot_sim_cycle + m_last_inst_gpu_sim_cycle;
+  }
 
   // used by functional simulation:
   // modifiers

@@ -495,6 +495,17 @@ void LocalInterconnect::CreateInterconnect(unsigned m_n_shader, unsigned m_n_mem
   assert(m_dev_chiplet.size() == n_shader + n_mem && "chiplet map size mismatch");
 
   m_use_ring = (m_inct_config.use_ring != 0) && (m_n_chiplets > 1);
+  auto icnt_fatal = [](const char* why) {
+    fprintf(stderr, "\nFATAL: %s\n", why);
+    fflush(stderr);
+    abort();
+  };
+  if (n_subnets == 1 && m_n_chiplets > 1)  // the ICP reply path assumes separate subnets
+    icnt_fatal("-icnt_subnets 1 with several chiplets misroutes inter-chiplet replies; use 2.");
+  if (m_use_ring && m_inct_config.arbiter_algo == NAIVE_RR)  // RR_Advance() never serves the ICP VOQ
+    icnt_fatal("-icnt_use_ring 1 needs -icnt_arbiter_algo 1 (iSLIP).");
+  if (m_use_ring && m_inct_config.ring_buf == 0)
+    icnt_fatal("-icnt_ring_buf 0 leaves no ring buffer; use 1 or more.");
   const unsigned n_icp = (m_n_chiplets > 1) ? 1u : 0u;
   net.resize(n_subnets);
   for (unsigned s = 0; s < n_subnets; ++s) {

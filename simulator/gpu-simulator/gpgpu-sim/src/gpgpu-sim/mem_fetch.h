@@ -91,15 +91,16 @@ class mem_fetch {
   unsigned size() const { return m_data_size + m_ctrl_size; }
   bool is_write() { return m_access.is_write(); }
   void set_addr(new_addr_type addr) { m_access.set_addr(addr); }
-  new_addr_type get_va() const { return m_va; } // Returns the original virtual address before TLB translation.
-  bool is_translated() const { return m_translated; } // Returns true if TLB translation has completed for this request.
+  new_addr_type get_va() const { return m_va; }        // address before translation
+  bool is_translated() const { return m_translated; }  // set_pa() has run
   // Page-walk fields (PTW requests only)
   int        get_tlb_depth()  const { return m_tlb_depth; }
   mem_fetch* get_parent_mf()  const { return m_parent_mf; }
   void set_tlb_depth(int d)         { m_tlb_depth = d; }
   void set_parent_mf(mem_fetch* p)  { m_parent_mf = p; }
-  void set_type(enum mf_type t)     { m_type = t; }  // used by GMMU to override READ_REQUEST to TLB_FILL_ACC
-  void set_pa(new_addr_type pa); // Called on TLB hit. Sets PA and recomputes m_raw_addr/m_partition_addr for correct routing.
+  void set_type(enum mf_type t)     { m_type = t; }  // GMMU: READ_REQUEST -> TLB_FILL_ACC
+  // Replace the address with the PA and redo the DRAM/partition decode.
+  void set_pa(new_addr_type pa);
   new_addr_type get_addr() const { return m_access.get_addr(); }
   unsigned get_access_size() const { return m_access.get_size(); }
   new_addr_type get_partition_addr() const { return m_partition_addr; }

@@ -129,6 +129,8 @@ dram_t::dram_t(unsigned int partition_id, const memory_config *config,
   if (m_config->scheduler_type == DRAM_FRFCFS)
     m_frfcfs_scheduler = new frfcfs_scheduler(m_config, this, stats);
   n_cmd = 0;
+  n_ref = 0;
+  pending_writes = 0;
   n_activity = 0;
   n_nop = 0;
   n_act = 0;

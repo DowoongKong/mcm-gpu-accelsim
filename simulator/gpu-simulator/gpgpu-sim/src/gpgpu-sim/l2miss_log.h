@@ -1,5 +1,5 @@
-// ACCELSIM_L2MISS_LOG=<file>: timeline of L2 TLB misses (M lines) and completed page walks (C lines).
-// Read-only (a run with it on is cycle-identical); line format in simulator/README.md (Debug logs).
+// ACCELSIM_L2MISS_LOG=<file>: timeline of L2 TLB misses (M lines) and completed page walks (C lines);
+// writing it does not change the run. Field order: see the fprintf calls in gpu-module.cc and gmmu.cc.
 #ifndef L2MISS_LOG_H
 #define L2MISS_LOG_H
 #include <cstdio>
