@@ -340,6 +340,12 @@ void memory_config::reg_options(class OptionParser *opp) {
   option_parser_register(opp, "-gpgpu_frfcfs_dram_sched_queue_size", OPT_INT32,
                          &gpgpu_frfcfs_dram_sched_queue_size,
                          "0 = unlimited (default); # entries per chip", "0");
+  option_parser_register(opp, "-gpgpu_frfcfs_age_cap", OPT_UINT32,
+                         &gpgpu_frfcfs_age_cap,
+                         "FR-FCFS starvation cap: once a bank's oldest request has waited this "
+                         "many core cycles, the bank switches to its row instead of serving more "
+                         "row hits (0 = no cap)",
+                         "0");
   option_parser_register(opp, "-gpgpu_dram_return_queue_size", OPT_INT32,
                          &gpgpu_dram_return_queue_size,
                          "0 = unlimited (default); # entries per chip", "0");
@@ -568,6 +574,24 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          &gpgpu_l1_tlb_mshr_wait_fifo,
                          "L1 TLB lookups blocked by a full MSHR retry oldest first "
                          "(0 = the most recently blocked first)",
+                         "0");
+  option_parser_register(opp, "-gpgpu_l1_tlb_mshr_wait_age", OPT_BOOL,
+                         &gpgpu_l1_tlb_mshr_wait_age,
+                         "L1 TLB lookups blocked by a full MSHR take freed entries before new "
+                         "lookups, oldest instruction first (a warp's lookups kept together); "
+                         "cannot be combined with -gpgpu_l1_tlb_mshr_wait_fifo",
+                         "0");
+  option_parser_register(opp, "-gpgpu_shmem_per_cta_reserve", OPT_UINT32,
+                         &gpgpu_shmem_per_cta_reserve,
+                         "shared memory bytes the driver reserves per CTA of a kernel that uses "
+                         "shared memory (1024 from sm_80); counted in the CTA-per-SM limit and the "
+                         "L1D carveout choice (0 = not modeled)",
+                         "0");
+  option_parser_register(opp, "-gpgpu_l2_tlb_mshr_age_order", OPT_BOOL,
+                         &gpgpu_l2_tlb_mshr_age_order,
+                         "a free L2 TLB MSHR entry goes to the request that has waited longest "
+                         "for one (first blocked cycle), whatever the SM order (0 = first asker "
+                         "in SM order)",
                          "0");
   option_parser_register(opp, "-gpgpu_trace_atomic_no_stall", OPT_BOOL,
                          &gpgpu_trace_atomic_no_stall,
@@ -2661,7 +2685,9 @@ bool shader_core_ctx::occupy_shader_resource_1block(kernel_info_t &k,
 
   const struct gpgpu_ptx_sim_info *kernel_info = ptx_sim_kernel_info(kernel);
 
-  if (m_occupied_shmem + kernel_info->smem > m_config->gpgpu_shmem_size)
+  const unsigned smem_per_cta =  // -gpgpu_shmem_per_cta_reserve, as in max_cta()
+      kernel_info->smem > 0 ? kernel_info->smem + m_config->gpgpu_shmem_per_cta_reserve : 0;
+  if (m_occupied_shmem + smem_per_cta > m_config->gpgpu_shmem_size)
     return false;
 
   unsigned int used_regs = padded_cta_size * ((kernel_info->regs + 3) & ~3);
@@ -2672,7 +2698,7 @@ bool shader_core_ctx::occupy_shader_resource_1block(kernel_info_t &k,
 
   if (occupy) {
     m_occupied_n_threads += padded_cta_size;
-    m_occupied_shmem += kernel_info->smem;
+    m_occupied_shmem += smem_per_cta;
     m_occupied_regs += (padded_cta_size * ((kernel_info->regs + 3) & ~3));
     m_occupied_ctas++;
 
@@ -2708,8 +2734,10 @@ void shader_core_ctx::release_shader_resource_1block(unsigned hw_ctaid,
 
     const struct gpgpu_ptx_sim_info *kernel_info = ptx_sim_kernel_info(kernel);
 
-    assert(m_occupied_shmem >= (unsigned int)kernel_info->smem);
-    m_occupied_shmem -= kernel_info->smem;
+    const unsigned smem_per_cta =
+        kernel_info->smem > 0 ? kernel_info->smem + m_config->gpgpu_shmem_per_cta_reserve : 0;
+    assert(m_occupied_shmem >= smem_per_cta);
+    m_occupied_shmem -= smem_per_cta;
 
     unsigned int used_regs = padded_cta_size * ((kernel_info->regs + 3) & ~3);
     assert(m_occupied_regs >= used_regs);

@@ -710,6 +710,9 @@ void dram_t::print(FILE *simFile) const {
       "n_rd=%llu n_rd_L2_A=%llu n_write=%llu n_wr_bk=%llu bw_util=%.4g\n",
       n_cmd, n_nop, n_act, n_pre, n_ref, n_req, n_rd, n_rd_L2_A, n_wr, n_wr_WB,
       (float)bwutil / n_cmd);
+  if (m_config->gpgpu_frfcfs_age_cap && m_frfcfs_scheduler)
+    fprintf(simFile, "[DRAM_AGECAP] DRAM[%d] forced_row_switches=%llu\n", id,
+            m_frfcfs_scheduler->age_cap_switches());
   fprintf(simFile, "n_activity=%llu dram_eff=%.4g\n", n_activity,
           (float)bwutil / n_activity);
   for (i = 0; i < m_config->nbk; i++) {

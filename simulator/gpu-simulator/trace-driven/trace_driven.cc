@@ -80,7 +80,8 @@ const trace_warp_inst_t *trace_shd_warp_t::get_next_trace_inst() {
 
 void trace_shd_warp_t::clear() {
   trace_pc = 0;
-  warp_traces.clear();
+  // Release the storage too: clear() alone keeps the longest trace this slot ever held.
+  std::vector<inst_trace_t>().swap(warp_traces);
 }
 
 // functional_done
@@ -123,10 +124,11 @@ trace_kernel_info_t::trace_kernel_info_t(dim3 gridDim, dim3 blockDim,
   else if (kernel_trace_info->binary_verion == TURING_BINART_VERSION)
     OpcodeMap = &Turing_OpcodeMap;
   else {
-    printf("unsupported binary version: %d\n",
-           kernel_trace_info->binary_verion);
+    // No opcode table for this SASS architecture: stop with an error, not a clean exit.
     fflush(stdout);
-    exit(0);
+    fprintf(stderr, "\nFATAL: unsupported trace binary version %u (no opcode table for this SASS "
+            "architecture)\n", kernel_trace_info->binary_verion);
+    abort();
   }
 }
 

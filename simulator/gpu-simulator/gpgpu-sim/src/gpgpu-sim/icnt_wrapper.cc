@@ -192,6 +192,12 @@ void icnt_reg_options(class OptionParser* opp) {
                          &g_inct_config.icp_port_width,
                          "flits per cycle of a chiplet's ICP egress port (send to the "
                          "ring); 0 = -icnt_xbar_port_width", "0");
+  option_parser_register(opp, "-icnt_ring_credit", OPT_BOOL,
+                         &g_inct_config.ring_credit,
+                         "1 = ring flow control: a link starts a packet only while its wire holds "
+                         "fewer than width*(max hop latency+2) packets, and a local injection keeps "
+                         "one link slot free (bubble); 0 = unbounded wire",
+                         "0");
   option_parser_register(opp, "-icnt_xbar_input_limit", OPT_BOOL,
                          &g_inct_config.xbar_input_limit,
                          "each SM and L2 input of a chiplet xbar sends at most "
