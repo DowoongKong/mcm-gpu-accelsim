@@ -142,10 +142,9 @@ class shd_warp_t {
     m_waiting_ldgsts = false;
 
     // Ni: Clear m_ldgdepbar_buf
-    for (unsigned i = 0; i < m_ldgdepbar_buf.size(); i++) {
-      m_ldgdepbar_buf[i].clear();
-    }
     m_ldgdepbar_buf.clear();
+    m_ldgdepbar_pending.clear();
+    m_ldgdepbar_first_pending = 0;
   }
   void init(address_type start_pc, unsigned cta_id, unsigned wid,
             const std::bitset<MAX_WARP_SIZE> &active, unsigned dynamic_warp_id,
@@ -174,10 +173,9 @@ class shd_warp_t {
     m_waiting_ldgsts = false;
 
     // Ni: Clear m_ldgdepbar_buf
-    for (unsigned i = 0; i < m_ldgdepbar_buf.size(); i++) {
-      m_ldgdepbar_buf[i].clear();
-    }
     m_ldgdepbar_buf.clear();
+    m_ldgdepbar_pending.clear();
+    m_ldgdepbar_first_pending = 0;
   }
 
   bool functional_done() const;
@@ -354,8 +352,24 @@ class shd_warp_t {
   // Ni: LDGDEPBAR barrier support
  public:
   unsigned int m_ldgdepbar_id;  // LDGDEPBAR barrier ID
-  std::vector<std::vector<warp_inst_t>>
-      m_ldgdepbar_buf;  // LDGDEPBAR barrier buffer
+  // One LDGSTS of a group: its pc ((address_type)-1 once complete or when no lane is active) and the
+  // lane-0 address unset_depbar() matches on completion.
+  struct ldgsts_entry_t {
+    address_type pc;
+    new_addr_type addr0;
+  };
+  std::vector<std::vector<ldgsts_entry_t>> m_ldgdepbar_buf;  // LDGDEPBAR groups
+  std::vector<unsigned> m_ldgdepbar_pending;  // per group: entries not yet complete
+  unsigned m_ldgdepbar_first_pending = 0;     // closed groups below it have none pending
+  // True if a group below end_group still has a pending LDGSTS.
+  bool ldgsts_pending_below(unsigned end_group) {
+    while (m_ldgdepbar_first_pending < m_ldgdepbar_id &&
+           m_ldgdepbar_pending[m_ldgdepbar_first_pending] == 0)
+      m_ldgdepbar_first_pending++;
+    for (unsigned g = m_ldgdepbar_first_pending; g < end_group; g++)
+      if (m_ldgdepbar_pending[g] > 0) return true;
+    return false;
+  }
   unsigned int m_depbar_start_id;
   unsigned int m_depbar_group;
   bool m_waiting_ldgsts;  // Ni: Whether the warp is waiting for the LDGSTS
@@ -1899,6 +1913,9 @@ class shader_core_config : public core_config {
   bool     gpgpu_ldst_gate_skip_shared;     // shared-space LOAD/STORE do not take the ldst gate
   bool     gpgpu_ldst_gate_release_at_xlat; // a LOAD/STORE releases the ldst gate once translated
   bool     gpgpu_l1_tlb_mshr_wait_fifo;     // MSHR-full L1 TLB lookups retry oldest first
+  bool     gpgpu_l1_tlb_mshr_wait_age;      // MSHR-full L1 TLB lookups retry by instruction age
+  bool     gpgpu_l2_tlb_mshr_age_order;     // a free L2 TLB MSHR entry goes to the longest-blocked request
+  unsigned gpgpu_shmem_per_cta_reserve;    // bytes of shared memory the driver reserves per CTA
   bool     gpgpu_trace_atomic_no_stall;     // a warp keeps issuing while its atomics are in flight
   bool     gpgpu_trace_rz_no_reg;           // R255 (RZ) is not a register operand
   bool     gpgpu_membar_wait_stores;        // MEMBAR also waits for the warp's store acks

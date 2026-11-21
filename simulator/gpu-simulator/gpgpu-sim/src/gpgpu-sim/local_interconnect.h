@@ -55,6 +55,7 @@ struct inct_config {
   unsigned xbar_port_width;  // intra-chiplet xbar: flits drained per cycle per OUTPUT port
   unsigned icp_port_width;   // flits per cycle of the ICP egress output; 0 = xbar_port_width
   bool xbar_input_limit;     // SM and L2 inputs send at most xbar_port_width flits per cycle
+  bool ring_credit;          // ring flow control: bounded wire + bubble injection
 };
 
 // True under ACCELSIM_DIAG (gpu-sim.cc); only then does the ring update its diagnostic counters.
@@ -202,15 +203,20 @@ class xbar_router {
   friend class LocalInterconnect;
 };
 
-// Inter-chiplet ring, one per subnet: a link sends link_width flits per cycle, then the wire adds
-// hop_latency. The wire stage is unbounded, so a blocked delivery never stalls the link.
+// Inter-chiplet ring, one per subnet: a link sends link_width flits per cycle, the wire adds hop_latency.
+// With credit a link starts a packet only while its wire holds fewer than m_wire_cap packets and a local
+// injection keeps one link slot free (bubble flow control); without it the wire is unbounded.
 class ring_net {
  public:
   ring_net(unsigned n_nodes, unsigned buf_depth, unsigned hop_latency,
-           unsigned hop_latency_ptw, unsigned link_width = 1)
+           unsigned hop_latency_ptw, unsigned link_width = 1, bool credit = false)
       : N(n_nodes), m_buf(buf_depth), m_hop_latency(hop_latency), 
         m_hop_latency_ptw(hop_latency_ptw),
-        m_link_width(link_width ? link_width : 1), m_cycle(0) {
+        m_link_width(link_width ? link_width : 1), m_cycle(0), m_credit(credit) {
+    // Never reached while deliveries flow: a link moves at most link_width packets per cycle
+    // into a wire that a packet leaves after its hop latency.
+    m_wire_cap = (unsigned long long)m_link_width *
+                 ((hop_latency > hop_latency_ptw ? hop_latency : hop_latency_ptw) + 2);
     link.assign(N, std::vector<std::queue<RingPkt> >(2));  // [node][dir] 0=cw,1=ccw (bandwidth)
     wire.assign(N, std::vector<std::queue<RingPkt> >(2));  // [node][dir] (wire latency, in-flight)
     wire_ptw.assign(N, std::vector<std::queue<RingPkt> >(2));  // same, page-table-walk class
@@ -229,6 +235,10 @@ class ring_net {
               unsigned cls) {
     unsigned dir = dir_of(src, dst);
     if (link[src][dir].size() >= m_buf) return false;
+    if (link[src][dir].size() + 1 == m_buf) {  // last free slot
+      cr_inject_last_slot++;
+      if (m_credit) return false;              // bubble: the last slot is kept for forwarded packets
+    }
     RingPkt p; p.data = data; p.final_dev = final_dev; p.dst = dst;
     p.dir = dir; p.flits = flits; p.remaining = flits; p.arrival = 0;
     p.cls = cls; p.wire_seq = 0;   // seq is stamped when the packet enters the wire stage
@@ -249,8 +259,16 @@ class ring_net {
         if (g_accelsim_diag)
           link_occ_sum[c][d] += link[c][d].size();  // [RINGLINK]
         unsigned budget = m_link_width;
+        const unsigned long long wp = wire[c][d].size() + wire_ptw[c][d].size();
+        if (wp > cr_max_wire_pkts) cr_max_wire_pkts = wp;
+        bool over_cap_noted = false;
         while (budget > 0 && !link[c][d].empty()) {
           RingPkt& p = link[c][d].front();
+          if (p.remaining == p.flits &&
+              wire[c][d].size() + wire_ptw[c][d].size() >= m_wire_cap) {  // wire full: no credit
+            if (!over_cap_noted) { cr_wire_over_cap++; over_cap_noted = true; }
+            if (m_credit) { cr_credit_stall++; break; }
+          }
           unsigned take = (p.remaining < budget) ? p.remaining : budget;
           if (g_accelsim_diag) link_flits[c][d] += take;  // [RINGLINK]
           p.remaining -= take;
@@ -335,6 +353,14 @@ class ring_net {
     if (w < xlatdbg_wire_min[cls]) xlatdbg_wire_min[cls] = w;
     if (w > xlatdbg_wire_max[cls]) xlatdbg_wire_max[cls] = w;
   }
+  // [RINGCREDIT] (always counted): max wire packets; (link, cycle)s where a packet would start on a
+  // full wire; credit stalls; local injection attempts (retries included) that found one free slot.
+  unsigned long long m_wire_cap = 0;
+  unsigned long long cr_max_wire_pkts = 0;
+  unsigned long long cr_wire_over_cap = 0;
+  unsigned long long cr_credit_stall = 0;
+  unsigned long long cr_inject_last_slot = 0;
+  bool credit_on() const { return m_credit; }
   // Configured hop latency of a class, printed beside the measured one.
   unsigned hop_lat_cfg(unsigned cls) const { return hop_lat_of(cls); }
   unsigned long long ringlat_sum[RING_CLS] = {0, 0};
@@ -364,6 +390,7 @@ class ring_net {
   unsigned long long m_wire_seq = 0;   // monotonic, stamped when a packet enters the wire
   unsigned m_link_width;  // flits/cycle per link
   unsigned long long m_cycle;
+  bool m_credit;          // -icnt_ring_credit
   mutable unsigned m_tie_rr = 0;  // round-robin cursor for equidistant direction split
   std::vector<std::vector<std::queue<RingPkt> > > link;  // bandwidth stage [node][dir]
   std::vector<std::vector<std::queue<RingPkt> > > wire;  // latency stage   [node][dir]

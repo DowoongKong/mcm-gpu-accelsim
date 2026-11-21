@@ -48,6 +48,7 @@ class frfcfs_scheduler {
   void print(FILE *fp);
   unsigned num_pending() const { return m_num_pending; }
   unsigned num_write_pending() const { return m_num_write_pending; }
+  unsigned long long age_cap_switches() const { return m_age_cap_switches; }
 
  private:
   const memory_config *m_config;
@@ -68,6 +69,7 @@ class frfcfs_scheduler {
 
   enum memory_mode m_mode;
   memory_stats_t *m_stats;
+  unsigned long long m_age_cap_switches = 0;  // -gpgpu_frfcfs_age_cap row switches
 };
 
 #endif

@@ -296,6 +296,34 @@ void gpu_l1_tlb::cycle(uint64_t cur) {
       m_resv_fail_start.erase(it);
     }
   };
+  // Retry MSHR-full waiters (no new lookup latency) only when the fill or MSHR epoch moved;
+  // otherwise all would fail again. Skipped cycles are charged to their fail type.
+  auto retry_waiters = [&]() {
+    if (m_mshr_wait_q.empty()) return;
+    const uint64_t epoch = m_fill_epoch + m_mshr.mutations();
+    if (epoch == m_last_wake_epoch) return;
+    m_last_wake_epoch = epoch;
+    std::deque<mshr_wait_ent> keep;
+    for (mshr_wait_ent &w : m_mshr_wait_q) {
+      if (w.last_attempt == cur) { keep.push_back(w); continue; }  // enqueued this cycle
+      // cycles strictly between attempts would all have failed with w's type
+      const uint64_t skipped = cur - w.last_attempt - 1;
+      if (skipped) {
+        if (w.merge_cap) m_mshr_merge_full += skipped;
+        else             m_mshr_entries_full += skipped;
+      }
+      bool in_flight = false;
+      if (resolve_lookup(w.s, cur, &in_flight)) {
+        on_resolved(w.s);
+      } else {
+        w.last_attempt = cur;
+        w.merge_cap = in_flight;   // == m_mshr.probe(w.s.vpn); state unchanged, no re-lookup
+        keep.push_back(w);
+      }
+    }
+    m_mshr_wait_q.swap(keep);
+  };
+  if (m_mshr_wait_age) retry_waiters();   // waiters take freed entries before this cycle's new lookups
   for (lookup_slot &head : pipe_stage(0)) {   // ring head
     if (!head.valid) continue;
     bool in_flight = false;
@@ -311,7 +339,15 @@ void gpu_l1_tlb::cycle(uint64_t cur) {
   }
   // Retry order: FIFO appends this cycle's group (oldest first); otherwise it is prepended in
   // its own order (newest group first).
-  if (m_mshr_wait_fifo) {
+  if (m_mshr_wait_age) {
+    // Instruction age: a warp's lookups stay together (after its last waiter, else at the end).
+    for (const auto &b : this_cycle_blocked) {
+      auto pos = m_mshr_wait_q.end();
+      for (auto it = m_mshr_wait_q.begin(); it != m_mshr_wait_q.end(); ++it)
+        if (it->s.warp_id == b.s.warp_id) pos = it + 1;
+      m_mshr_wait_q.insert(pos, b);
+    }
+  } else if (m_mshr_wait_fifo) {
     for (const auto &b : this_cycle_blocked) m_mshr_wait_q.push_back(b);
   } else {
     for (auto it = this_cycle_blocked.rbegin(); it != this_cycle_blocked.rend(); ++it)
@@ -338,33 +374,7 @@ void gpu_l1_tlb::cycle(uint64_t cur) {
     assert(n == m_pipe_live && "P4_CHECK: pipe_live drift");
   }
 #endif
-  // Retry MSHR-full waiters (no new lookup latency) only when the fill or MSHR epoch moved;
-  // otherwise all would fail again. Skipped cycles are charged to their fail type.
-  if (!m_mshr_wait_q.empty()) {
-    const uint64_t epoch = m_fill_epoch + m_mshr.mutations();
-    if (epoch != m_last_wake_epoch) {
-      m_last_wake_epoch = epoch;
-      std::deque<mshr_wait_ent> keep;
-      for (mshr_wait_ent &w : m_mshr_wait_q) {
-        if (w.last_attempt == cur) { keep.push_back(w); continue; }  // enqueued this cycle
-        // cycles strictly between attempts would all have failed with w's type
-        const uint64_t skipped = cur - w.last_attempt - 1;
-        if (skipped) {
-          if (w.merge_cap) m_mshr_merge_full += skipped;
-          else             m_mshr_entries_full += skipped;
-        }
-        bool in_flight = false;
-        if (resolve_lookup(w.s, cur, &in_flight)) {
-          on_resolved(w.s);
-        } else {
-          w.last_attempt = cur;
-          w.merge_cap = in_flight;   // == m_mshr.probe(w.s.vpn); state unchanged, no re-lookup
-          keep.push_back(w);
-        }
-      }
-      m_mshr_wait_q.swap(keep);
-    }
-  }
+  if (!m_mshr_wait_age) retry_waiters();
 }
 
 
@@ -607,7 +617,8 @@ void gpu_l2_tlb::set_set_hash(unsigned mode) {
   }
 }
 
-bool gpu_l2_tlb::full_verdict(uint64_t vpn_val, bool *merge) const {  // debug check build (P4_CHECK)
+// Debug check build (P4_CHECK) only.
+bool gpu_l2_tlb::full_verdict(uint64_t vpn_val, unsigned cluster_id, bool *merge) const {
   if (find_way(set_idx(vpn_val), vpn_val) >= 0) return false;
   auto it = m_mshr.find(vpn_val);
   if (it != m_mshr.end()) {
@@ -615,7 +626,7 @@ bool gpu_l2_tlb::full_verdict(uint64_t vpn_val, bool *merge) const {  // debug c
     return it->second.pending_clusters.size() >= m_mshr_max_merge;
   }
   *merge = false;
-  return m_mshr.size() >= m_mshr_entries;
+  return new_entry_blocked(cluster_id, vpn_val);
 }
 
 int gpu_l2_tlb::find_way(unsigned sidx, uint64_t vpn_val) const {
@@ -661,9 +672,14 @@ gpu_l2_tlb::result_t gpu_l2_tlb::access(uint64_t va, unsigned cluster_id,
         m_resv_fail_start.emplace(rid, cur);
         git->second.blocked = true;
       }
+      if (m_age_order) {   // only a request waiting for a free entry has an age
+        if (m_last_full_merge) age_done(rid);
+        else                   age_wait(rid);
+      }
       // Re-arm as already expired: the next poll retries without paying the lookup latency again.
       git->second.ready = cur;
     } else {
+      if (m_age_order) age_done(rid);
       m_lookup_ready.erase(git);                      // probe latency elapsed
       m_probing.erase(rid);                           // left the lookup stage
       auto fit = m_resv_fail_start.find(rid);
@@ -771,6 +787,11 @@ gpu_l2_tlb::resolve(uint64_t vpn_val, unsigned sidx, unsigned cluster_id,
     m_last_full_merge = false;                      // fail type for skip synthesis
     return MSHR_FULL;                               // re-poll (gate re-armed as expired)
   }
+  if (m_age_order && !age_allows(req_key(cluster_id, vpn_val))) {  // older waiters first
+    m_age_defer++;
+    m_last_full_merge = false;
+    return MSHR_FULL;
+  }
   m_ep_set[sidx]++;  // a vpn of this set now exists in the MSHR
   m_ep_set_any++;
   l2_mshr_entry_t& e = m_mshr[vpn_val];             // first miss for this vpn
@@ -780,6 +801,66 @@ gpu_l2_tlb::resolve(uint64_t vpn_val, unsigned sidx, unsigned cluster_id,
   m_misses++;
   m_set_lookups[sidx]++;
   return MISS;
+}
+
+// -gpgpu_l2_tlb_mshr_age_order: a request joins the queue when it starts waiting for an entry and
+// leaves when it resolves; age_refresh() keeps the oldest min(free entries, waiters) reserved.
+void gpu_l2_tlb::age_wait(uint64_t rid) {
+  if (m_age_st.count(rid)) return;
+  m_age_q.emplace_back(rid, ++m_age_seq);
+  m_age_st.emplace(rid, age_st_t{m_age_seq, false});
+  age_refresh();
+}
+
+void gpu_l2_tlb::age_done(uint64_t rid) {
+  auto it = m_age_st.find(rid);
+  if (it == m_age_st.end()) return;
+  if (it->second.resv) m_age_resv--;
+  m_age_st.erase(it);
+  age_refresh();
+}
+
+void gpu_l2_tlb::age_refresh() {
+  while (!m_age_q.empty() && !age_live(m_age_q.front())) m_age_q.pop_front();
+  const size_t free_entries = m_mshr.size() < m_mshr_entries ? m_mshr_entries - m_mshr.size() : 0;
+  const size_t target = std::min(free_entries, m_age_st.size());
+  for (auto it = m_age_q.begin(); it != m_age_q.end() && m_age_resv < target; ++it) {
+    if (!age_live(*it)) continue;
+    age_st_t &st = m_age_st.find(it->first)->second;
+    if (st.resv) continue;
+    st.resv = true;
+    m_age_resv++;
+    m_age_ep++;
+  }
+}
+
+// A waiter takes an entry only with a reservation; anyone else only where no reservation holds it.
+bool gpu_l2_tlb::age_allows(uint64_t rid) const {
+  const size_t free_entries = m_mshr.size() < m_mshr_entries ? m_mshr_entries - m_mshr.size() : 0;
+#ifdef P4_CHECK
+  {
+    size_t r = 0;
+    for (const auto &kv : m_age_st) {
+      if (kv.second.resv) r++;
+      assert(m_resv_fail_start.count(kv.first) && "P4_CHECK: L2 age waiter is not blocked");
+    }
+    assert(r == m_age_resv && m_age_resv == std::min(free_entries, m_age_st.size()) &&
+           "P4_CHECK: L2 reservations are not min(free, waiters)");
+    bool seen_unreserved = false;  // in queue order, every reserved waiter precedes every other one
+    size_t live = 0;
+    for (const auto &e : m_age_q) {
+      if (!age_live(e)) continue;
+      live++;
+      const bool resv = m_age_st.find(e.first)->second.resv;
+      assert(!(resv && seen_unreserved) && "P4_CHECK: an L2 reservation is not on the oldest waiters");
+      if (!resv) seen_unreserved = true;
+    }
+    assert(live == m_age_st.size() && "P4_CHECK: an L2 age waiter has no live queue entry");
+  }
+#endif
+  auto st = m_age_st.find(rid);
+  if (st != m_age_st.end()) return st->second.resv;
+  return free_entries > m_age_resv;
 }
 
 void gpu_l2_tlb::fill(uint64_t vpn_val, const gpu_pte_t& pte,
@@ -832,7 +913,10 @@ bool gpu_l2_tlb::query_completed(uint64_t vpn_val, unsigned cluster_id,
   if (std::find(clusters.begin(), clusters.end(), cluster_id) == clusters.end())
     ready_del(cluster_id, vpn_val);
   m_ep_consume++;  // a merge count shrank
-  if (clusters.empty()) m_mshr.erase(it);  // all SMs consumed; free entry (table_full() reads the size live)
+  if (clusters.empty()) {  // all SMs consumed; free entry (table_full() reads the size live)
+    m_mshr.erase(it);
+    if (m_age_order) age_refresh();
+  }
   return true;
 }
 
@@ -850,7 +934,10 @@ void gpu_l2_tlb::remove_from_mshr(uint64_t vpn_val, unsigned cluster_id) {
   c.erase(std::remove(c.begin(), c.end(), cluster_id), c.end());
   ready_del(cluster_id, vpn_val);  // every occurrence is gone
   m_ep_consume++;  // a merge count shrank
-  if (c.empty()) m_mshr.erase(it);  // table_full() reads the size live
+  if (c.empty()) {  // table_full() reads the size live
+    m_mshr.erase(it);
+    if (m_age_order) age_refresh();
+  }
 }
 
 void gpu_l2_tlb::print_stats(FILE* f) const {
@@ -865,6 +952,9 @@ void gpu_l2_tlb::print_stats(FILE* f) const {
           m_mshr_hits, m_mshr_merge_full, m_mshr_entries_full,
           m_resv_fail_cycles,
           total ? 100.0 * m_hits / total : 0.0);
+  if (m_age_order)
+    fprintf(f, "[L2_TLB_%s_AGE] chiplet=%u defer=%llu waiting=%zu\n",
+            page_kind_tag(m_page_shift), m_chiplet_id, m_age_defer, m_age_st.size());
   // PORT row only with a port cap or under ACCELSIM_DIAG.
   if (m_n_ports != 0 || g_accelsim_diag)
     fprintf(f, "[L2_TLB_%s_PORT] chiplet=%u ports=%u port_busy=%llu concurrent_max=%u\n",

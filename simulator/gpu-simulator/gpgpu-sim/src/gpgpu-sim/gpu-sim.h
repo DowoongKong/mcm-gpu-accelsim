@@ -332,6 +332,7 @@ class memory_config {
   char *gpgpu_L2_queue_config;
   bool l2_ideal;
   unsigned gpgpu_frfcfs_dram_sched_queue_size;
+  unsigned gpgpu_frfcfs_age_cap;  // a request this old (core cycles) ends the open row's run of hits
   unsigned gpgpu_dram_return_queue_size;
   enum dram_ctrl_t scheduler_type;
   bool gpgpu_memlatency_stat;
@@ -550,6 +551,9 @@ class gpgpu_sim_config : public power_config,
   unsigned get_l2_tlb_ports() const { return m_shader_config.gpgpu_l2_tlb_ports; }
   unsigned get_l2_tlb_starts_per_cycle() const {
     return m_shader_config.gpgpu_l2_tlb_starts_per_cycle;
+  }
+  bool get_l2_tlb_mshr_age_order() const {
+    return m_shader_config.gpgpu_l2_tlb_mshr_age_order;
   }
   unsigned get_l2_tlb_sets()         const { return m_l2_tlb_sets; }
   unsigned get_l2_tlb_assoc()        const { return m_l2_tlb_assoc; }

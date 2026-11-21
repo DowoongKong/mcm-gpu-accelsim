@@ -513,6 +513,8 @@ void LocalInterconnect::CreateInterconnect(unsigned m_n_shader, unsigned m_n_mem
     icnt_fatal("-icnt_use_ring 1 needs -icnt_arbiter_algo 1 (iSLIP).");
   if (m_use_ring && m_inct_config.ring_buf == 0)
     icnt_fatal("-icnt_ring_buf 0 leaves no ring buffer; use 1 or more.");
+  if (m_use_ring && m_inct_config.ring_credit && m_inct_config.ring_buf < 2)  // bubble keeps one slot
+    icnt_fatal("-icnt_ring_credit 1 needs -icnt_ring_buf 2 or more (one slot stays free for forwarding).");
   const unsigned n_icp = (m_n_chiplets > 1) ? 1u : 0u;
   net.resize(n_subnets);
   for (unsigned s = 0; s < n_subnets; ++s) {
@@ -537,7 +539,10 @@ void LocalInterconnect::CreateInterconnect(unsigned m_n_shader, unsigned m_n_mem
       m_ring[s] = new ring_net(m_n_chiplets, m_inct_config.ring_buf,
                                m_inct_config.ring_hop_latency,
                                ptw_hop,
-                               m_inct_config.ring_link_width);
+                               m_inct_config.ring_link_width,
+                               m_inct_config.ring_credit);
+    printf("[ICNT] ring credit flow control: %s (wire cap %llu packets per link)\n",
+           m_inct_config.ring_credit ? "on" : "off", m_ring[0]->m_wire_cap);
     // [RINGINJ] diagnostics: [subnet][chiplet] source-side egress accounting.
     m_rinj_egress_busy.assign(n_subnets, std::vector<unsigned long long>(m_n_chiplets, 0));
     m_rinj_stall.assign(n_subnets, std::vector<unsigned long long>(m_n_chiplets, 0));
@@ -751,6 +756,15 @@ void LocalInterconnect::DisplayStats() const {
     printf("%s_Network_out_buffer_full_per_cycle = %12.4f\n", tag, (float)out_buffer_full/cyc);
     printf("%s_Network_out_buffer_avg_util = %12.4f\n", tag, (float)out_buffer_util/cyc/active_out);
     printf("\n");
+  }
+  // [RINGCREDIT]: cumulative ring flow-control counters (always printed).
+  for (unsigned s = 0; s < m_ring.size(); ++s) {
+    if (!m_ring[s]) continue;
+    const ring_net* r = m_ring[s];
+    printf("[RINGCREDIT] %s_ring credit=%d cap_pkts=%llu max_wire_pkts=%llu wire_over_cap_link_cycles=%llu "
+           "credit_stall_link_cycles=%llu inject_last_slot=%llu\n",
+           (s == REQ_NET) ? "Req" : "Reply", r->credit_on() ? 1 : 0, r->m_wire_cap, r->cr_max_wire_pkts,
+           r->cr_wire_over_cap, r->cr_credit_stall, r->cr_inject_last_slot);
   }
   // Ring diagnostic report, only under ACCELSIM_DIAG (the counters are gated too).
   if (m_use_ring && g_accelsim_diag) {

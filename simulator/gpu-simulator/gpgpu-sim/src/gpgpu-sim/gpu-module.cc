@@ -332,6 +332,7 @@ void gpu_module::init() {
         GPU_PAGE_SHIFT);
     l2tlb_4k->set_ports(m_top->get_config().get_l2_tlb_ports());
     l2tlb_4k->set_starts_per_cycle(m_top->get_config().get_l2_tlb_starts_per_cycle());
+    l2tlb_4k->set_mshr_age_order(m_top->get_config().get_l2_tlb_mshr_age_order());
     l2tlb_4k->set_set_hash(m_top->get_config().get_l2_tlb_set_hash());
     m_chiplets[c]->set_l2_tlb_4k(l2tlb_4k);
     m_gmmus[c]->set_l2_tlb_4k(l2tlb_4k);
@@ -353,6 +354,7 @@ void gpu_module::init() {
         GPU_64K_SHIFT);
     l2tlb_64k->set_ports(m_top->get_config().get_l2_tlb_ports());
     l2tlb_64k->set_starts_per_cycle(m_top->get_config().get_l2_tlb_starts_per_cycle());
+    l2tlb_64k->set_mshr_age_order(m_top->get_config().get_l2_tlb_mshr_age_order());
     l2tlb_64k->set_set_hash(m_top->get_config().get_l2_tlb_set_hash());
     m_chiplets[c]->set_l2_tlb_64k(l2tlb_64k);
     m_gmmus[c]->set_l2_tlb_64k(l2tlb_64k);
@@ -373,6 +375,7 @@ void gpu_module::init() {
         GPU_HUGE_SHIFT);
     l2tlb_2m->set_ports(m_top->get_config().get_l2_tlb_ports());
     l2tlb_2m->set_starts_per_cycle(m_top->get_config().get_l2_tlb_starts_per_cycle());
+    l2tlb_2m->set_mshr_age_order(m_top->get_config().get_l2_tlb_mshr_age_order());
     l2tlb_2m->set_set_hash(m_top->get_config().get_l2_tlb_set_hash());
     m_chiplets[c]->set_l2_tlb_2m(l2tlb_2m);
     m_gmmus[c]->set_l2_tlb_2m(l2tlb_2m);

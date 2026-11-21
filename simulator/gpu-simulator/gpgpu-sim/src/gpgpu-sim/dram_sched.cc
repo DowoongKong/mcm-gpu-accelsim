@@ -135,6 +135,29 @@ dram_req_t *frfcfs_scheduler::schedule(unsigned bank, unsigned curr_row) {
     m_current_last_row = m_last_write_row;
   }
 
+  // -gpgpu_frfcfs_age_cap: a request waiting this long ends the open row's run of hits.
+  if (m_config->gpgpu_frfcfs_age_cap && !m_current_queue[bank].empty()) {
+    dram_req_t *oldest = m_current_queue[bank].back();
+    const unsigned now =
+        (unsigned)(m_dram->m_gpu->gpu_sim_cycle + m_dram->m_gpu->gpu_tot_sim_cycle);
+    const unsigned serving = m_current_last_row[bank]
+                                 ? (*m_current_last_row[bank]->back())->row
+                                 : curr_row;
+    // With no run and no open-row bin the normal path already takes the oldest request's row.
+    const bool normal_takes_oldest = !m_current_last_row[bank] &&
+        m_current_bins[bank].find(curr_row) == m_current_bins[bank].end();
+    if (now - oldest->timestamp >= m_config->gpgpu_frfcfs_age_cap && oldest->row != serving &&
+        !normal_takes_oldest) {
+      std::map<unsigned, std::list<std::list<dram_req_t *>::iterator> >::iterator
+          bin_ptr = m_current_bins[bank].find(oldest->row);
+      assert(bin_ptr != m_current_bins[bank].end());
+      m_current_last_row[bank] = &(bin_ptr->second);
+      data_collection(bank);
+      rowhit = false;
+      m_age_cap_switches++;
+    }
+  }
+
   if (m_current_last_row[bank] == NULL) {
     if (m_current_queue[bank].empty()) return NULL;
 

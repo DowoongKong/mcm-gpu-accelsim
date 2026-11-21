@@ -1110,19 +1110,19 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
   // Add LDGSTS instructions into a buffer
   unsigned int ldgdepbar_id = m_warp[warp_id]->m_ldgdepbar_id;
   if (next_inst->m_is_ldgsts) {
-    if (m_warp[warp_id]->m_ldgdepbar_buf.size() == ldgdepbar_id + 1) {
-      m_warp[warp_id]->m_ldgdepbar_buf[ldgdepbar_id].push_back(*next_inst);
+    shd_warp_t *w = m_warp[warp_id];
+    // No active lane: nothing will complete, so the entry starts as complete.
+    shd_warp_t::ldgsts_entry_t e;
+    e.pc = (next_inst->get_active_mask() == 0) ? (address_type)-1 : next_inst->pc;
+    e.addr0 = next_inst->get_addr(0);
+    if (w->m_ldgdepbar_buf.size() == ldgdepbar_id + 1) {
+      w->m_ldgdepbar_buf[ldgdepbar_id].push_back(e);
     } else {
-      assert(m_warp[warp_id]->m_ldgdepbar_buf.size() < ldgdepbar_id + 1);
-      std::vector<warp_inst_t> l;
-      l.push_back(*next_inst);
-      m_warp[warp_id]->m_ldgdepbar_buf.push_back(l);
+      assert(w->m_ldgdepbar_buf.size() < ldgdepbar_id + 1);
+      w->m_ldgdepbar_buf.push_back(std::vector<shd_warp_t::ldgsts_entry_t>(1, e));
+      w->m_ldgdepbar_pending.push_back(0);
     }
-    // If the mask of the instruction is all 0, then the address is also 0,
-    // so that there's no need to check through the writeback
-    if (next_inst->get_active_mask() == 0) {
-      (m_warp[warp_id]->m_ldgdepbar_buf.back()).back().pc = -1;
-    }
+    if (e.pc != (address_type)-1) w->m_ldgdepbar_pending.back()++;
   }
 
   // A BAR/MEMBAR with every lane predicated off does nothing (the tracer still records it).
@@ -1140,8 +1140,8 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
     // If there are no added LDGSTS, insert an empty vector
     if (m_warp[warp_id]->m_ldgdepbar_buf.size() != ldgdepbar_id + 1) {
       assert(m_warp[warp_id]->m_ldgdepbar_buf.size() < ldgdepbar_id + 1);
-      std::vector<warp_inst_t> l;
-      m_warp[warp_id]->m_ldgdepbar_buf.push_back(l);
+      m_warp[warp_id]->m_ldgdepbar_buf.emplace_back();
+      m_warp[warp_id]->m_ldgdepbar_pending.push_back(0);
     }
   } else if (next_inst->m_is_depbar) {  // Add for DEPBAR
     // Set to true immediately when a DEPBAR instruction is met
@@ -1162,17 +1162,7 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
 
     // Check for the case that the LDGSTSs monitored have finished when
     // encountering the DEPBAR instruction
-    bool done_flag = true;
-    for (int i = 0; i < end_group; i++) {
-      for (int j = 0; j < m_warp[warp_id]->m_ldgdepbar_buf[i].size(); j++) {
-        if (m_warp[warp_id]->m_ldgdepbar_buf[i][j].pc != -1) {
-          done_flag = false;
-          goto UpdateDEPBAR;
-        }
-      }
-    }
-
-  UpdateDEPBAR:
+    const bool done_flag = !m_warp[warp_id]->ldgsts_pending_below(end_group);
     if (done_flag) {
       if (m_warp[warp_id]->m_waiting_ldgsts) {
         m_warp[warp_id]->m_waiting_ldgsts = false;
@@ -2087,33 +2077,24 @@ void shader_core_ctx::unset_depbar(const warp_inst_t &inst) {
     end_group = std::min(n_buf, start_id + 1 > group ? start_id + 1 - group : 0u);
 
   if (inst.m_is_ldgsts) {
-    for (int i = 0; i < m_warp[inst.warp_id()]->m_ldgdepbar_buf.size(); i++) {
-      for (int j = 0; j < m_warp[inst.warp_id()]->m_ldgdepbar_buf[i].size();
-           j++) {
-        if (m_warp[inst.warp_id()]->m_ldgdepbar_buf[i][j].pc == inst.pc) {
-          // Handle the case that same pc results in multiple LDGSTS
-          // instructions
-          if (m_warp[inst.warp_id()]->m_ldgdepbar_buf[i][j].get_addr(0) ==
-              inst.get_addr(0)) {
-            m_warp[inst.warp_id()]->m_ldgdepbar_buf[i][j].pc = -1;
-            goto DoneWB;
-          }
+    shd_warp_t *w = m_warp[inst.warp_id()];
+    // First pending entry with this pc and lane-0 address (same pc can repeat); groups below
+    // m_ldgdepbar_first_pending hold only complete entries.
+    const new_addr_type a0 = inst.get_addr(0);
+    for (unsigned i = w->m_ldgdepbar_first_pending; i < w->m_ldgdepbar_buf.size(); i++) {
+      bool found = false;
+      for (shd_warp_t::ldgsts_entry_t &e : w->m_ldgdepbar_buf[i]) {
+        if (e.pc == inst.pc && e.addr0 == a0) {
+          e.pc = (address_type)-1;
+          w->m_ldgdepbar_pending[i]--;
+          found = true;
+          break;
         }
       }
+      if (found) break;
     }
+    done_flag = !w->ldgsts_pending_below(end_group);
 
-  DoneWB:
-    for (int i = 0; i < end_group; i++) {
-      for (int j = 0; j < m_warp[inst.warp_id()]->m_ldgdepbar_buf[i].size();
-           j++) {
-        if (m_warp[inst.warp_id()]->m_ldgdepbar_buf[i][j].pc != -1) {
-          done_flag = false;
-          goto UpdateDEPBAR;
-        }
-      }
-    }
-
-  UpdateDEPBAR:
     if (done_flag) {
       if (m_warp[inst.warp_id()]->m_waiting_ldgsts) {
         m_warp[inst.warp_id()]->m_waiting_ldgsts = false;
@@ -3162,6 +3143,15 @@ ldst_unit::ldst_unit(mem_fetch_interface *icnt,
     m_l1_tlb_2m->set_mshr_wait_fifo(m_config->gpgpu_l1_tlb_mshr_wait_fifo);
     m_l1_tlb_64k->set_mshr_wait_fifo(m_config->gpgpu_l1_tlb_mshr_wait_fifo);
     m_l1_tlb_4k->set_mshr_wait_fifo(m_config->gpgpu_l1_tlb_mshr_wait_fifo);
+    if (m_config->gpgpu_l1_tlb_mshr_wait_fifo && m_config->gpgpu_l1_tlb_mshr_wait_age) {
+      fprintf(stderr, "FATAL: -gpgpu_l1_tlb_mshr_wait_fifo and -gpgpu_l1_tlb_mshr_wait_age are "
+                      "different retry orders; set only one.\n");
+      fflush(stderr);
+      abort();
+    }
+    m_l1_tlb_2m->set_mshr_wait_age(m_config->gpgpu_l1_tlb_mshr_wait_age);
+    m_l1_tlb_64k->set_mshr_wait_age(m_config->gpgpu_l1_tlb_mshr_wait_age);
+    m_l1_tlb_4k->set_mshr_wait_age(m_config->gpgpu_l1_tlb_mshr_wait_age);
     assert(m_config->m_L1D_config.l1_latency > 0);
     if (m_config->max_warps_per_shader > (1u << gpu_l1_tlb::kReqKeyWarpBits)) {
       fprintf(stderr,
@@ -3622,7 +3612,8 @@ void ldst_unit::cycle_b() {
             (wm.n_gated == 0 || cur_cycle < wm.min_next_poll) &&
             l2_tlb->ep_set_any() == wm.ep_set_any &&
             (wm.n_merge == 0 || l2_tlb->ep_consume() == wm.ep_consume) &&
-            (wm.n_table == 0 || l2_tlb->table_full())) {
+            (wm.n_table == 0 ||
+             (l2_tlb->table_full_or_reserved() && l2_tlb->age_epoch() == wm.age_ep))) {
 #ifdef P4_CHECK
           {  // re-derive every entry's verdict the way the walk would
             unsigned g = 0, mm = 0, tt = 0;
@@ -3631,7 +3622,7 @@ void ldst_unit::cycle_b() {
               assert(it->wait_epoch != 0 &&
                      l2_tlb->ep_set_idx((unsigned)it->wait_ep3) == it->wait_ep2 &&
                      (it->wait_merge ? (l2_tlb->ep_consume() == it->wait_epoch)
-                                     : l2_tlb->table_full()) &&
+                                     : l2_tlb->new_entry_blocked(m_tpc, it->vpn)) &&
                      "P4_CHECK: walk memo armed but an entry is eligible");
               if (it->wait_merge) mm++; else tt++;
             }
@@ -3643,6 +3634,8 @@ void ldst_unit::cycle_b() {
           l2_tlb->note_mshr_full_skip_n(wm.n_merge, wm.n_table);
         } else {
         wm.armed = false;
+        // Taken before any poll: a reservation granted during the walk must force the next walk.
+        const uint64_t age_ep_start = l2_tlb->age_epoch();
         unsigned sent = 0;
         unsigned n_gated = 0, n_merge = 0, n_table = 0, n_eligible = 0;  // for the walk skip
         uint64_t min_poll = ~0ull;
@@ -3657,15 +3650,15 @@ void ldst_unit::cycle_b() {
             continue;
           }
           // Last answer was MSHR_FULL: while nothing that can flip it changed (set epoch, plus
-          // merge consumption or a full table), skip the call and count the same stall.
+          // merge consumption, or a new entry still blocked), skip the call and count the same stall.
           if (it->wait_epoch != 0 &&
               l2_tlb->ep_set_idx((unsigned)it->wait_ep3) == it->wait_ep2 &&
               (it->wait_merge ? (l2_tlb->ep_consume() == it->wait_epoch)
-                              : l2_tlb->table_full())) {
+                              : l2_tlb->new_entry_blocked(m_tpc, it->vpn))) {
 #ifdef P4_CHECK
             {
               bool chk_merge = false;
-              assert(l2_tlb->full_verdict(it->vpn, &chk_merge) &&
+              assert(l2_tlb->full_verdict(it->vpn, m_tpc, &chk_merge) &&
                      chk_merge == it->wait_merge &&
                      "P4_CHECK: frozen verdict changed with no typed epoch");
             }
@@ -3720,6 +3713,7 @@ void ldst_unit::cycle_b() {
           wm.n_gated = n_gated; wm.n_merge = n_merge; wm.n_table = n_table;
           wm.min_next_poll = min_poll;
           wm.ep_set_any = l2_tlb->ep_set_any();
+          wm.age_ep = age_ep_start;
           wm.ep_consume = l2_tlb->ep_consume();
           wm.enq_seq = l1_tlb->l2_req_enq_seq();
         }
@@ -4502,8 +4496,11 @@ unsigned int shader_core_config::max_cta(const kernel_info_t &k) const {
 
   // Limit by shmem/shader
   unsigned int result_shmem = (unsigned)-1;
-  if (kernel_info->smem > 0)
-    result_shmem = gpgpu_shmem_size / kernel_info->smem;
+  // -gpgpu_shmem_per_cta_reserve: the driver's per-CTA system share (1 KB from sm_80)
+  const unsigned smem_per_cta =
+      kernel_info->smem > 0 ? kernel_info->smem + gpgpu_shmem_per_cta_reserve : 0;
+  if (smem_per_cta > 0)
+    result_shmem = gpgpu_shmem_size / smem_per_cta;
 
   // Limit by register count, rounded up to multiple of 4.
   unsigned int result_regs = (unsigned)-1;
@@ -4555,7 +4552,7 @@ unsigned int shader_core_config::max_cta(const kernel_info_t &k) const {
   if (adaptive_cache_config && !k.cache_config_set) {
     // For more info about adaptive cache, see
     // https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#shared-memory-7-x
-    unsigned total_shmem = kernel_info->smem * result;
+    unsigned total_shmem = smem_per_cta * result;
     assert(total_shmem >= 0 && total_shmem <= shmem_opt_list.back());
 
     // Unified cache config is in KB. Converting to B

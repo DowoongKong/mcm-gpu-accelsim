@@ -114,7 +114,8 @@ class gpu_l1_tlb {
   void fill(uint64_t vpn, const gpu_pte_t &pte, uint64_t current_cycle,
             const xlat_down_t *down = NULL);
 
-  // Per cycle: resolve the pipe head, advance it, start queued lookups, retry MSHR-full waiters.
+  // Per cycle: resolve the pipe head, advance it, start queued lookups, retry MSHR-full waiters
+  // (with -gpgpu_l1_tlb_mshr_wait_age the waiters retry first).
   void cycle(uint64_t current_cycle);
   // L1->L2 request queue accessors (drained by ldst_unit::cycle).
   bool l2_req_front(uint64_t &vpn) const;
@@ -130,6 +131,7 @@ class gpu_l1_tlb {
   void set_ports(unsigned p) { m_n_ports = p; }
   void set_lookups_per_cycle(unsigned n) { m_lookups_per_cycle = n; }
   void set_mshr_wait_fifo(bool on) { m_mshr_wait_fifo = on; }
+  void set_mshr_wait_age(bool on) { m_mshr_wait_age = on; }
   // -gpgpu_l1d_vipt: a hit overlaps the L1D access (see access()).
   void set_hit_overlap(bool on) { m_hit_overlap = on; }
   unsigned long long port_busy_stalls() const { return m_port_busy_stalls; }
@@ -208,6 +210,7 @@ class gpu_l1_tlb {
   unsigned m_lookups_per_cycle = 0;
   bool m_hit_overlap = false;  // -gpgpu_l1d_vipt
   bool m_mshr_wait_fifo = false;  // -gpgpu_l1_tlb_mshr_wait_fifo
+  bool m_mshr_wait_age = false;   // -gpgpu_l1_tlb_mshr_wait_age
   uint64_t m_inject_cycle = ~0ull;   // cycle that m_inject_count refers to
   unsigned m_inject_count = 0;       // lookups started in m_inject_cycle
   std::deque<lookup_slot> m_inject_q;
@@ -278,6 +281,7 @@ class gpu_l1_tlb {
     uint64_t min_next_poll = 0;            // over the gated entries
     uint64_t ep_set_any = 0, ep_consume = 0;  // L2 snapshots at arm time
     uint64_t enq_seq = 0;                  // m_l2_req_enq at arm time
+    uint64_t age_ep = 0;                   // L2 age_epoch() at arm time
   };
   walk_memo_t &walk_memo() { return m_walk_memo; }
   uint64_t l2_req_enq_seq() const { return m_l2_req_enq; }
@@ -338,6 +342,7 @@ class gpu_l2_tlb {
   static const unsigned kReqKeyClusterBits = 12;
   void set_ports(unsigned p) { m_n_ports = p; }
   void set_starts_per_cycle(unsigned n) { m_starts_per_cycle = n; }
+  void set_mshr_age_order(bool on) { m_age_order = on; }
   unsigned long long port_busy_stalls() const { return m_port_busy_stalls; }
   unsigned concurrent_max() const { return m_concurrent_max; }
 
@@ -424,7 +429,7 @@ class gpu_l2_tlb {
   unsigned long long m_hits;
   unsigned long long m_misses;
   unsigned long long m_mshr_hits;
-  // Blocked cycles by cause, as in gpu_l1_tlb: merge_full + entries_full == resv_fail_cycles.
+  // Blocked cycles by cause: merge_full + entries_full (+ m_age_defer with age order) == resv_fail_cycles.
   unsigned long long m_mshr_merge_full   = 0;  // cycles blocked by the merge cap (pending_clusters >= max_merge)
   unsigned long long m_mshr_entries_full = 0;  // cycles blocked by a full MSHR table (new VPN)
   // Deadlock dump: which gate branch each access() took.
@@ -435,24 +440,33 @@ class gpu_l2_tlb {
   void note_gate_pending() { m_gate_pending++; }
   void note_gate_pending_n(unsigned n) { m_gate_pending += n; }  // batch form (walk skip)
   // MSHR_FULL waiters skip re-polls while their verdict cannot change:
-  //   table full: while table_full() and the set's epoch (fills, MSHR inserts) stand still;
+  //   no entry: while new_entry_blocked() and the set's epoch (fills, MSHR inserts) stand still;
   //   merge cap: while ep_consume() and the set's epoch stand still.
   bool table_full() const { return m_mshr.size() >= m_mshr_entries; }
+  // A new entry for (cluster, vpn) is refused now: the table is full, or with -gpgpu_l2_tlb_mshr_age_order
+  // every free entry is reserved for an older waiter. Equals table_full() without the option.
+  bool new_entry_blocked(unsigned cluster_id, uint64_t vpn_val) const {
+    return m_age_order ? !age_allows(req_key(cluster_id, vpn_val)) : table_full();
+  }
+  bool table_full_or_reserved() const { return m_mshr.size() + m_age_resv >= m_mshr_entries; }
+  uint64_t age_epoch() const { return m_age_ep; }
   uint64_t ep_consume() const { return m_ep_consume; }
   unsigned set_of(uint64_t vpn_val) const { return set_idx(vpn_val); }
   uint64_t ep_set_idx(unsigned sidx) const { return m_ep_set[sidx]; }
   // Debug check build (P4_CHECK): would resolve() answer MSHR_FULL now? Read-only.
-  bool full_verdict(uint64_t vpn_val, bool *merge) const;
+  bool full_verdict(uint64_t vpn_val, unsigned cluster_id, bool *merge) const;
   bool last_full_merge() const { return m_last_full_merge; }
   // A skipped re-poll charges what a real retry would: gate_expire and the fail-type counter.
   void note_mshr_full_skip(bool merge) {
     m_gate_expire++;
-    if (merge) m_mshr_merge_full++; else m_mshr_entries_full++;
+    if (merge) m_mshr_merge_full++;
+    else if (table_full()) m_mshr_entries_full++;
+    else m_age_defer++;   // free entries all reserved for older waiters
   }
   void note_mshr_full_skip_n(unsigned n_merge, unsigned n_table) {  // batch form (walk skip)
     m_gate_expire += n_merge + n_table;
     m_mshr_merge_full += n_merge;
-    m_mshr_entries_full += n_table;
+    if (table_full()) m_mshr_entries_full += n_table; else m_age_defer += n_table;
   }
   // Walk skip: moves whenever any m_ep_set[] entry moves (fill or MSHR insert).
   uint64_t ep_set_any() const { return m_ep_set_any; }
@@ -466,6 +480,25 @@ class gpu_l2_tlb {
   unsigned long long m_gate_expire  = 0;   // branch (1): window elapsed -> resolve()
   unsigned long long m_resv_fail_cycles = 0;
   std::unordered_map<uint64_t, uint64_t> m_resv_fail_start;   // rid -> first fail cycle
+  // -gpgpu_l2_tlb_mshr_age_order: requests waiting for a free entry, in the order they first found none;
+  // the oldest min(free entries, waiters) hold a reservation (entries of finished waiters drop lazily).
+  bool m_age_order = false;
+  // A queue entry is live only while its sequence number matches the rid's state (a rid can wait again).
+  struct age_st_t { uint64_t seq; bool resv; };
+  std::deque<std::pair<uint64_t, uint64_t>> m_age_q;  // (waiter rid, sequence), oldest first
+  std::unordered_map<uint64_t, age_st_t> m_age_st;    // live waiter rid -> its sequence, holds a reservation
+  uint64_t m_age_seq = 0;                             // last sequence number handed out
+  bool age_live(const std::pair<uint64_t, uint64_t> &e) const {
+    auto st = m_age_st.find(e.first);
+    return st != m_age_st.end() && st->second.seq == e.second;
+  }
+  unsigned m_age_resv = 0;                      // reservations held
+  uint64_t m_age_ep = 1;                        // bumped whenever a reservation is granted
+  unsigned long long m_age_defer = 0;           // new-entry requests sent back for older waiters
+  void age_wait(uint64_t rid);
+  void age_done(uint64_t rid);
+  void age_refresh();
+  bool age_allows(uint64_t rid) const;
 
   // Latency breakdown: L2 boundaries per in-flight (cluster, vpn); erased when the fill takes it.
   std::unordered_map<uint64_t, xlat_down_t> m_xlat_seg;
